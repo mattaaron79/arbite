@@ -38,6 +38,18 @@ FIELD_ORDER = [
 
 DEFAULT_BODY = "## Description\n{description}\n\n## Notes\n"
 
+BLANK_TITLE = "TODO: replace with a short title"
+BLANK_TYPE = "TODO: bug|feature|refactor|chore"
+BLANK_TIER = "TODO: low|medium|high"
+BLANK_DOMAIN = "TODO: e.g. mesh, image_gen, audio_gen, ui, io"
+BLANK_DESCRIPTION = "TODO: describe the task."
+BLANK_WARNING = (
+    "> **TEMPLATE -- not ready.** This ticket was scaffolded blank by "
+    "`arbite create --blank` and has not been filled in yet. Do not claim or "
+    "work it until a human has replaced the TODO placeholders above, written "
+    "a real description below, and saved the file."
+)
+
 
 class TicketError(Exception):
     pass
