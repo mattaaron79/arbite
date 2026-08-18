@@ -17,8 +17,9 @@ FIELD_NOTES = {
     "title": "short human-readable summary",
     "status": "open | in_progress | blocked | closed -- mirrors the ticket's folder, kept in sync by every arbite command",
     "type": "bug | feature | refactor | chore",
-    "tier": "low | medium | high -- capability level required to work the ticket",
+    "tier": "low | medium | high | frontier -- agent capability level required to work the ticket",
     "domain": "what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io -- drives routing",
+    "priority": "numeric urgency index, lower = more urgent (e.g. 1 is highest priority) -- used to order which workable ticket to pick up next; unset (null) sorts last",
     "tags": "freeform list, for human/codebase-area search -- distinct from domain",
     "assignee": "agent id currently working the ticket, e.g. claude.haiku.001, or null if unclaimed",
     "depends_on": "list of other ticket ids that must close first (structural)",
@@ -54,7 +55,10 @@ def render(parser, subparsers_by_name: dict) -> str:
         "**Any agent or human working in this repo should use `arbite` for creating, claiming, "
         "blocking, and closing tasks instead of ad hoc notes or files.** The ticket's folder location "
         "is the single source of truth for its state -- an agent's own memory of what it was doing is "
-        "only a hint, and must be checked against the ticket's actual location before being trusted."
+        "only a hint, and must be checked against the ticket's actual location before being trusted. "
+        "Agents should also prefer `arbite note` over directly editing a ticket file to leave progress "
+        "notes -- it timestamps and attributes the entry consistently instead of relying on freeform "
+        "hand edits."
     )
     lines.append("")
     lines.append("## Directory layout")
@@ -84,7 +88,9 @@ def render(parser, subparsers_by_name: dict) -> str:
         "`depends_on` (structural, ticket ids) and `blocked_by` (freeform, human-readable) are "
         "deliberately separate fields -- don't collapse them. `tier` (capability level) and `domain` "
         "(specialization) are independent axes. `domain` (routing) and `tags` (search) serve different "
-        "purposes even though both are strings."
+        "purposes even though both are strings. `priority` (urgency) is independent of `tier` "
+        "(capability): a trivial chore can still be urgent. When choosing between workable tickets, "
+        "pick the one with the lowest `priority` number first."
     )
     lines.append("")
     lines.append("## Agent identity and resuming work")
@@ -102,9 +108,10 @@ def render(parser, subparsers_by_name: dict) -> str:
     lines.append("")
     lines.append("```")
     lines.append("arbite list --status open --domain mesh --tier medium   # find something to work")
+    lines.append("arbite list next --tier high                            # grab the next workable open ticket")
     lines.append("arbite show tic-a1b2                                    # read it in full")
     lines.append("arbite claim tic-a1b2 --agent claude.haiku.001          # take it")
-    lines.append("# ...do the work, append progress notes to the ticket body...")
+    lines.append('arbite note tic-a1b2 claude.haiku.001 "progress update" # ...do the work, log progress...')
     lines.append('arbite block tic-a1b2 --reason "waiting on tic-c3d4"    # if stalled')
     lines.append("arbite close tic-a1b2                                   # when done")
     lines.append("```")

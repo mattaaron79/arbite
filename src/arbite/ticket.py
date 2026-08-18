@@ -27,6 +27,7 @@ FIELD_ORDER = [
     "type",
     "tier",
     "domain",
+    "priority",
     "tags",
     "assignee",
     "depends_on",
@@ -35,6 +36,9 @@ FIELD_ORDER = [
     "updated",
     "closed",
 ]
+
+# Sentinels so unset priorities sort after every explicit numeric priority.
+PRIORITY_MAX = float("inf")
 
 DEFAULT_BODY = "## Description\n{description}\n\n## Notes\n"
 
@@ -63,6 +67,7 @@ class Ticket:
     type: str
     tier: str
     domain: str
+    priority: Optional[int] = None
     tags: list = field(default_factory=list)
     assignee: Optional[str] = None
     depends_on: list = field(default_factory=list)
@@ -71,6 +76,11 @@ class Ticket:
     updated: str = ""
     closed: Optional[str] = None
     body: str = ""
+
+    def priority_sort_key(self) -> float:
+        """Sort key for urgency: lower number = more urgent. Unset (None)
+        tickets sort after every explicit priority so they are picked up last."""
+        return self.priority if self.priority is not None else PRIORITY_MAX
 
     def to_markdown(self) -> str:
         data = {}
@@ -147,12 +157,49 @@ def load_all_tickets(tickets_root: Path):
         yield path, load_ticket(path)
 
 
+def find_tickets(tickets_root: Path, term: str):
+    """Returns a sorted list of (path, Ticket) whose ids contain `term` as a
+    case-insensitive substring (wildcard) search -- e.g. 'f6' matches
+    tic-f607, and 'tic-' matches every ticket. Sorted by ticket id."""
+    term_lower = term.lower()
+    matches = [
+        (path, ticket)
+        for path, ticket in load_all_tickets(tickets_root)
+        if term_lower in ticket.id.lower()
+    ]
+    matches.sort(key=lambda pair: pair[1].id)
+    return matches
+
+
 def find_ticket(tickets_root: Path, ticket_id: str):
-    """Returns (path, Ticket) for the given id, or raises TicketError."""
-    for path, ticket in load_all_tickets(tickets_root):
-        if ticket.id == ticket_id:
-            return path, ticket
-    raise TicketError(f"no ticket found with id {ticket_id}")
+    """Returns (path, Ticket) for the ticket matching `ticket_id` by wildcard
+    (substring) search; if several tickets match, the first alphabetically is
+    returned. Raises TicketError if nothing matches."""
+    matches = find_tickets(tickets_root, ticket_id)
+    if not matches:
+        raise TicketError(f"no ticket found matching '{ticket_id}'")
+    return matches[0]
+
+
+def append_note(ticket: Ticket, agent_id: str, message: str, note_date: Optional[str] = None) -> None:
+    """Appends a timestamped, agent-identified entry to the ticket's '## Notes'
+    section, with a blank line between entries. Mutates ticket.body in place;
+    caller is responsible for saving."""
+    note_date = note_date or today()
+    entry = f"- {note_date} {agent_id}: {message}"
+    marker = "## Notes"
+    idx = ticket.body.rfind(marker)
+    if idx == -1:
+        head = ticket.body.rstrip()
+        sep = "\n\n" if head else ""
+        ticket.body = f"{head}{sep}{marker}\n{entry}\n"
+        return
+    head = ticket.body[: idx + len(marker)]
+    existing = ticket.body[idx + len(marker) :].strip("\n")
+    if existing.strip():
+        ticket.body = f"{head}\n{existing}\n\n{entry}\n"
+    else:
+        ticket.body = f"{head}\n{entry}\n"
 
 
 def move_ticket(path: Path, ticket: Ticket, tickets_root: Path, new_status: str) -> Path:

@@ -60,6 +60,7 @@ status: open              # open | in_progress | blocked | closed — mirrors fo
 type: bug                  # bug | feature | refactor | chore
 tier: medium                # low | medium | high — capability level required
 domain: mesh                 # what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io
+priority: 2                   # numeric urgency index, lower = more urgent (1 is highest); unset sorts last
 tags: [normals, curves]       # freeform, for human/codebase-area search — distinct from domain
 
 assignee: null                # e.g. claude.haiku.001, or null if unclaimed
@@ -91,6 +92,12 @@ Field notes:
 - `domain` vs `tags`: `domain` drives routing (what kind of agent should
   claim this). `tags` is for searching by codebase area. Different purposes
   even though both are strings.
+- `priority`: numeric urgency index where **lower = more urgent** (1 is
+  highest). Independent of `tier` (capability) — a low-tier chore can still
+  be urgent. When two tickets are both workable, work the one with the lower
+  `priority` number first; tickets with no `priority` set sort last and
+  should be treated as least urgent. `arbite list` already orders by this,
+  and `arbite create --priority N` sets it at creation time.
 
 ## Agent identity and memory
 
@@ -121,8 +128,10 @@ Field notes:
 Command name: `arbite`. Suggested commands to implement:
 - `arbite init` — create `tickets/` folder structure if it doesn't exist, and create
   `agents/` scratchpad files for each known agent identity (from config)
-- `arbite create` — create a new ticket in `open/`
-- `arbite list [--status --tier --domain --assignee]` — list/filter tickets
+- `arbite create [--priority N]` — create a new ticket in `open/` (priority
+  is a numeric urgency index, lower = more urgent, optional)
+- `arbite list [--status --tier --domain --priority --assignee]` — list/filter
+  tickets, sorted so more urgent (lower priority) workable tickets come first
 - `arbite claim <id> --agent <id>` — move ticket to `in_progress/`, set
   `assignee`, update `status` and `updated`
 - `arbite block <id> --reason <text or ticket id>` — move to `blocked/`,
@@ -130,6 +139,12 @@ Command name: `arbite`. Suggested commands to implement:
 - `arbite close <id>` — move to `closed/YYYY-MM/` (by current date), set
   `status: closed` and `closed` date
 - `arbite show <id>` — print a ticket's full contents
+- `arbite note <id> <agent_id> <message>` — append a timestamped,
+  agent-identified entry to the ticket's `## Notes` section (blank line
+  between entries) and update `updated`. Agents should prefer this over
+  directly editing a ticket file to leave progress notes — it keeps
+  attribution and timestamps consistent instead of relying on freeform hand
+  edits.
 - `arbite deps <id>` — walk `depends_on` to show a dependency tree (nice
   to have, not required for first pass)
 
