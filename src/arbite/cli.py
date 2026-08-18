@@ -345,6 +345,31 @@ def cmd_close(args):
     print(f"closed {t.id} -> {new_path}")
 
 
+def cmd_reopen(args):
+    tickets_root = _require_tickets_root()
+    path, t = ticket_mod.find_ticket(tickets_root, args.id)
+    if t.status == "open":
+        raise TicketError(f"ticket {t.id} is already open")
+    t.closed = None
+    t.blocked_by = None
+    t.updated = ticket_mod.today()
+    ticket_mod.append_note(t, args.agent, "Reopened.")
+    new_path = ticket_mod.move_ticket(path, t, tickets_root, "open")
+    print(f"reopened {t.id} -> {new_path}")
+
+
+def cmd_shelve(args):
+    tickets_root = _require_tickets_root()
+    path, t = ticket_mod.find_ticket(tickets_root, args.id)
+    t.updated = ticket_mod.today()
+    message = "Shelved."
+    if args.reason:
+        message = f"Shelved: {args.reason}"
+    ticket_mod.append_note(t, "system", message)
+    new_path = ticket_mod.move_ticket(path, t, tickets_root, "shelved")
+    print(f"shelved {t.id} -> {new_path}")
+
+
 def cmd_note(args):
     tickets_root = _require_tickets_root()
     path, t = ticket_mod.find_ticket(tickets_root, args.id)
@@ -513,6 +538,35 @@ def build_parser():
     )
     p_close.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_close.set_defaults(func=cmd_close)
+
+    p_reopen = sub.add_parser(
+        "reopen",
+        help="move a ticket back to open/ (reopen it)",
+        description="Move a ticket that is not currently open back to tickets/open/: clear its "
+        "closed date and block reason, append an automatic 'Reopened' note, and update status/updated.",
+    )
+    p_reopen.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_reopen.add_argument(
+        "--agent",
+        default="system",
+        help="agent id (or 'system') attributed on the automatic reopen note, e.g. "
+        "claude.haiku.001 (default: system)",
+    )
+    p_reopen.set_defaults(func=cmd_reopen)
+
+    p_shelve = sub.add_parser(
+        "shelve",
+        help="move a ticket to shelved/ (shelve it)",
+        description="Move a ticket to tickets/shelved/, set status/updated, and append an automatic "
+        "timestamped note recording that it was shelved (including --reason if given).",
+    )
+    p_shelve.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_shelve.add_argument(
+        "--reason",
+        default="",
+        help="why it's being shelved; included in the automatic note (optional)",
+    )
+    p_shelve.set_defaults(func=cmd_shelve)
 
     p_note = sub.add_parser(
         "note",

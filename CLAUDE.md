@@ -35,6 +35,7 @@ tickets/
   open/
   in_progress/
   blocked/
+  shelved/
   closed/
     2026-08/
     2026-07/
@@ -56,7 +57,7 @@ tickets/
 ---
 id: tic-a1b2
 title: Fix off-by-one in vertex normal calc
-status: open              # open | in_progress | blocked | closed — mirrors folder
+status: open              # open | in_progress | blocked | shelved | closed — mirrors folder
 type: bug                  # bug | feature | refactor | chore
 tier: medium                # low | medium | high — capability level required
 domain: mesh                 # what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io
@@ -136,8 +137,15 @@ Command name: `arbite`. Suggested commands to implement:
   `assignee`, update `status` and `updated`
 - `arbite block <id> --reason <text or ticket id>` — move to `blocked/`,
   set `blocked_by`, update `status`
+- `arbite shelve <id> [--reason <text>]` — move to `shelved/`, set
+  `status: shelved`, update `updated`, and append an automatic timestamped
+  note recording that it was shelved (including `--reason` if given)
 - `arbite close <id>` — move to `closed/YYYY-MM/` (by current date), set
   `status: closed` and `closed` date
+- `arbite reopen <id> [--agent <id>]` — move a ticket that is not `open`
+  back to `open/`, clear its `closed` date and `blocked_by`, update
+  `status`/`updated`, and append an automatic "Reopened" note (attributed to
+  `--agent`, default `system`); errors if the ticket is already `open`
 - `arbite show <id>` — print a ticket's full contents
 - `arbite note <id> <agent_id> <message>` — append a timestamped,
   agent-identified entry to the ticket's `## Notes` section (blank line

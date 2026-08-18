@@ -11,11 +11,11 @@ from typing import Optional
 
 import yaml
 
-STATUSES = ["open", "in_progress", "blocked", "closed"]
+STATUSES = ["open", "in_progress", "blocked", "shelved", "closed"]
 
 # Statuses that live directly under tickets/<status>/ (closed is special-cased
 # into tickets/closed/YYYY-MM/).
-FLAT_STATUS_DIRS = {"open", "in_progress", "blocked"}
+FLAT_STATUS_DIRS = {"open", "in_progress", "blocked", "shelved"}
 
 ID_PATTERN = re.compile(r"^tic-[0-9a-f]{4}$")
 
