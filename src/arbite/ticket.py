@@ -54,6 +54,33 @@ BLANK_WARNING = (
     "a real description below, and saved the file."
 )
 
+# Raw tickets (`arbite raw <memo|feature|bug> <message>`): deliberately
+# unclassified quick captures. Only the type and a placeholder title are set;
+# everything needed to actually work them (a real title, tier, domain,
+# priority, and an expanded description) is left to be filled in by triage, so
+# raw tickets must be classified before they can be claimed or worked.
+RAW_TYPE_CHOICES = ["memo", "feature", "bug"]
+
+RAW_TITLE_FORMAT = "{type} (raw): Requires Classification"
+
+RAW_DESCRIPTION = (
+    "This is a **raw** ticket: it was captured from a brief request without proper "
+    "classification. It must be filled out before it can be worked.\n\n"
+    "Original request: {message}\n\n"
+    "What still needs to be done (human or agent triage):\n"
+    "- title -- replace \"Requires Classification\" with a short human-readable summary\n"
+    "- tier -- low | medium | high (capability level required)\n"
+    "- domain -- e.g. mesh, image_gen, audio_gen, ui, io (drives routing)\n"
+    "- priority -- numeric urgency index, lower = more urgent\n"
+    "- description -- expand this body into a proper task description based on the "
+    "original request, including any acceptance criteria"
+)
+
+MEMO_RAW_NOTE = (
+    "> **Note:** a memo is primarily a request to update any project notes / "
+    "documentation that is being maintained, rather than a code change."
+)
+
 
 class TicketError(Exception):
     pass

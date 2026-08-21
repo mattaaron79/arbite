@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import re
 import sys
 from pathlib import Path
 
@@ -116,6 +117,49 @@ def cmd_create(args):
         print(f"created blank template {new_id} at {dest} -- fill in the TODOs and save before it's claimed")
     else:
         print(f"created {new_id} at {dest}")
+
+
+def cmd_raw(args):
+    """Create a deliberately unclassified 'raw' ticket in tickets/open/ from a
+    brief request. Only the type and a placeholder title are set; the body
+    explains what still needs to be filled in (title, tier, domain, priority,
+    and an expanded description) before the ticket can be claimed or worked."""
+    tickets_root = _require_tickets_root()
+    existing_ids = {t.id for _, t in ticket_mod.load_all_tickets(tickets_root)}
+    new_id = ticket_mod.gen_id(existing_ids)
+    today = ticket_mod.today()
+    message = " ".join(args.message)
+
+    description = ticket_mod.RAW_DESCRIPTION.format(message=message)
+    if args.type == "memo":
+        description = f"{description}\n\n{ticket_mod.MEMO_RAW_NOTE}"
+
+    body = ticket_mod.DEFAULT_BODY.format(description=description)
+
+    new_ticket = Ticket(
+        id=new_id,
+        title=ticket_mod.RAW_TITLE_FORMAT.format(type=args.type),
+        status="open",
+        type=args.type,
+        tier=ticket_mod.BLANK_TIER,
+        domain=ticket_mod.BLANK_DOMAIN,
+        priority=None,
+        tags=[],
+        assignee=None,
+        depends_on=[],
+        blocked_by=None,
+        created=today,
+        updated=today,
+        closed=None,
+        body=body,
+    )
+
+    dest = ticket_mod.status_dir("open", tickets_root) / f"{new_id}.md"
+    ticket_mod.save_ticket(new_ticket, dest)
+    print(
+        f"created raw {args.type} ticket {new_id} at {dest} -- classify it "
+        "(title/tier/domain/priority/description) before it can be worked"
+    )
 
 
 def _matches_field_filters(args, t):
@@ -407,6 +451,94 @@ def cmd_deps(args):
     walk(start.id, "", set())
 
 
+def cmd_depend(args):
+    """Set or clear a ticket's depends_on. With two arguments, <tic_a> is made to
+    depend on <tic_b> (added to its depends_on, deduplicated). With a single
+    argument, all of <tic_a>'s dependencies are cleared."""
+    tickets_root = _require_tickets_root()
+    path, t = ticket_mod.find_ticket(tickets_root, args.id)
+    if args.dep is None:
+        t.depends_on = []
+        t.updated = ticket_mod.today()
+        ticket_mod.save_ticket(t, path)
+        print(f"cleared dependencies of {t.id}")
+        return
+    _, dep = ticket_mod.find_ticket(tickets_root, args.dep)
+    if dep.id == t.id:
+        raise TicketError(f"ticket {t.id} cannot depend on itself")
+    if dep.id not in t.depends_on:
+        t.depends_on.append(dep.id)
+        t.updated = ticket_mod.today()
+        ticket_mod.save_ticket(t, path)
+        print(f"{t.id} now depends on {dep.id}")
+    else:
+        print(f"{t.id} already depends on {dep.id}")
+
+
+def _ticket_field_value(t: Ticket, name: str) -> str:
+    """String form of a ticket field for searching; 'body' is the markdown body."""
+    if name == "body":
+        return t.body or ""
+    value = getattr(t, name, None)
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def _compile_matcher(pattern: str, use_regex: bool, use_wildcard: bool, ignore_case: bool = True):
+    """Build a text->bool matcher from the search pattern and mode flags. Default is a
+    case-insensitive substring match; -w treats '*' as 'any' (simple globbing); -r uses
+    the pattern as a regular expression (invalid patterns raise TicketError)."""
+    flags = re.IGNORECASE if ignore_case else 0
+    if use_regex:
+        try:
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            raise TicketError(f"invalid regex '{pattern}': {e}")
+        return lambda text: rx.search(text) is not None
+    if use_wildcard:
+        # Translate simple globs: everything is literal except '*' = any text (incl. empty).
+        rx = re.compile(re.escape(pattern).replace(r"\*", ".*"), flags)
+        return lambda text: rx.search(text) is not None
+    needle = pattern.lower()
+    return lambda text: needle in text.lower()
+
+
+# Fields `arbite search --params` accepts: every frontmatter field plus the body.
+SEARCH_PARAMS = set(ticket_mod.FIELD_ORDER) | {"body"}
+
+
+def cmd_search(args):
+    """Search every ticket for the given text, optionally restricted to specific
+    fields with --params (comma-separated; 'body' = the rest of the ticket, 'all' =
+    every field plus the body, the default). Matching is a case-insensitive substring
+    by default; -w adds simple wildcards ('*' = any text) and -r treats the text as a
+    regular expression."""
+    tickets_root = _require_tickets_root()
+    params = _split_csv(args.params) or ["all"]
+    if "all" in params:
+        params = sorted(SEARCH_PARAMS)
+    unknown = [p for p in params if p not in SEARCH_PARAMS]
+    if unknown:
+        raise TicketError(
+            f"unknown ticket field(s) to search: {', '.join(unknown)} "
+            f"(valid: all, body, {', '.join(ticket_mod.FIELD_ORDER)})"
+        )
+    matcher = _compile_matcher(" ".join(args.search_text), args.regex, args.wildcard)
+    rows = [
+        t
+        for _, t in ticket_mod.load_all_tickets(tickets_root)
+        if any(matcher(_ticket_field_value(t, p)) for p in params)
+    ]
+    if not rows:
+        print("no tickets found")
+        return
+    rows.sort(key=lambda t: (t.status, t.priority_sort_key(), t.id))
+    _print_flat(rows)
+
+
 def build_parser():
     """Returns (parser, subparsers_by_name). The dict is used by `arbite init`
     to render ARBITE.md's command reference straight from argparse's own
@@ -469,6 +601,31 @@ def build_parser():
     )
     p_create.set_defaults(func=cmd_create)
 
+    p_raw = sub.add_parser(
+        "raw",
+        help="create an unclassified raw ticket in open/ from a brief request",
+        description="Capture a brief request as a raw ticket in tickets/open/. Sets the type "
+        "and title to '<type> (raw): Requires Classification', leaves tier/domain/priority as "
+        "TODO placeholders, and writes a body explaining that the ticket must be filled out "
+        "(a real title, tier, domain, priority, and an expanded description) before it can be "
+        "claimed or worked. Use 'memo' when the request is to update project notes / "
+        "documentation rather than make a code change.",
+    )
+    p_raw.add_argument(
+        "type",
+        choices=ticket_mod.RAW_TYPE_CHOICES,
+        metavar="TYPE",
+        help="kind of raw ticket: memo | feature | bug",
+    )
+    p_raw.add_argument(
+        "message",
+        metavar="MESSAGE",
+        nargs="+",
+        help="brief request to capture, e.g. \"users can't save without auth\" "
+        "(joined with spaces if multiple words)",
+    )
+    p_raw.set_defaults(func=cmd_raw)
+
     p_list = sub.add_parser(
         "list", help="list/filter tickets", description="List tickets, optionally filtered by one or more fields. "
         "Sorted so that within a status, more urgent tickets (lower priority number) come first."
@@ -510,6 +667,43 @@ def build_parser():
         "capability tier",
     )
     p_list.set_defaults(func=cmd_list)
+
+    p_search = sub.add_parser(
+        "search",
+        help="search tickets by field and/or body text",
+        description="Search every ticket for SEARCH_TEXT, optionally restricted to specific "
+        "fields with --params. Matching is a case-insensitive substring by default; -w adds "
+        "simple wildcards ('*' matches any text, e.g. '*popup*') and -r treats SEARCH_TEXT "
+        "as a regular expression. A ticket matches if any selected field matches.",
+    )
+    p_search.add_argument(
+        "--params",
+        default="all",
+        metavar="FIELDS",
+        help="comma-separated ticket fields to search, e.g. 'title,body'; 'body' means the "
+        "rest of the ticket (markdown body), 'all' means every field plus the body "
+        "(default: all)",
+    )
+    search_mode = p_search.add_mutually_exclusive_group()
+    search_mode.add_argument(
+        "-r",
+        "--regex",
+        action="store_true",
+        help="treat SEARCH_TEXT as a regular expression (case-insensitive)",
+    )
+    search_mode.add_argument(
+        "-w",
+        "--wildcard",
+        action="store_true",
+        help="simple wildcards: '*' matches any text, e.g. '*popup*' (case-insensitive)",
+    )
+    p_search.add_argument(
+        "search_text",
+        metavar="SEARCH_TEXT",
+        nargs="+",
+        help="text to search for (joined with spaces if multiple words)",
+    )
+    p_search.set_defaults(func=cmd_search)
 
     p_claim = sub.add_parser(
         "claim",
@@ -593,6 +787,24 @@ def build_parser():
     )
     p_deps.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_deps.set_defaults(func=cmd_deps)
+
+    p_depend = sub.add_parser(
+        "depend",
+        help="add a dependency to a ticket's depends_on, or clear all of its dependencies",
+        description="Declare that one ticket depends on another. With two arguments, "
+        "<tic_a> is made to depend on <tic_b>: <tic_b> is added to <tic_a>'s "
+        "depends_on (deduplicated, existing dependencies are kept). With a single "
+        "argument, all of <tic_a>'s dependencies are cleared.",
+    )
+    p_depend.add_argument("id", metavar="TIC_A", help=TICKET_ID_HELP)
+    p_depend.add_argument(
+        "dep",
+        metavar="TIC_B",
+        nargs="?",
+        default=None,
+        help="ticket that <TIC_A> depends on; omit to clear all of <TIC_A>'s dependencies",
+    )
+    p_depend.set_defaults(func=cmd_depend)
 
     return parser, dict(sub.choices)
 
