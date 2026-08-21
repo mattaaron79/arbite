@@ -217,7 +217,9 @@ options:
 ### `arbite search`
 
 ```
-usage: arbite search [-h] [--params FIELDS] [-r | -w]
+usage: arbite search [-h] [--params FIELDS]
+                     [--status {open,in_progress,blocked,shelved,closed}]
+                     [-r | -w]
                      SEARCH_TEXT [SEARCH_TEXT ...]
 
 Search every ticket for SEARCH_TEXT, optionally restricted to specific fields
@@ -227,17 +229,22 @@ SEARCH_TEXT as a regular expression. A ticket matches if any selected field
 matches.
 
 positional arguments:
-  SEARCH_TEXT      text to search for (joined with spaces if multiple words)
+  SEARCH_TEXT           text to search for (joined with spaces if multiple
+                        words)
 
 options:
-  -h, --help       show this help message and exit
-  --params FIELDS  comma-separated ticket fields to search, e.g. 'title,body';
-                   'body' means the rest of the ticket (markdown body), 'all'
-                   means every field plus the body (default: all)
-  -r, --regex      treat SEARCH_TEXT as a regular expression (case-
-                   insensitive)
-  -w, --wildcard   simple wildcards: '*' matches any text, e.g. '*popup*'
-                   (case-insensitive)
+  -h, --help            show this help message and exit
+  --params FIELDS       comma-separated ticket fields to search, e.g.
+                        'title,body'; 'body' means the rest of the ticket
+                        (markdown body), 'all' means every field plus the body
+                        (default: all)
+  --status {open,in_progress,blocked,shelved,closed}
+                        only search tickets with this status (default: all
+                        statuses)
+  -r, --regex           treat SEARCH_TEXT as a regular expression (case-
+                        insensitive)
+  -w, --wildcard        simple wildcards: '*' matches any text, e.g. '*popup*'
+                        (case-insensitive)
 ```
 
 ### `arbite claim`

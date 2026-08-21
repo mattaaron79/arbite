@@ -530,7 +530,8 @@ def cmd_search(args):
     rows = [
         t
         for _, t in ticket_mod.load_all_tickets(tickets_root)
-        if any(matcher(_ticket_field_value(t, p)) for p in params)
+        if (not args.status or t.status == args.status)
+        and any(matcher(_ticket_field_value(t, p)) for p in params)
     ]
     if not rows:
         print("no tickets found")
@@ -683,6 +684,11 @@ def build_parser():
         help="comma-separated ticket fields to search, e.g. 'title,body'; 'body' means the "
         "rest of the ticket (markdown body), 'all' means every field plus the body "
         "(default: all)",
+    )
+    p_search.add_argument(
+        "--status",
+        choices=STATUSES,
+        help="only search tickets with this status (default: all statuses)",
     )
     search_mode = p_search.add_mutually_exclusive_group()
     search_mode.add_argument(
