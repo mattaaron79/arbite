@@ -64,6 +64,7 @@ class Spec:
     created: str = ""
     events: list = field(default_factory=list)
     blank: bool = False
+    epic: str = ""
 
 
 SPECS = [
@@ -72,6 +73,7 @@ SPECS = [
         id="tic-a1b2",
         title="Set up image_gen service skeleton",
         type="chore", tier="medium", domain="image_gen",
+        epic="image-gen-backend",
         tags=["infra", "scaffolding"],
         description=(
             "Create the package skeleton for the image generation service: module layout, "
@@ -90,6 +92,7 @@ SPECS = [
         id="tic-b2c3",
         title="Add mesh normals computation pipeline",
         type="feature", tier="high", domain="mesh",
+        epic="mesh-pipeline",
         tags=["normals", "curves"],
         description=(
             "Implement the core normals pipeline: smooth/flat normals, normal map baking hooks, "
@@ -109,6 +112,7 @@ SPECS = [
         id="tic-c3d4",
         title="Fix UV seam artifacts on curved meshes",
         type="bug", tier="high", domain="mesh",
+        epic="mesh-pipeline",
         tags=["uv", "normals"],
         description=(
             "Curved meshes show a visible seam/band where UV islands are split. Likely the normals "
@@ -127,6 +131,7 @@ SPECS = [
         id="tic-d4e5",
         title="Route image_gen through shared io layer",
         type="refactor", tier="medium", domain="io",
+        epic="io-layer",
         tags=["io", "image_gen"],
         description=(
             "image_gen currently does its own file read/write. Move that into the shared io layer "
@@ -146,6 +151,7 @@ SPECS = [
         id="tic-e5f6",
         title="Implement audio_gen wave shape preview",
         type="feature", tier="medium", domain="audio_gen",
+        epic="audio-gen",
         tags=["waveform", "preview"],
         description=(
             "Add a wave shape preview panel to the audio generator so users see the generated "
@@ -162,6 +168,7 @@ SPECS = [
         id="tic-f607",
         title="Optimize mesh decimation for large models",
         type="refactor", tier="high", domain="mesh",
+        epic="mesh-pipeline",
         tags=["decimation", "performance"],
         description=(
             "Decimation is too slow and memory-hungry on high-poly models. Replace the current "
@@ -181,6 +188,7 @@ SPECS = [
         id="tic-0718",
         title="Fix crash loading empty OBJ files",
         type="bug", tier="high", domain="io",
+        epic="io-layer",
         tags=["crash", "obj"],
         description=(
             "Importing an OBJ with no geometry (header-only file) crashes the addon instead of "
@@ -197,6 +205,7 @@ SPECS = [
         id="tic-1829",
         title="Document image_gen prompt schema",
         type="chore", tier="low", domain="image_gen",
+        epic="image-gen-backend",
         tags=["docs", "schema"],
         description=(
             "Write a reference for the image_gen prompt schema (fields, defaults, examples) and "
@@ -213,6 +222,7 @@ SPECS = [
         id="tic-293a",
         title="Normalize UI color palette tokens",
         type="feature", tier="low", domain="ui",
+        epic="ui-polish",
         tags=["design", "tokens"],
         description=(
             "Collect the hardcoded hex colors scattered across panels into a single tokens file and "
@@ -229,6 +239,7 @@ SPECS = [
         id="tic-3a4b",
         title="Backfill unit tests for mesh pipeline",
         type="chore", tier="medium", domain="mesh",
+        epic="mesh-pipeline",
         tags=["tests", "normals"],
         description=(
             "The mesh pipeline shipped without tests. Backfill coverage for normal computation, "
@@ -246,6 +257,7 @@ SPECS = [
         id="tic-c8d9",
         title="Support legacy .3ds import format",
         type="chore", tier="low", domain="io",
+        epic="io-layer",
         tags=["import", "legacy"],
         description=(
             "Investigate adding a .3ds importer for old projects. Evaluate scope before committing "
@@ -264,6 +276,7 @@ SPECS = [
         id="tic-8f90",
         title="Migrate image_gen backend to new diffusion service",
         type="feature", tier="high", domain="image_gen",
+        epic="image-gen-backend",
         tags=["backend", "migration"],
         description=(
             "The image_gen service is moving to a new diffusion backend. Port the request/response "
@@ -280,6 +293,7 @@ SPECS = [
         id="tic-b1c2",
         title="Fix audio latency in preview playback",
         type="bug", tier="high", domain="audio_gen",
+        epic="audio-gen",
         tags=["latency", "playback"],
         description=(
             "Preview playback has an audible ~150ms latency spike on first play. Buffers are being "
@@ -295,6 +309,7 @@ SPECS = [
         id="tic-5c6d",
         title="Expose audio sample buffer via io layer",
         type="feature", tier="medium", domain="io",
+        epic="io-layer",
         tags=["io", "audio"],
         description=(
             "Add a streaming sample-buffer API to the shared io layer so audio_gen consumers can "
@@ -310,6 +325,7 @@ SPECS = [
         id="tic-4b5c",
         title="Add real-time waveform scrubbing to audio_gen UI",
         type="feature", tier="high", domain="audio_gen",
+        epic="audio-gen",
         tags=["waveform", "ui"],
         description=(
             "Let users scrub the waveform preview in real time. Requires the wave shape preview "
@@ -326,6 +342,7 @@ SPECS = [
         id="tic-6d7e",
         title="Regenerate PBR textures with new image_gen backend",
         type="refactor", tier="high", domain="image_gen",
+        epic="image-gen-backend",
         tags=["pbr", "textures"],
         description=(
             "Point the PBR texture baking at the new image_gen backend and re-baseline the reference "
@@ -342,6 +359,7 @@ SPECS = [
         id="tic-c2d3",
         title="Refactor shared io retry logic",
         type="refactor", tier="medium", domain="io",
+        epic="io-layer",
         tags=["retry"],
         description=(
             "The io retry wrapper predates the streaming APIs and assumes whole-buffer reads. Rework "
@@ -359,6 +377,7 @@ SPECS = [
         id="tic-7e8f",
         title="Investigate intermittent mesh LOD pop-in",
         type="bug", tier="medium", domain="mesh",
+        epic="mesh-pipeline",
         priority=3,
         tags=["lod", "pop-in"],
         description=(
@@ -371,6 +390,7 @@ SPECS = [
         id="tic-90a1",
         title="Add keyboard shortcuts for viewport navigation",
         type="feature", tier="low", domain="ui",
+        epic="ui-polish",
         priority=5,
         tags=["shortcuts", "viewport"],
         description=(
@@ -383,6 +403,7 @@ SPECS = [
         id="tic-a0b2",
         title="Add glTF 2.0 export support",
         type="feature", tier="high", domain="io",
+        epic="io-layer",
         priority=1,
         tags=["export", "gltf"],
         description=(
@@ -396,6 +417,7 @@ SPECS = [
         id="tic-d3e4",
         title="Create demo scene pack",
         type="chore", tier="low", domain="mesh",
+        epic="mesh-pipeline",
         priority=6,
         tags=["assets", "demo"],
         description=(
@@ -408,6 +430,7 @@ SPECS = [
         id="tic-e4f5",
         title="Dark mode polish pass on panels",
         type="feature", tier="low", domain="ui",
+        epic="ui-polish",
         priority=4,
         tags=["dark-mode", "polish"],
         description=(
@@ -420,6 +443,7 @@ SPECS = [
         id="tic-f5a6",
         title="Investigate high memory use on large scenes",
         type="bug", tier="high", domain="mesh",
+        epic="mesh-pipeline",
         priority=2,
         tags=["memory", "performance"],
         description=(
@@ -432,6 +456,7 @@ SPECS = [
         id="tic-b7c8",
         title="Add image_gen style presets to UI dropdown",
         type="feature", tier="medium", domain="image_gen",
+        epic="image-gen-backend",
         priority=2,
         tags=["presets", "ui"],
         description=(
@@ -490,6 +515,7 @@ def _create_ticket(spec: Spec, date: str) -> tuple[Ticket, Path]:
         type=typ,
         tier=tier,
         domain=domain,
+        epic=spec.epic or None,
         priority=spec.priority,
         tags=list(spec.tags),
         assignee=None,

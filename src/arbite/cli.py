@@ -100,6 +100,7 @@ def cmd_create(args):
         type=args.type or ticket_mod.BLANK_TYPE,
         tier=args.tier or ticket_mod.BLANK_TIER,
         domain=args.domain or ticket_mod.BLANK_DOMAIN,
+        epic=args.epic,
         priority=args.priority,
         tags=_split_csv(args.tags),
         assignee=None,
@@ -122,8 +123,10 @@ def cmd_create(args):
 def cmd_raw(args):
     """Create a deliberately unclassified 'raw' ticket in tickets/open/ from a
     brief request. Only the type and a placeholder title are set; the body
-    explains what still needs to be filled in (title, tier, domain, priority,
-    and an expanded description) before the ticket can be claimed or worked."""
+    explains what still needs to be filled in (title, tier, domain, epic,
+    priority, and an expanded description) before the ticket can be claimed or
+    worked. The ticket is auto-grouped under the 'classification' epic so
+    triage/classification jobs can discover it."""
     tickets_root = _require_tickets_root()
     existing_ids = {t.id for _, t in ticket_mod.load_all_tickets(tickets_root)}
     new_id = ticket_mod.gen_id(existing_ids)
@@ -143,6 +146,7 @@ def cmd_raw(args):
         type=args.type,
         tier=ticket_mod.BLANK_TIER,
         domain=ticket_mod.BLANK_DOMAIN,
+        epic=ticket_mod.CLASSIFICATION_EPIC,
         priority=None,
         tags=[],
         assignee=None,
@@ -158,17 +162,20 @@ def cmd_raw(args):
     ticket_mod.save_ticket(new_ticket, dest)
     print(
         f"created raw {args.type} ticket {new_id} at {dest} -- classify it "
-        "(title/tier/domain/priority/description) before it can be worked"
+        "(title/tier/domain/epic/priority/description) before it can be worked; "
+        f"it is grouped under the '{ticket_mod.CLASSIFICATION_EPIC}' epic until then"
     )
 
 
 def _matches_field_filters(args, t):
-    """True if t passes the --status/--tier/--domain/--priority/--assignee filters."""
+    """True if t passes the --status/--tier/--domain/--epic/--priority/--assignee filters."""
     if args.status and t.status != args.status:
         return False
     if args.tier and t.tier != args.tier:
         return False
     if args.domain and t.domain != args.domain:
+        return False
+    if args.epic and t.epic != args.epic:
         return False
     if args.assignee and t.assignee != args.assignee:
         return False
@@ -184,13 +191,14 @@ def _print_flat(rows):
     priority_w = max(len("-") if t.priority is None else len(str(t.priority)) for t in rows) + 1
     tier_w = max(len(t.tier) for t in rows) + 1
     domain_w = max(len(t.domain) for t in rows) + 1
+    epic_w = max(len(t.epic or "-") for t in rows) + 1
     assignee_w = max(len(t.assignee or "-") for t in rows) + 1
 
     for t in rows:
         prio = "-" if t.priority is None else str(t.priority)
         print(
             f"{t.id:<{id_w}} {t.status:<{status_w}} {prio:<{priority_w}} "
-            f"{t.tier:<{tier_w}} {t.domain:<{domain_w}} "
+            f"{t.tier:<{tier_w}} {t.domain:<{domain_w}} {(t.epic or '-'):<{epic_w}} "
             f"{(t.assignee or '-'):<{assignee_w}} {t.title}"
         )
 
@@ -276,12 +284,14 @@ def _print_topo(scope):
 def _cmd_list_next(args, all_tickets):
     """Print a single list entry: the next open ticket in topological dependency
     order (dependencies come first; when several are ready at once, the most
-    urgent -- lowest priority number -- comes first). --tier narrows the
+    urgent -- lowest priority number -- comes first). --tier/--epic narrow the
     candidates, and anything that isn't `open` is never considered."""
     scope = {
         t.id: t
         for t in all_tickets
-        if t.status == "open" and (not args.tier or t.tier == args.tier)
+        if t.status == "open"
+        and (not args.tier or t.tier == args.tier)
+        and (not args.epic or t.epic == args.epic)
     }
     if not scope:
         print("no tickets found")
@@ -579,6 +589,11 @@ def build_parser():
         help="what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io (required unless --blank)",
     )
     p_create.add_argument(
+        "--epic",
+        help="larger initiative this ticket belongs to, e.g. 'mesh-pipeline' (optional; "
+        "group tickets under an epic with `arbite list --epic` / `arbite list next --epic`)",
+    )
+    p_create.add_argument(
         "--priority",
         type=int,
         default=None,
@@ -607,10 +622,12 @@ def build_parser():
         help="create an unclassified raw ticket in open/ from a brief request",
         description="Capture a brief request as a raw ticket in tickets/open/. Sets the type "
         "and title to '<type> (raw): Requires Classification', leaves tier/domain/priority as "
-        "TODO placeholders, and writes a body explaining that the ticket must be filled out "
-        "(a real title, tier, domain, priority, and an expanded description) before it can be "
-        "claimed or worked. Use 'memo' when the request is to update project notes / "
-        "documentation rather than make a code change.",
+        "TODO placeholders, auto-groups the ticket under the 'classification' epic (so "
+        "triage/classification jobs can find it with `arbite list next --epic classification`), "
+        "and writes a body explaining that the ticket must be filled out (a real title, tier, "
+        "domain, epic, priority, and an expanded description) before it can be claimed or "
+        "worked. Use 'memo' when the request is to update project notes / documentation "
+        "rather than make a code change.",
     )
     p_raw.add_argument(
         "type",
@@ -634,6 +651,7 @@ def build_parser():
     p_list.add_argument("--status", choices=STATUSES, help="filter by status")
     p_list.add_argument("--tier", choices=["low", "medium", "high"], help="filter by tier")
     p_list.add_argument("--domain", help="filter by domain")
+    p_list.add_argument("--epic", help="filter by epic (the larger initiative a ticket belongs to), e.g. 'mesh-pipeline'")
     p_list.add_argument("--priority", type=int, help="filter by exact priority number (lower = more urgent)")
     p_list.add_argument("--assignee", help="filter by assignee agent id")
     p_list.add_argument(
@@ -664,8 +682,8 @@ def build_parser():
         choices=["next"],
         metavar="SUBCOMMAND",
         help="'next' prints a single list entry for the next open ticket in topological "
-        "dependency order (most urgent first); combine with --tier to restrict to a "
-        "capability tier",
+        "dependency order (most urgent first); combine with --tier/--epic to restrict "
+        "to a capability tier or an epic",
     )
     p_list.set_defaults(func=cmd_list)
 

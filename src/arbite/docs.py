@@ -19,6 +19,7 @@ FIELD_NOTES = {
     "type": "bug | feature | refactor | chore | memo -- memo is produced by 'arbite raw' for requests to update project notes/documentation",
     "tier": "low | medium | high | frontier -- agent capability level required to work the ticket",
     "domain": "what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io -- drives routing",
+    "epic": "the larger initiative this ticket belongs to, e.g. mesh-pipeline -- a freeform grouping label for filtering (list/next --epic), not a structural dependency or a ticket id",
     "priority": "numeric urgency index, lower = more urgent (e.g. 1 is highest priority) -- used to order which workable ticket to pick up next; unset (null) sorts last",
     "tags": "freeform list, for human/codebase-area search -- distinct from domain",
     "assignee": "agent id currently working the ticket, e.g. claude.haiku.001, or null if unclaimed",
@@ -90,8 +91,10 @@ def render(parser, subparsers_by_name: dict) -> str:
         "deliberately separate fields -- don't collapse them. `tier` (capability level) and `domain` "
         "(specialization) are independent axes. `domain` (routing) and `tags` (search) serve different "
         "purposes even though both are strings. `priority` (urgency) is independent of `tier` "
-        "(capability): a trivial chore can still be urgent. When choosing between workable tickets, "
-        "pick the one with the lowest `priority` number first."
+        "(capability): a trivial chore can still be urgent. `epic` groups tickets under a larger "
+        "initiative (e.g. 'mesh-pipeline') -- it's a freeform label for filtering, not a structural "
+        "dependency. When choosing between workable tickets, pick the one with the lowest `priority` "
+        "number first."
     )
     lines.append("")
     lines.append("## Agent identity and resuming work")
@@ -110,6 +113,8 @@ def render(parser, subparsers_by_name: dict) -> str:
     lines.append("```")
     lines.append("arbite list --status open --domain mesh --tier medium   # find something to work")
     lines.append("arbite list next --tier high                            # grab the next workable open ticket")
+    lines.append("arbite list next --epic mesh-pipeline                   # next workable ticket in an epic")
+    lines.append("arbite list next --epic classification                  # next raw ticket needing triage")
     lines.append('arbite search --params title,body "LOD pop-in"          # find tickets by text')
     lines.append('arbite raw feature "add per-mesh LOD"                   # quick capture; classify later')
     lines.append("arbite show tic-a1b2                                    # read it in full")
@@ -131,13 +136,15 @@ def render(parser, subparsers_by_name: dict) -> str:
     lines.append(
         "A **raw** ticket (`arbite raw <memo|feature|bug> <message>`) is a deliberately "
         "unclassified quick capture of a brief request: it sets only the `type` and a placeholder "
-        "title (`<type> (raw): Requires Classification`), and its body lists what still needs to "
-        "be filled in -- a real title, `tier`, `domain`, `priority`, and an expanded description "
-        "based on the original request -- before the ticket can be claimed or worked. Raw tickets "
-        "exist so a thought isn't lost, not as workable tasks: treat them as requiring triage, and "
-        "classify them before picking them up. A `memo` raw ticket is primarily a request to "
-        "update any project notes / documentation that is being maintained, rather than a code "
-        "change."
+        "title (`<type> (raw): Requires Classification`), auto-groups the ticket under the "
+        "`classification` epic (so triage/classification jobs can discover it with "
+        "`arbite list next --epic classification`), and its body lists what still needs to be "
+        "filled in -- a real title, `tier`, `domain`, a real `epic`, `priority`, and an expanded "
+        "description based on the original request -- before the ticket can be claimed or worked. "
+        "Raw tickets exist so a thought isn't lost, not as workable tasks: treat them as requiring "
+        "triage, and classify them before picking them up. A `memo` raw ticket is primarily a "
+        "request to update any project notes / documentation that is being maintained, rather "
+        "than a code change."
     )
     lines.append("")
     lines.append("## Full command reference")

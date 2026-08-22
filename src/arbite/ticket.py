@@ -27,6 +27,7 @@ FIELD_ORDER = [
     "type",
     "tier",
     "domain",
+    "epic",
     "priority",
     "tags",
     "assignee",
@@ -56,12 +57,18 @@ BLANK_WARNING = (
 
 # Raw tickets (`arbite raw <memo|feature|bug> <message>`): deliberately
 # unclassified quick captures. Only the type and a placeholder title are set;
-# everything needed to actually work them (a real title, tier, domain,
+# everything needed to actually work them (a real title, tier, domain, epic,
 # priority, and an expanded description) is left to be filled in by triage, so
 # raw tickets must be classified before they can be claimed or worked.
 RAW_TYPE_CHOICES = ["memo", "feature", "bug"]
 
 RAW_TITLE_FORMAT = "{type} (raw): Requires Classification"
+
+# Every raw ticket is auto-grouped under this epic so triage/classification
+# jobs can discover them with `arbite list next --epic classification` (or
+# `arbite list --epic classification`) and pick them up. When triage replaces
+# the placeholder fields, it should also move the ticket to a real epic.
+CLASSIFICATION_EPIC = "classification"
 
 RAW_DESCRIPTION = (
     "This is a **raw** ticket: it was captured from a brief request without proper "
@@ -71,6 +78,9 @@ RAW_DESCRIPTION = (
     "- title -- replace \"Requires Classification\" with a short human-readable summary\n"
     "- tier -- low | medium | high (capability level required)\n"
     "- domain -- e.g. mesh, image_gen, audio_gen, ui, io (drives routing)\n"
+    "- epic -- this raw ticket is auto-grouped under the 'classification' epic "
+    "(so triage can find it with `arbite list next --epic classification`); replace "
+    "it with the real epic this work belongs to, e.g. mesh-pipeline\n"
     "- priority -- numeric urgency index, lower = more urgent\n"
     "- description -- expand this body into a proper task description based on the "
     "original request, including any acceptance criteria"
@@ -94,6 +104,7 @@ class Ticket:
     type: str
     tier: str
     domain: str
+    epic: Optional[str] = None
     priority: Optional[int] = None
     tags: list = field(default_factory=list)
     assignee: Optional[str] = None

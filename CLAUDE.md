@@ -61,6 +61,7 @@ status: open              # open | in_progress | blocked | shelved | closed — 
 type: bug                  # bug | feature | refactor | chore
 tier: medium                # low | medium | high — capability level required
 domain: mesh                 # what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io
+epic: mesh-pipeline          # larger initiative this ticket belongs to (optional); freeform label for filtering
 priority: 2                   # numeric urgency index, lower = more urgent (1 is highest); unset sorts last
 tags: [normals, curves]       # freeform, for human/codebase-area search — distinct from domain
 
@@ -93,6 +94,15 @@ Field notes:
 - `domain` vs `tags`: `domain` drives routing (what kind of agent should
   claim this). `tags` is for searching by codebase area. Different purposes
   even though both are strings.
+- `epic`: the larger initiative a ticket belongs to (e.g. `mesh-pipeline`),
+  a freeform grouping label — optional, and distinct from `depends_on`
+  (structural) and `domain` (routing). Group tickets under an epic with
+  `arbite create --epic <name>`, and filter with `arbite list --epic <name>`
+  or `arbite list next --epic <name>` (the next workable open ticket in that
+  epic). Raw tickets (`arbite raw ...`) are auto-grouped under the
+  `classification` epic so triage jobs can pick them up with
+  `arbite list next --epic classification`; triage should move them to a real
+  epic when classifying.
 - `priority`: numeric urgency index where **lower = more urgent** (1 is
   highest). Independent of `tier` (capability) — a low-tier chore can still
   be urgent. When two tickets are both workable, work the one with the lower
@@ -129,10 +139,18 @@ Field notes:
 Command name: `arbite`. Suggested commands to implement:
 - `arbite init` — create `tickets/` folder structure if it doesn't exist, and create
   `agents/` scratchpad files for each known agent identity (from config)
-- `arbite create [--priority N]` — create a new ticket in `open/` (priority
-  is a numeric urgency index, lower = more urgent, optional)
-- `arbite list [--status --tier --domain --priority --assignee]` — list/filter
-  tickets, sorted so more urgent (lower priority) workable tickets come first
+- `arbite create [--priority N] [--epic E]` — create a new ticket in `open/`
+  (priority is a numeric urgency index, lower = more urgent, optional; `--epic`
+  groups it under a larger initiative)
+- `arbite raw <memo|feature|bug> <message>` — quick-capture an unclassified
+  ticket in `open/`; auto-grouped under the `classification` epic so
+  triage/classification jobs can find it with `arbite list next --epic
+  classification`
+- `arbite list [--status --tier --domain --epic --priority --assignee]` —
+  list/filter tickets, sorted so more urgent (lower priority) workable tickets
+  come first
+- `arbite list next [--tier T] [--epic E]` — the next open ticket to work, in
+  topological dependency order; filter to a tier and/or an epic
 - `arbite claim <id> --agent <id>` — move ticket to `in_progress/`, set
   `assignee`, update `status` and `updated`
 - `arbite block <id> --reason <text or ticket id>` — move to `blocked/`,
