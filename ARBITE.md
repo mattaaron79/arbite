@@ -94,6 +94,7 @@ positional arguments:
     deps      walk depends_on to show a dependency tree
     depend    add a dependency to a ticket's depends_on, or clear all of its
               dependencies
+    set       set one or more ticket properties
 
 options:
   -h, --help  show this help message and exit
@@ -421,5 +422,30 @@ positional arguments:
 
 options:
   -h, --help  show this help message and exit
+```
+
+### `arbite set`
+
+```
+usage: arbite set [-h] TICKET_ID PROPERTY VALUE [PROPERTY VALUE ...]
+
+Set one or more ticket properties on an existing ticket. Properties are given
+as PROPERTY VALUE pairs and any number can be set in one call; quote any value
+that spans more than one word. Type-aware: 'tags' and 'depends_on' are comma-
+separated lists, 'priority' must be an integer, and an empty quoted value ('')
+clears a field. If 'status' is set, the ticket is moved to the matching folder
+so folder and frontmatter never disagree (moving to 'closed' auto-dates
+'closed'). 'id' is structural and cannot be set.
+
+positional arguments:
+  TICKET_ID       ticket id or any wildcard (substring) match, e.g. 'f6' or
+                  'tic-f607' both resolve to tic-f607; if several tickets
+                  match, the first alphabetically is used
+  PROPERTY VALUE  one or more PROPERTY VALUE pairs to set, e.g. title 'New
+                  Title' tier high; quote any value that spans more than one
+                  word, and use an empty quoted value ('') to clear a field
+
+options:
+  -h, --help      show this help message and exit
 ```
 
