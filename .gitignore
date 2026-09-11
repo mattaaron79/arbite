@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+tickets/
+plans/
+.arbite/
+
+# Local / personal editor settings
+.vscode/
+.idea/
+*.swp
