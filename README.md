@@ -8,8 +8,28 @@ database or behind a server: they are files with YAML frontmatter, and a ticket'
 --follow` on a ticket file traces its whole lifecycle for free.
 
 ## Example AGENTS.md
+
 See AGENTS_EXAMPLE.md. An AGENTS.md or CLAUDE.md pointing the agent to the .arbite/AGENTS.md file will
-in almost all cases cause agents to use the tickets system automatically
+in almost all cases cause agents to use the ticket system automatically
+
+## Useful Human Commands
+
+Topological sort based on ticket dependency order:
+arbite list --topo --status open
+
+Tree view (more for humans):
+arbite list --tree
+
+View epic status:
+arbite list --topo --epic <epic_name>
+
+Get the next workable ticket (if you'd like to specify the ticket to an agent):
+arbite list next
+
+File a quick bug/feature/memo:
+arbite bug The thing doesn't work that I want to work!
+arbite feature Make the button glow when hovering
+arbite memo The readme probably needs to be updated
 
 ---
 
@@ -41,6 +61,17 @@ mode to work the tickets until completion. Well designed tickets can usually be 
 by small or medium-sized models.
 
 ---
+
+## Ticket Creation
+
+Usually it's best to have the agent create the tickets, as a command line interface can be
+cumbersome. However, there are 'raw' tickets that are created via the 'arbite bug|feature|memo|wish' commands.
+Raw tickets need to be classified before they are worked.
+
+You can view raw tickets via:
+arbite list raw
+
+See AGENTS_EXAMPLE.md, which tells the agent to classify and work raw tickets when told simple directives like 'Work Next'.
 
 ## Goals
 

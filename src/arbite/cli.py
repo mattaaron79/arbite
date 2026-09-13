@@ -29,13 +29,7 @@ def _split_csv(value):
 
 
 def _json_flag(parser):
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="emit machine-readable JSON on stdout instead of a formatted table "
-        "(field names match the ticket frontmatter); exit code 2 means the query "
-        "ran but matched nothing",
-    )
+    parser.add_argument("--json", action="store_true", help=docs.JSON_HELP)
 
 
 def _print_json(payload):
@@ -57,19 +51,13 @@ def _emit_tickets(rows, as_json):
 
 # Shared help for commands that take a single ticket id: searches are wildcard
 # (substring) matches, so 'tic-' can be skipped entirely and e.g. 'f6' resolves
-# to tic-f607; if several tickets match, the first alphabetically is used.
-TICKET_ID_HELP = (
-    "ticket id or any wildcard (substring) match, e.g. 'f6' or 'tic-f607' both "
-    "resolve to tic-f607; an exact id always wins, and for commands that modify "
-    "a ticket an ambiguous match is an error listing the candidates rather than "
-    "a guess"
-)
+# to tic-f607. The strings themselves live in docs.py (imported here) so that
+# .arbite/AGENTS.md can recognise this boilerplate and collapse it into a single
+# cross-reference instead of repeating it once per command.
+TICKET_ID_HELP = docs.TICKET_ID_HELP
 
 # Read-only commands keep the old convenience: a guess there costs nothing.
-TICKET_ID_HELP_READONLY = (
-    "ticket id or any wildcard (substring) match, e.g. 'f6' or 'tic-f607' both "
-    "resolve to tic-f607; if several tickets match, the first alphabetically is used"
-)
+TICKET_ID_HELP_READONLY = docs.TICKET_ID_HELP_READONLY
 
 # `arbite bug|feature|memo|wish <message>` is shorthand for the equally-named
 # `arbite raw <type> <message>` form: they create an identical raw ticket (same
@@ -1401,9 +1389,10 @@ def cmd_doctor(args):
 
 
 def build_parser():
-    """Returns (parser, subparsers_by_name). The dict is used by `arbite init`
-    to render .arbite/AGENTS.md's command reference straight from argparse's
-    own --help output, so that doc can't drift from the real CLI."""
+    """Returns (parser, subparsers_by_name). The dict is used by `arbite init` to
+    render .arbite/AGENTS.md's command reference straight from these parsers
+    (every usage line and flag, compacted rather than dumped as --help text), so
+    that doc can't drift from the real CLI."""
     parser = argparse.ArgumentParser(prog="arbite", description="File-based ticketing system")
     parser.add_argument("--version", action="version", version=f"arbite {__version__}")
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
@@ -1494,13 +1483,7 @@ def build_parser():
         metavar="TYPE",
         help="kind of raw ticket: memo | feature | bug | wish",
     )
-    p_raw.add_argument(
-        "message",
-        metavar="MESSAGE",
-        nargs="+",
-        help="brief request to capture, e.g. \"users can't save without auth\" "
-        "(joined with spaces if multiple words)",
-    )
+    p_raw.add_argument("message", metavar="MESSAGE", nargs="+", help=docs.MESSAGE_HELP)
     p_raw.set_defaults(func=cmd_raw)
 
     # Shorthand subcommands: `arbite bug <message>` == `arbite raw bug <message>`,
@@ -1517,13 +1500,7 @@ def build_parser():
             "'classification' epic; classify it (title/tier/domain/epic/priority/description) "
             "before it can be claimed or worked.",
         )
-        p_shortcut.add_argument(
-            "message",
-            metavar="MESSAGE",
-            nargs="+",
-            help="brief request to capture, e.g. \"users can't save without auth\" "
-            "(joined with spaces if multiple words)",
-        )
+        p_shortcut.add_argument("message", metavar="MESSAGE", nargs="+", help=docs.MESSAGE_HELP)
         p_shortcut.set_defaults(func=cmd_raw, type=_name)
 
     p_fetch = sub.add_parser(
