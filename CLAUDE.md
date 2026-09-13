@@ -307,7 +307,7 @@ virtualenv.
 ```toml
 [project]
 name = "arbite"
-version = "0.1.0"
+version = "0.1.1"
 description = "File-based ticketing system for git repos and AI agents"
 requires-python = ">=3.9"
 dependencies = [

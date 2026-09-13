@@ -287,9 +287,17 @@ pip install -e .
 arbite --version
 ```
 
-On Windows, [`update-arbite.bat`](update-arbite.bat:1) wraps
-`python -m pipx install "." --force` to reinstall the current checkout into the global
-pipx environment.
+Helper scripts in [`scripts/`](scripts/) wrap `pipx install "." --force` to reinstall
+the current checkout into the global pipx environment. Both derive the repo root from
+their own location, so they can be run from any directory:
+
+- Windows: [`scripts/update-arbite.bat`](scripts/update-arbite.bat:1)
+- Linux/macOS: [`scripts/update-arbite.sh`](scripts/update-arbite.sh:1), e.g.
+  `./scripts/update-arbite.sh`
+
+Run the shell script as your normal user, **not** with `sudo`: pipx installs per-user,
+so under root the package lands in `/root/.local` and stays invisible to your shell.
+The script refuses to run as root for exactly this reason.
 
 `pyproject.toml` declares `requires-python = ">=3.9"`.
 
@@ -349,7 +357,6 @@ These exist because agents, not humans, are the main callers:
 
 ```
 pyproject.toml          packaging + console-script entry point
-update-arbite.bat       reinstall the checkout into global pipx (Windows)
 CLAUDE.md               the original design spec and rationale
 src/arbite/
   __init__.py           package version
@@ -360,6 +367,8 @@ src/arbite/
 scripts/
   seed_demo.py          generates ~2.5 months of realistic seed tickets for the
                         local .arbite/, via the same code paths the CLI uses
+  update-arbite.bat     reinstall the checkout into global pipx (Windows)
+  update-arbite.sh      reinstall the checkout into global pipx (Linux/macOS)
 ```
 
 ## Status
