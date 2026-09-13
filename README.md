@@ -7,9 +7,9 @@ database or behind a server: they are files with YAML frontmatter, and a ticket'
 *is* the state change, and because filenames stay stable across moves, `git log
 --follow` on a ticket file traces its whole lifecycle for free.
 
-It was built for a large, hand-written Blender addon codebase where several AI agents
-(and at least one human) work in parallel and need a shared, scriptable way to pick up
-tasks, record progress, and leave a clean history of what happened and when.
+## Example AGENTS.md
+See AGENTS_EXAMPLE.md. An AGENTS.md or CLAUDE.md pointing the agent to the .arbite/AGENTS.md file will
+in almost all cases cause agents to use the tickets system automatically
 
 ---
 
@@ -30,6 +30,15 @@ Two constraints shaped most of the design:
 2. **Coordinates must be honest.** Multiple agents can be working at once, so
    claiming a ticket is a compare-and-swap rather than a blind write, and any command
    that could pick the wrong ticket from an ambiguous id refuses instead of guessing.
+
+## Use in Planning
+
+A cost and token saving method of agentic engineering is to use a high-tier LLM or
+agent to do a planning and requirements session with the user. Have them generate a spec
+doc based on the conversation. Then ask a high tier planning agent to generate one
+or more epics in arbite. Once the tickets are ready, use an agent in orchestration
+mode to work the tickets until completion. Well designed tickets can usually be completed
+by small or medium-sized models.
 
 ---
 
