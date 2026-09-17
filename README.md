@@ -487,14 +487,25 @@ arbite close tic-a1b2
 arbite doctor --fix
 ```
 
-Opting into the database sink instead, or in addition:
+Using the database sink instead of files. `--sink` is a *per-command* choice, so
+either pass it every time or make it the project default — one line of config:
 
 ```bash
-arbite init --sink sqlite             # same tickets, different store
-arbite sink info                      # which store, where, and what it supports
-arbite migrate --to sqlite            # copy every ticket across (source untouched)
-arbite --sink sqlite list --status open --domain mesh
+# A new project on the database sink
+arbite init --sink sqlite                  # creates .arbite/arbite.db + AGENTS.md
+printf 'sink: sqlite\n' >> arbite.yaml     # make every later command use it
+arbite sink info                           # which store, where, what it supports
+
+# Or bring an existing file-based project across, then switch
+arbite migrate --to sqlite                 # copies every ticket; source untouched
+printf 'sink: sqlite\n' >> arbite.yaml
+arbite doctor                              # verify the new store
 ```
+
+For a one-off command, skip the config: `arbite --sink sqlite list --status open
+--domain mesh`, or `ARBITE_SINK=sqlite arbite list`. Until `sink:` is set, plain
+`arbite` commands use the file sink — and if a database exists that nobody has
+selected, the CLI says so on stderr rather than quietly reading the other store.
 
 ## Agent-facing conventions
 

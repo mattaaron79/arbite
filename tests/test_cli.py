@@ -104,6 +104,40 @@ def test_sink_info_reports_the_active_sink(project, cli):
     assert info["status_is_location"] is True
     assert info["supports_buckets"] is True
     assert info["ticket_count"] == 0
+    text = cli("sink", "info").stdout
+    # `sink info` is where a user asks "what storage am I using", so it has to
+    # name the alternatives rather than only the active one.
+    assert "available sinks: file, sqlite" in text
+
+
+def test_a_database_nobody_selected_is_called_out(cli, tmp_project):
+    """`init --sink sqlite` is a per-command flag, so a project can have a full
+    database while `arbite list` reads an empty file store. That failure is
+    otherwise completely silent, so the CLI says so."""
+    cli("init", "--sink", "sqlite")
+
+    proc = cli("list", expect=2)
+    assert "exists but no sink is configured" in proc.stderr
+    assert "--sink sqlite" in proc.stderr
+
+    # An explicit choice, by flag or environment, is a decision -- never second-guessed.
+    assert "no sink is configured" not in cli("list", "--sink", "sqlite", expect=2).stderr
+    assert "no sink is configured" not in cli("list", expect=2, sink="file").stderr
+    # And once the config names a sink, there is nothing ambiguous left.
+    (tmp_project / "arbite.yaml").write_text("sink: file\n")
+    assert "no sink is configured" not in cli("list", expect=2).stderr
+
+
+def test_migrate_names_the_source_when_it_is_already_the_active_sink(cli, tmp_project):
+    cli("init")
+    (tmp_project / "arbite.yaml").write_text("sink: sqlite\n")
+    cli("sink", "init")
+    proc = cli("migrate", "--to", "sqlite", expect=1)
+    assert "--from file" in proc.stderr
+    # Following that instruction works: the file store is empty here, which is an
+    # answer (exit 2), not an error.
+    followed = cli("migrate", "--from", "file", "--to", "sqlite", expect=2)
+    assert "no tickets found in the file sink" in followed.stdout
 
 
 def test_sink_can_be_selected_by_flag_before_or_after_the_command(cli, tmp_project):

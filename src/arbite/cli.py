@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -134,7 +135,37 @@ def _cwd_sink(args):
 
 def _require_sink(args):
     """The configured sink, or a clear instruction to initialise one."""
-    return config.open_sink(getattr(args, "sink", None))
+    sink = config.open_sink(getattr(args, "sink", None))
+    _warn_about_an_unused_database(args, sink)
+    return sink
+
+
+def _warn_about_an_unused_database(args, sink) -> None:
+    """Warn when this command quietly used the file sink in a project that has a
+    database nobody selected.
+
+    Creating a database-backed project is `init --sink sqlite` or a `sink:` key,
+    and the flag is deliberately per-command -- so a project can end up with
+    `.arbite/arbite.db` full of tickets while `arbite list` (no flag, no config)
+    reads an empty file store instead. Nothing about that failure is visible: the
+    command succeeds and reports no tickets. This says so on stderr, once per
+    command, and only in that exact ambiguous case: an explicit `--sink` or
+    `ARBITE_SINK` is a decision, not a mistake."""
+    if sink.kind != config.DEFAULT_SINK_KIND:
+        return
+    if getattr(args, "sink", None) or os.environ.get(config.ENV_SINK):
+        return
+    project_root = config.find_project_root()
+    if config.load_config(project_root).get("sink"):
+        return
+    database = config.default_location("sqlite", project_root / config.ARBITE_DIRNAME)
+    if database.exists():
+        print(
+            f"note: {database} exists but no sink is configured, so this command used "
+            f"the '{config.DEFAULT_SINK_KIND}' sink instead -- pass --sink sqlite, set "
+            f"{config.ENV_SINK}=sqlite, or add 'sink: sqlite' to arbite.yaml",
+            file=sys.stderr,
+        )
 
 
 def _expect_from(ticket: Ticket) -> Expect:
@@ -223,6 +254,12 @@ def cmd_sink(args):
     # "support" vs "in use": the capability line and a sink's own list of buckets
     # in use would otherwise both print under the word "buckets".
     print(f"buckets supported: {'yes' if info.supports_buckets else 'no'}")
+    # A user should not have to read the docs to discover that another store
+    # exists; `sink info` is where they look to ask what is going on.
+    print(
+        f"available sinks: {', '.join(SINK_KINDS)} (choose one with --sink, "
+        f"{config.ENV_SINK}, or a 'sink:' key in arbite.yaml)"
+    )
     if info.details:
         for key, value in sorted(info.details.items()):
             print(f"{key}: {value}")
@@ -1136,7 +1173,19 @@ def cmd_migrate(args):
     source = config.open_sink(args.from_sink, project_root)
     target = config.open_sink_kind(args.to_sink, project_root)
     if source.kind == str(target.kind) and str(source.root) == str(target.root):
-        raise TicketError("source and destination are the same sink; nothing to migrate")
+        # The common way to arrive here: `migrate --to sqlite` after switching the
+        # config to sqlite, meaning "bring my file tickets across". Name the
+        # source instead of leaving the caller to work out what went wrong.
+        others = [k for k in SINK_KINDS if k != source.kind]
+        hint = (
+            f"pass --from {others[0]} to copy from that sink"
+            if args.from_sink is None and others
+            else "pass --from or --to with a different kind"
+        )
+        raise TicketError(
+            f"source and destination are both the {source.kind} sink at {source.root} "
+            f"-- {hint}"
+        )
 
     tickets = source.query(TicketQuery(buckets=("*",)))
     if not tickets:
