@@ -28,6 +28,21 @@ def _split_csv(value):
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _status_list(value):
+    """argparse type for --status: a single status or a comma-separated list of
+    them, e.g. 'open' or 'open,in_progress'. Validated here so an unknown status
+    is an argparse error (exit 2) naming the valid values, rather than a filter
+    that silently matches nothing. The result is always a list, and an empty
+    value means 'no status filter'."""
+    statuses = _split_csv(value)
+    unknown = [s for s in statuses if s not in STATUSES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"invalid status '{unknown[0]}' (valid: {', '.join(STATUSES)})"
+        )
+    return statuses
+
+
 def _json_flag(parser):
     parser.add_argument("--json", action="store_true", help=docs.JSON_HELP)
 
@@ -269,8 +284,9 @@ def cmd_fetch(args):
 
 
 def _matches_field_filters(args, t):
-    """True if t passes the --status/--tier/--domain/--epic/--priority/--assignee filters."""
-    if args.status and t.status != args.status:
+    """True if t passes the --status/--tier/--domain/--epic/--priority/--assignee
+    filters. --status is a list of statuses and matches any one of them."""
+    if args.status and t.status not in args.status:
         return False
     if args.tier and t.tier != args.tier:
         return False
@@ -1159,7 +1175,7 @@ def cmd_search(args):
     rows = [
         t
         for _, t in ticket_mod.load_all_tickets(tickets_root)
-        if (not args.status or t.status == args.status)
+        if (not args.status or t.status in args.status)
         and any(matcher(_ticket_field_value(t, p)) for p in params)
     ]
     rows.sort(key=lambda t: (t.status, t.priority_sort_key(), t.id))
@@ -1531,7 +1547,14 @@ def build_parser():
         "list", help="list/filter tickets", description="List tickets, optionally filtered by one or more fields. "
         "Sorted so that within a status, more urgent tickets (lower priority number) come first."
     )
-    p_list.add_argument("--status", choices=STATUSES, help="filter by status")
+    p_list.add_argument(
+        "--status",
+        type=_status_list,
+        default=[],
+        metavar="STATUS",
+        help="filter by status; a comma-separated list matches any of them, "
+        "e.g. 'open,in_progress'",
+    )
     p_list.add_argument(
         "--tier",
         choices=TIERS,
@@ -1621,8 +1644,11 @@ def build_parser():
     )
     p_search.add_argument(
         "--status",
-        choices=STATUSES,
-        help="only search tickets with this status (default: all statuses)",
+        type=_status_list,
+        default=[],
+        metavar="STATUS",
+        help="only search tickets with these statuses (default: all statuses); a "
+        "comma-separated list matches any of them, e.g. 'open,in_progress'",
     )
     search_mode = p_search.add_mutually_exclusive_group()
     search_mode.add_argument(
