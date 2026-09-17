@@ -29,7 +29,7 @@ from . import __version__, config, docs, graph, schema
 from .errors import ArbiteError, Conflict, TicketError
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
-from .sinks import SINK_KINDS, Expect, build_sink
+from .sinks import SINK_KINDS, Expect, SinkInfo, build_sink
 
 # Exit codes. Agents drive arbite from shell loops, so "nothing matched" has to
 # be distinguishable from "worked fine" and from "broke" without parsing
@@ -168,6 +168,23 @@ def _warn_about_an_unused_database(args, sink) -> None:
         )
 
 
+def _describe_safely(sink) -> SinkInfo:
+    """A sink's `SinkInfo`, tolerating a store that does not exist yet.
+
+    `arbite init` describes the *other* sink too -- the one a plain command will
+    read -- and that store may never have been created. Capabilities are known from
+    the class either way; only the counts are unavailable."""
+    try:
+        return sink.describe()
+    except ArbiteError:
+        return SinkInfo(
+            kind=sink.kind,
+            root=str(sink.root),
+            status_is_location=sink.status_is_location,
+            supports_buckets=sink.supports_buckets,
+        )
+
+
 def _expect_from(ticket: Ticket) -> Expect:
     """A compare-and-swap token for the exact state just read.
 
@@ -217,8 +234,16 @@ def cmd_init(args):
 
     parser, subparsers_by_name = build_parser()
     agents_md = arbite_dir / "AGENTS.md"
+    # The guide is committed and read by processes other than this one, so it
+    # describes the sink a *plain* command will use (committed config only, no
+    # --sink, no environment), and `render` warns when that is not the store this
+    # run just created.
+    default_sink = build_sink(config.configured_sink_spec(project_root), arbite_dir)
     agents_md.write_text(
-        docs.render(parser, subparsers_by_name, sink.describe()), encoding="utf-8"
+        docs.render(
+            parser, subparsers_by_name, _describe_safely(sink), _describe_safely(default_sink)
+        ),
+        encoding="utf-8",
     )
     print(
         f"AGENTS.md refreshed at {agents_md} -- this is not auto-discovered, so point your "
@@ -1193,12 +1218,23 @@ def cmd_migrate(args):
         sys.exit(EXIT_EMPTY)
 
     if args.dry_run:
-        verb = "would migrate"
-        skipped = sum(1 for t in tickets if target.exists(t.id)) if _target_exists(target) else 0
-        print(
-            f"{verb} {len(tickets)} ticket(s) from {source.kind} to {target.kind} "
-            f"at {target.root}" + (f" ({skipped} already present, skipped)" if skipped else "")
+        present = (
+            sum(1 for t in tickets if target.exists(t.id)) if _target_exists(target) else 0
         )
+        held_back = present if not args.overwrite else 0
+        print(
+            f"would migrate {len(tickets)} ticket(s) from {source.kind} to {target.kind} "
+            f"at {target.root}"
+            + (f" ({held_back} already present, skipped)" if held_back else "")
+        )
+        if args.prune:
+            if held_back:
+                print(
+                    f"would NOT prune: {held_back} ticket(s) already present, so the source "
+                    "copies are the newest -- pass --overwrite to replace them first"
+                )
+            else:
+                print(f"would prune {len(tickets)} ticket(s) from the {source.kind} sink")
         return
 
     target.init()
@@ -1226,6 +1262,22 @@ def cmd_migrate(args):
     if skipped:
         summary += f" ({len(skipped)} already present, skipped: {', '.join(sorted(skipped))})"
     print(summary)
+
+    if args.prune:
+        # The copy is done; pruning is the destructive half, and it is refused
+        # outright when it would leave a *stale* copy as the only copy. Nothing is
+        # removed before that check, so a refused prune still leaves both stores
+        # intact -- the migration simply happened without the cleanup.
+        if skipped:
+            raise TicketError(
+                f"refusing to prune: {len(skipped)} ticket(s) already existed in the "
+                f"{target.kind} sink and were left as they were "
+                f"({', '.join(sorted(skipped))}), so the source copies are the newer ones -- "
+                "re-run with --overwrite to replace them, then prune"
+            )
+        for t in tickets:
+            source.remove(t.id)
+        print(f"pruned {len(tickets)} ticket(s) from the {source.kind} sink at {source.root}")
 
 
 def _target_exists(target) -> bool:
@@ -1835,6 +1887,14 @@ def build_parser():
         action="store_true",
         help="replace destination tickets that already use one of the source ids, instead "
         "of skipping them",
+    )
+    p_migrate.add_argument(
+        "--prune",
+        action="store_true",
+        help="after copying, delete the source tickets -- the destructive half of a "
+        "migration, for retiring a store once its contents are verified in the other one. "
+        "Refused if any ticket was skipped, because a stale destination copy would then be "
+        "the only copy left; combine with --dry-run to see what it would remove",
     )
     _sink_flag(p_migrate)
     p_migrate.set_defaults(func=cmd_migrate)

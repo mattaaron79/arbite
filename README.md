@@ -237,11 +237,28 @@ it can gate CI or an agent's startup.
 
 `arbite migrate --to <kind>` copies every ticket — status-managed ones and
 bucketed ones — into the other sink, preserving ids, timestamps, body, tags,
-dependencies, notes and buckets verbatim. It never touches the source, so a
-migration is undone by not switching the config over. Because it reads through one
-sink and writes through the other, a `file → sqlite → file` round trip that
-reproduces the original files byte for byte is the end-to-end test of the whole
-interface; `tests/test_cli.py` asserts exactly that.
+dependencies, notes and buckets verbatim. It never touches the source unless you
+ask it to, so a migration is undone by not switching the config over. Because it
+reads through one sink and writes through the other, a `file → sqlite → file`
+round trip that reproduces the original files byte for byte is the end-to-end test
+of the whole interface; `tests/test_cli.py` asserts exactly that.
+
+Two things worth being explicit about, because both are easy to assume wrongly:
+
+- **`arbite init --sink sqlite` does not migrate anything.** It creates the store.
+  Existing tickets stay in the file store until you run `migrate`, and until
+  `sink: sqlite` is in the config (or you pass `--sink sqlite`) every command still
+  reads the files. `.arbite/AGENTS.md` warns in bold when a store exists that no
+  command would select.
+- **`--prune` retires the old store** once the copy is verified: after migrating, it
+  deletes the source tickets, so `arbite migrate --to sqlite --prune` followed by
+  `sink: sqlite` leaves exactly one store. It refuses outright if any ticket was
+  *skipped* because the destination already had that id — the source copy is then
+  the newer one, and pruning would destroy it (add `--overwrite` to replace it
+  first). A refused prune destroys nothing: the copy has happened, the cleanup
+  hasn't. `--dry-run` reports what it would migrate and prune without touching
+  either side, and `--overwrite` replaces destination tickets that share an id
+  instead of skipping them.
 
 ---
 
@@ -296,7 +313,7 @@ The package exposes the console script `arbite`, providing:
 | Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
 | Lifecycle | `claim`, `release`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen` |
 | Authoring | `note`, `set`, `depend`, `move` |
-| Storage | `migrate --to <sink>` |
+| Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
 | Integrity | `doctor [--fix]` |
 | Destruction | `delete <id> --force` |
 
@@ -500,6 +517,10 @@ arbite sink info                           # which store, where, what it support
 arbite migrate --to sqlite                 # copies every ticket; source untouched
 printf 'sink: sqlite\n' >> arbite.yaml
 arbite doctor                              # verify the new store
+
+# ...and once you are satisfied, retire the old store (destructive)
+arbite migrate --to sqlite --prune --dry-run   # what would be migrated and pruned
+arbite migrate --to sqlite --prune             # copy, then delete the file tickets
 ```
 
 For a one-off command, skip the config: `arbite --sink sqlite list --status open

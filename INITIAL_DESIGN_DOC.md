@@ -272,11 +272,14 @@ Command name: `arbite`. Suggested commands to implement:
   from the store. Refuses without `--force`, and records a `Deleted by <agent>` note
   first so the last state the ticket ever had is attributable; `close` is the
   non-destructive alternative
-- `arbite migrate --to <kind> [--from <kind>] [--dry-run] [--overwrite]` — copy
-  every ticket (status-managed and bucketed alike) from one sink into another,
+- `arbite migrate --to <kind> [--from <kind>] [--dry-run] [--overwrite] [--prune]` —
+  copy every ticket (status-managed and bucketed alike) from one sink into another,
   preserving ids, timestamps, body, tags, dependencies, notes and buckets. The source
-  is never modified, and a `file → sqlite → file` round trip reproduces the original
-  files byte for byte, which is the end-to-end test of the interface
+  is never modified unless `--prune` asks for it, and a `file → sqlite → file` round
+  trip reproduces the original files byte for byte, which is the end-to-end test of
+  the interface. `--prune` deletes the source tickets after a successful copy, so a
+  migration can also retire a store; it refuses when any ticket was skipped, because
+  a stale destination copy would then be the only copy left
 - `arbite doctor [--fix]` — check the invariants nothing else enforces.
   Tickets are plain files in a git repo: humans `mv` them, merges and rebases
   mangle them, an interrupted write can strand a temp file. Every arbite

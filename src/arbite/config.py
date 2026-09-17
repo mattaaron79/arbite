@@ -83,13 +83,26 @@ def load_known_agent_ids(project_root: Path) -> list:
     return [str(a) for a in agents]
 
 
-def sink_spec(cli_sink: Optional[str] = None, project_root: Optional[Path] = None) -> SinkSpec:
+def sink_spec(
+    cli_sink: Optional[str] = None,
+    project_root: Optional[Path] = None,
+    use_env: bool = True,
+) -> SinkSpec:
     """Resolve which sink to use: flag, then environment, then config, then the
-    default. An unknown name is an error listing the valid kinds."""
+    default. An unknown name is an error listing the valid kinds.
+
+    `use_env=False` answers a different question -- "what will a plain command use
+    in *this project*" -- which is what `.arbite/AGENTS.md` has to state, since that
+    file is committed and read by processes whose environment arbite cannot know."""
     project_root = project_root or find_project_root()
     config = load_config(project_root)
 
-    kind = cli_sink or os.environ.get(ENV_SINK) or config.get("sink") or DEFAULT_SINK_KIND
+    kind = (
+        cli_sink
+        or (os.environ.get(ENV_SINK) if use_env else None)
+        or config.get("sink")
+        or DEFAULT_SINK_KIND
+    )
     kind = str(kind).strip().lower()
     if kind not in SINK_KINDS:
         raise TicketError(
@@ -105,6 +118,15 @@ def sink_spec(cli_sink: Optional[str] = None, project_root: Optional[Path] = Non
     location_key = SINK_LOCATION_KEYS.get(kind, "root")
     root = options.pop(location_key, None)
     return SinkSpec(kind=kind, root=root, options=options)
+
+
+def configured_sink_spec(project_root: Optional[Path] = None) -> SinkSpec:
+    """The sink a plain command uses in this project, from committed config alone.
+
+    Deliberately ignores both `--sink` and `ARBITE_SINK`: those are per-invocation
+    decisions made by whoever runs a command, and the one thing an agent reading a
+    committed guide needs is the answer that holds when nobody passes anything."""
+    return sink_spec(None, project_root, use_env=False)
 
 
 def open_sink(

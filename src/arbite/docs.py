@@ -201,17 +201,35 @@ def _usage(subparser) -> str:
     return text[len("usage: "):] if text.startswith("usage: ") else text
 
 
-def render(parser, subparsers_by_name: dict, info=None) -> str:
-    """Render the guide for the active sink.
+def render(parser, subparsers_by_name: dict, info=None, default_info=None) -> str:
+    """Render the guide for the sink this project will actually use.
 
-    `info` is a `sinks.SinkInfo` describing the store this project uses. It is
-    optional only so the renderer can be exercised without a store; when it is
-    absent the prose stays neutral about where tickets live."""
+    `info` describes the store this run was pointed at (what `arbite init` just
+    created). `default_info` describes the store a *plain* command will read --
+    the committed config, with no `--sink` or `ARBITE_SINK` in play.
+
+    They can differ, and when they do this file must not pretend otherwise: an
+    agent reads this guide and then runs `arbite` with no flags, so the prose that
+    describes *behavior* follows `default_info`, and a warning at the top says
+    plainly that the store this run created is not the one commands will read. A
+    guide that named the wrong store would be worse than no guide at all: the
+    wrong store looks exactly like an empty one."""
     _disable_color(parser, *subparsers_by_name.values())
 
-    status_is_location = bool(getattr(info, "status_is_location", False))
-    sink_kind = getattr(info, "kind", None)
-    sink_root = getattr(info, "root", None)
+    # Behavior prose (folder vs column, how to resume) describes what a plain
+    # command will actually do.
+    primary = default_info if default_info is not None else info
+    status_is_location = bool(getattr(primary, "status_is_location", False))
+    sink_kind = getattr(primary, "kind", None)
+    sink_root = getattr(primary, "root", None)
+    mismatch = (
+        None
+        if default_info is None or info is None
+        else (
+            (getattr(info, "kind", None), str(getattr(info, "root", "")))
+            != (getattr(default_info, "kind", None), str(getattr(default_info, "root", "")))
+        )
+    )
 
     lines: list[str] = []
     add = lines.append
@@ -270,10 +288,36 @@ def render(parser, subparsers_by_name: dict, info=None) -> str:
         "in use, so only two things change: where the data sits, and what `arbite doctor` can check."
     )
     add("")
+    if mismatch:
+        add(
+            f"> **Warning: a plain `arbite` command will not use the store this guide was "
+            f"generated for.** `.arbite/` holds a `{getattr(info, 'kind', '?')}` store at "
+            f"`{getattr(info, 'root', '?')}`, but this project has no `sink:` key in "
+            f"`arbite.yaml`, so a command with no `--sink` flag and no `ARBITE_SINK` reads the "
+            f"`{sink_kind}` store instead. Before running anything, make the choice explicit: "
+            f"add `sink: {getattr(info, 'kind', '?')}` to `arbite.yaml`, or pass `--sink "
+            f"{getattr(info, 'kind', '?')}`. **The wrong store looks exactly like an empty "
+            f"one**, so if a command reports no tickets, run `arbite sink info --json` and "
+            f"check its `kind` field before concluding the queue is empty."
+        )
+        add("")
     if sink_kind:
-        add(f"- active sink: `{sink_kind}`" + (f" at `{sink_root}`" if sink_root else ""))
+        add(
+            f"- active sink: `{sink_kind}`"
+            + (f" at `{sink_root}`" if sink_root else "")
+            + " -- what a command with no `--sink` flag reads"
+        )
     else:
         add("- active sink: see `arbite sink info`")
+    if mismatch:
+        add(
+            f"- also present, but not selected: `{getattr(info, 'kind', '?')}` at "
+            f"`{getattr(info, 'root', '?')}`"
+        )
+    add(
+        "- confirm it at any time: `arbite sink info --json` -- its `kind` field is the store "
+        "your command will read"
+    )
     add(
         "- selection, highest precedence first: `--sink <kind>`, the `ARBITE_SINK` environment "
         "variable, a `sink:` key in `arbite.yaml`, then the default (`file`)"

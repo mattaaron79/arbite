@@ -90,12 +90,30 @@ def test_init_with_the_sqlite_sink_creates_a_database_and_says_so(cli, tmp_proje
     assert "sqlite sink ready" in output
     assert (tmp_project / ".arbite" / "arbite.db").is_file()
     assert "sink: sqlite" in output, "the user must be told how to make it the default"
+    # Creating a store is not migrating into it: the database starts empty, and any
+    # existing ticket files are still files.
+    assert cli("--sink", "sqlite", "list", expect=2).stdout.strip() == "no tickets found"
+
+
+def test_the_guide_names_the_store_a_plain_command_will_read(cli, tmp_project):
+    """An agent reads this file and then runs `arbite` with no flags, so it must not
+    name a store those commands would not touch -- the wrong store looks exactly
+    like an empty one."""
+    cli("init", "--sink", "sqlite")  # created, but nothing selects it
     guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
-    assert "sqlite" in guide
-    # The guide must not teach the folder rule to a store that has no folders.
+    assert "will not use the store this guide was generated for" in guide
+    assert "also present, but not selected: `sqlite`" in guide
+    assert "check its `kind` field" in guide
+    # ...and the behaviour prose describes what a plain command really does.
+    assert "folder is the source of truth" in guide
+
+    (tmp_project / "arbite.yaml").write_text("sink: sqlite\n")
+    cli("init")
+    guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    assert "will not use the store" not in guide
+    assert "- active sink: `sqlite`" in guide
     assert "folder is the source of truth" not in guide
-    assert "the folder a ticket sits in mirrors its `status`" not in guide
-    assert "`in_progress` with `assignee`" in guide
+    assert "Status is a field" in guide
 
 
 def test_sink_info_reports_the_active_sink(project, cli):
@@ -404,3 +422,54 @@ def test_migrate_refuses_to_clobber_without_overwrite(project, cli):
 
 def test_migrate_from_an_empty_store_exits_two(project, cli):
     cli("migrate", "--to", "sqlite", expect=2)
+
+
+def test_migrate_prune_retires_the_source_after_a_verified_copy(project, cli):
+    """The destructive half of a migration: for retiring a store once its contents
+    are known to be in the other one."""
+    open_ticket = create(cli, "moving to the database")
+    wish = create(cli, "a filed wish")
+    cli("move", wish, "/wishlist")
+
+    dry = cli("migrate", "--to", "sqlite", "--prune", "--dry-run").stdout
+    assert "would migrate 2 ticket(s)" in dry
+    assert "would prune 2 ticket(s)" in dry
+    assert (project / ".arbite" / "open" / f"{open_ticket}.md").exists(), "dry run destroys nothing"
+
+    out = cli("migrate", "--to", "sqlite", "--prune").stdout
+    assert "pruned 2 ticket(s) from the file sink" in out
+    assert not (project / ".arbite" / "open" / f"{open_ticket}.md").exists()
+    assert not (project / ".arbite" / "wishlist" / f"{wish}.md").exists()
+    cli("list", expect=2)  # the file store is empty now ...
+    assert json.loads(cli("show", open_ticket, "--json", sink="sqlite").stdout)["title"] == (
+        "moving to the database"
+    )
+    assert json.loads(cli("show", wish, "--json", sink="sqlite").stdout)["id"] == wish
+    cli("doctor", sink="sqlite")
+
+
+def test_migrate_prune_refuses_when_a_source_copy_is_the_newer_one(project, cli):
+    tid = create(cli, "original")
+    cli("migrate", "--to", "sqlite")
+    cli("set", tid, "title", "newer in the file sink")
+
+    proc = cli("migrate", "--to", "sqlite", "--prune", expect=1)
+    assert "refusing to prune" in proc.stderr
+    assert "--overwrite" in proc.stderr
+    assert (project / ".arbite" / "open" / f"{tid}.md").exists(), "nothing was destroyed"
+
+    # Following the instruction replaces the stale copy and the prune then proceeds.
+    cli("migrate", "--to", "sqlite", "--prune", "--overwrite")
+    assert not (project / ".arbite" / "open" / f"{tid}.md").exists()
+    assert json.loads(cli("show", tid, "--json", sink="sqlite").stdout)["title"] == (
+        "newer in the file sink"
+    )
+
+
+def test_migrate_prune_dry_run_reports_what_it_would_refuse(project, cli):
+    tid = create(cli, "original")
+    cli("migrate", "--to", "sqlite")
+    out = cli("migrate", "--to", "sqlite", "--prune", "--dry-run").stdout
+    assert "would NOT prune" in out
+    assert "--overwrite" in out
+    assert (project / ".arbite" / "open" / f"{tid}.md").exists()
