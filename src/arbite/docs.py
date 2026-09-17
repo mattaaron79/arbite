@@ -201,35 +201,32 @@ def _usage(subparser) -> str:
     return text[len("usage: "):] if text.startswith("usage: ") else text
 
 
-def render(parser, subparsers_by_name: dict, info=None, default_info=None) -> str:
+def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) -> str:
     """Render the guide for the sink this project will actually use.
 
-    `info` describes the store this run was pointed at (what `arbite init` just
-    created). `default_info` describes the store a *plain* command will read --
-    the committed config, with no `--sink` or `ARBITE_SINK` in play.
+    `active_info` describes the store a *plain* command reads: the committed config,
+    with no `--sink` and no `ARBITE_SINK` in play -- which is what an agent reading
+    this file will get when it runs the commands here. `stale_info`, when given,
+    describes another store in the same project that *has tickets* and that nothing
+    selects (a database left behind by a deleted config, an `ARBITE_SINK` one-off,
+    a half-finished migration).
 
-    They can differ, and when they do this file must not pretend otherwise: an
-    agent reads this guide and then runs `arbite` with no flags, so the prose that
-    describes *behavior* follows `default_info`, and a warning at the top says
-    plainly that the store this run created is not the one commands will read. A
-    guide that named the wrong store would be worse than no guide at all: the
-    wrong store looks exactly like an empty one."""
+    An agent reads this guide and then runs `arbite` with no flags, so the prose that
+    describes *behavior* follows `active_info`, and a stale store is called out in
+    bold rather than quietly ignored. A guide that named the wrong store would be
+    worse than no guide at all: the wrong store looks exactly like an empty one."""
     _disable_color(parser, *subparsers_by_name.values())
 
     # Behavior prose (folder vs column, how to resume) describes what a plain
     # command will actually do.
-    primary = default_info if default_info is not None else info
+    primary = active_info if active_info is not None else stale_info
     status_is_location = bool(getattr(primary, "status_is_location", False))
     sink_kind = getattr(primary, "kind", None)
     sink_root = getattr(primary, "root", None)
-    mismatch = (
-        None
-        if default_info is None or info is None
-        else (
-            (getattr(info, "kind", None), str(getattr(info, "root", "")))
-            != (getattr(default_info, "kind", None), str(getattr(default_info, "root", "")))
-        )
-    )
+    stale_kind = getattr(stale_info, "kind", None)
+    stale_root = getattr(stale_info, "root", None)
+    stale_count = getattr(stale_info, "ticket_count", 0)
+    mismatch = active_info is not None and stale_info is not None
 
     lines: list[str] = []
     add = lines.append
@@ -290,15 +287,16 @@ def render(parser, subparsers_by_name: dict, info=None, default_info=None) -> st
     add("")
     if mismatch:
         add(
-            f"> **Warning: a plain `arbite` command will not use the store this guide was "
-            f"generated for.** `.arbite/` holds a `{getattr(info, 'kind', '?')}` store at "
-            f"`{getattr(info, 'root', '?')}`, but this project has no `sink:` key in "
-            f"`arbite.yaml`, so a command with no `--sink` flag and no `ARBITE_SINK` reads the "
-            f"`{sink_kind}` store instead. Before running anything, make the choice explicit: "
-            f"add `sink: {getattr(info, 'kind', '?')}` to `arbite.yaml`, or pass `--sink "
-            f"{getattr(info, 'kind', '?')}`. **The wrong store looks exactly like an empty "
-            f"one**, so if a command reports no tickets, run `arbite sink info --json` and "
-            f"check its `kind` field before concluding the queue is empty."
+            f"> **Warning: this project holds a second ticket store that nothing selects.** "
+            f"There are {stale_count} ticket(s) in a `{stale_kind}` store at `{stale_root}`, "
+            f"but a plain `arbite` command -- no `--sink`, no `ARBITE_SINK` -- reads the "
+            f"`{sink_kind}` store at `{sink_root}` instead. Decide before running anything "
+            f"that writes: either point the project at the other store (add `sink: "
+            f"{stale_kind}` to `arbite.yaml`, or pass `--sink {stale_kind}`), or bring its "
+            f"tickets across with `arbite migrate --from {stale_kind} --to {sink_kind}`. "
+            f"**The wrong store looks exactly like an empty one**, so if a command reports no "
+            f"tickets, run `arbite sink info --json` and check its `kind` field before "
+            f"concluding the queue is empty."
         )
         add("")
     if sink_kind:
@@ -311,8 +309,8 @@ def render(parser, subparsers_by_name: dict, info=None, default_info=None) -> st
         add("- active sink: see `arbite sink info`")
     if mismatch:
         add(
-            f"- also present, but not selected: `{getattr(info, 'kind', '?')}` at "
-            f"`{getattr(info, 'root', '?')}`"
+            f"- also present, but not selected: `{stale_kind}` at `{stale_root}` "
+            f"({stale_count} ticket(s))"
         )
     add(
         "- confirm it at any time: `arbite sink info --json` -- its `kind` field is the store "
@@ -321,6 +319,10 @@ def render(parser, subparsers_by_name: dict, info=None, default_info=None) -> st
     add(
         "- selection, highest precedence first: `--sink <kind>`, the `ARBITE_SINK` environment "
         "variable, a `sink:` key in `arbite.yaml`, then the default (`file`)"
+    )
+    add(
+        "- that `sink:` key is the committed choice and is what makes one store stick for every "
+        "command; `arbite init` and a successful `arbite migrate` write it for you"
     )
     add(
         "- available kinds: `file` (markdown files under the arbite directory, the default, and the "

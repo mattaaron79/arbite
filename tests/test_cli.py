@@ -89,28 +89,88 @@ def test_init_with_the_sqlite_sink_creates_a_database_and_says_so(cli, tmp_proje
     output = cli("init", "--sink", "sqlite").stdout
     assert "sqlite sink ready" in output
     assert (tmp_project / ".arbite" / "arbite.db").is_file()
-    assert "sink: sqlite" in output, "the user must be told how to make it the default"
-    # Creating a store is not migrating into it: the database starts empty, and any
-    # existing ticket files are still files.
-    assert cli("--sink", "sqlite", "list", expect=2).stdout.strip() == "no tickets found"
+    # The store it created becomes the project default, so nothing has to be
+    # configured by hand afterwards.
+    assert "set 'sink: sqlite'" in output
+    assert (tmp_project / "arbite.yaml").read_text().strip() == "sink: sqlite"
+    # Creating a store is still not migrating into it: the database starts empty, and
+    # any existing ticket files stay files until `migrate` runs.
+    assert cli("list", expect=2).stdout.strip() == "no tickets found"
+
+
+def test_init_makes_the_store_it_creates_the_default(cli, tmp_project):
+    """The point of writing the config: whatever store you set up is the store every
+    later command reads, including one an agent runs with no flags at all."""
+    cli("init", "--sink", "sqlite")
+    tid = ticket_id(
+        cli(
+            "create", "--title", "in the database", "--type", "bug", "--tier", "low",
+            "--domain", "io",
+        ).stdout
+    )
+    assert json.loads(cli("show", tid, "--json").stdout)["path"].startswith("sqlite:")
+    assert not (tmp_project / ".arbite" / "open").exists(), "nothing landed in files"
+
+
+def test_the_default_sink_writes_no_config(cli, tmp_project):
+    """A fresh file-based project stays config-free: nothing to explain, nothing to
+    keep in sync with the directory that is already there."""
+    cli("init")
+    assert not (tmp_project / "arbite.yaml").exists()
+
+
+def test_setting_a_sink_preserves_the_rest_of_the_config(cli, tmp_project):
+    """arbite.yaml is also hand-maintained, so only the `sink:` line is touched."""
+    (tmp_project / "arbite.yaml").write_text(
+        "# hand-maintained\n"
+        "agents: [claude.haiku.001]\n"
+        "sink: file\n"
+        "sinks:\n"
+        "  sqlite:\n"
+        "    path: .arbite/other.db\n"
+    )
+    cli("init", "--sink", "sqlite")
+    text = (tmp_project / "arbite.yaml").read_text()
+    assert "# hand-maintained" in text
+    assert "agents: [claude.haiku.001]" in text
+    assert "path: .arbite/other.db" in text
+    assert text.count("sink: sqlite") == 1, text
+    assert "sink: file" not in text, "the old selection is overwritten, not duplicated"
+
+
+def test_an_environment_choice_is_not_written_to_the_config(cli, tmp_project):
+    """ARBITE_SINK is one process's decision; committed config is the project's."""
+    output = cli("init", sink="sqlite").stdout
+    assert not (tmp_project / "arbite.yaml").exists()
+    assert "--sink sqlite" in output
 
 
 def test_the_guide_names_the_store_a_plain_command_will_read(cli, tmp_project):
     """An agent reads this file and then runs `arbite` with no flags, so it must not
-    name a store those commands would not touch -- the wrong store looks exactly
-    like an empty one."""
-    cli("init", "--sink", "sqlite")  # created, but nothing selects it
+    name a store those commands would not touch -- and it must not stay quiet about
+    a store holding tickets that nothing selects."""
+    cli("init", "--sink", "sqlite")
+    cli(
+        "create", "--title", "in the database", "--type", "bug", "--tier", "low",
+        "--domain", "io",
+    )
+    (tmp_project / "arbite.yaml").unlink()  # the selection goes; the tickets stay
+
+    cli("init")  # re-renders the guide from the sink plain commands will read
     guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
-    assert "will not use the store this guide was generated for" in guide
+    assert "holds a second ticket store that nothing selects" in guide
+    assert "1 ticket(s) in a `sqlite` store" in guide
     assert "also present, but not selected: `sqlite`" in guide
     assert "check its `kind` field" in guide
     # ...and the behaviour prose describes what a plain command really does.
     assert "folder is the source of truth" in guide
 
+    # Point the project at the database and both the warning and the file-shaped
+    # prose go away.
     (tmp_project / "arbite.yaml").write_text("sink: sqlite\n")
     cli("init")
     guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
-    assert "will not use the store" not in guide
+    assert "nothing selects" not in guide
     assert "- active sink: `sqlite`" in guide
     assert "folder is the source of truth" not in guide
     assert "Status is a field" in guide
@@ -129,10 +189,11 @@ def test_sink_info_reports_the_active_sink(project, cli):
 
 
 def test_a_database_nobody_selected_is_called_out(cli, tmp_project):
-    """`init --sink sqlite` is a per-command flag, so a project can have a full
-    database while `arbite list` reads an empty file store. That failure is
-    otherwise completely silent, so the CLI says so."""
+    """If a database exists that nothing selects -- hand-created, or left behind by
+    someone deleting the config -- a command reading the file store would otherwise
+    report "no tickets" with no hint that the backlog is one file away."""
     cli("init", "--sink", "sqlite")
+    (tmp_project / "arbite.yaml").unlink()
 
     proc = cli("list", expect=2)
     assert "exists but no sink is configured" in proc.stderr
@@ -411,13 +472,19 @@ def test_migrate_round_trips_file_to_sqlite_and_back_byte_identically(project, c
 
 
 def test_migrate_refuses_to_clobber_without_overwrite(project, cli):
+    """A copy that silently replaced a divergent ticket would destroy the only copy
+    of that work, so the destination wins nothing by default."""
     tid = create(cli, "original")
     cli("migrate", "--to", "sqlite")
-    cli("set", tid, "title", "changed in the file sink")
-    cli("migrate", "--to", "sqlite")
+    # After migrating, the database is the active store, so the file-side edit has
+    # to name its sink -- and the re-migration has to name its source.
+    cli("set", tid, "title", "changed in the file sink", sink="file")
+    cli("migrate", "--from", "file", "--to", "sqlite")
     assert json.loads(cli("show", tid, "--json", sink="sqlite").stdout)["title"] == "original"
-    cli("migrate", "--to", "sqlite", "--overwrite")
-    assert json.loads(cli("show", tid, "--json", sink="sqlite").stdout)["title"] == "changed in the file sink"
+    cli("migrate", "--from", "file", "--to", "sqlite", "--overwrite")
+    assert json.loads(cli("show", tid, "--json", sink="sqlite").stdout)["title"] == (
+        "changed in the file sink"
+    )
 
 
 def test_migrate_from_an_empty_store_exits_two(project, cli):
@@ -430,6 +497,7 @@ def test_migrate_prune_retires_the_source_after_a_verified_copy(project, cli):
     open_ticket = create(cli, "moving to the database")
     wish = create(cli, "a filed wish")
     cli("move", wish, "/wishlist")
+    assert not (project / "arbite.yaml").exists()
 
     dry = cli("migrate", "--to", "sqlite", "--prune", "--dry-run").stdout
     assert "would migrate 2 ticket(s)" in dry
@@ -440,26 +508,45 @@ def test_migrate_prune_retires_the_source_after_a_verified_copy(project, cli):
     assert "pruned 2 ticket(s) from the file sink" in out
     assert not (project / ".arbite" / "open" / f"{open_ticket}.md").exists()
     assert not (project / ".arbite" / "wishlist" / f"{wish}.md").exists()
-    cli("list", expect=2)  # the file store is empty now ...
-    assert json.loads(cli("show", open_ticket, "--json", sink="sqlite").stdout)["title"] == (
+    # The file store is empty now, and the migration made the database the default,
+    # so plain commands follow the tickets rather than the store they left.
+    cli("list", "--sink", "file", expect=2)
+    assert (project / "arbite.yaml").read_text().strip() == "sink: sqlite"
+    assert json.loads(cli("show", open_ticket, "--json").stdout)["title"] == (
         "moving to the database"
     )
-    assert json.loads(cli("show", wish, "--json", sink="sqlite").stdout)["id"] == wish
-    cli("doctor", sink="sqlite")
+    assert json.loads(cli("show", wish, "--json").stdout)["id"] == wish
+    cli("doctor")
+
+
+def test_migrate_makes_the_destination_the_default(project, cli):
+    tid = create(cli, "moving")
+    assert not (project / "arbite.yaml").exists()
+
+    out = cli("migrate", "--to", "sqlite").stdout
+    assert "set 'sink: sqlite'" in out
+    assert (project / "arbite.yaml").read_text().strip() == "sink: sqlite"
+    assert json.loads(cli("show", tid, "--json").stdout)["path"].startswith("sqlite:")
+
+    # ...and a dry run writes nothing: it does not know yet whether you will go
+    # through with it.
+    (project / "arbite.yaml").unlink()
+    cli("migrate", "--from", "sqlite", "--to", "file", "--dry-run")
+    assert not (project / "arbite.yaml").exists()
 
 
 def test_migrate_prune_refuses_when_a_source_copy_is_the_newer_one(project, cli):
     tid = create(cli, "original")
     cli("migrate", "--to", "sqlite")
-    cli("set", tid, "title", "newer in the file sink")
+    cli("set", tid, "title", "newer in the file sink", sink="file")
 
-    proc = cli("migrate", "--to", "sqlite", "--prune", expect=1)
+    proc = cli("migrate", "--from", "file", "--to", "sqlite", "--prune", expect=1)
     assert "refusing to prune" in proc.stderr
     assert "--overwrite" in proc.stderr
     assert (project / ".arbite" / "open" / f"{tid}.md").exists(), "nothing was destroyed"
 
     # Following the instruction replaces the stale copy and the prune then proceeds.
-    cli("migrate", "--to", "sqlite", "--prune", "--overwrite")
+    cli("migrate", "--from", "file", "--to", "sqlite", "--prune", "--overwrite")
     assert not (project / ".arbite" / "open" / f"{tid}.md").exists()
     assert json.loads(cli("show", tid, "--json", sink="sqlite").stdout)["title"] == (
         "newer in the file sink"
@@ -469,7 +556,7 @@ def test_migrate_prune_refuses_when_a_source_copy_is_the_newer_one(project, cli)
 def test_migrate_prune_dry_run_reports_what_it_would_refuse(project, cli):
     tid = create(cli, "original")
     cli("migrate", "--to", "sqlite")
-    out = cli("migrate", "--to", "sqlite", "--prune", "--dry-run").stdout
+    out = cli("migrate", "--from", "file", "--to", "sqlite", "--prune", "--dry-run").stdout
     assert "would NOT prune" in out
     assert "--overwrite" in out
     assert (project / ".arbite" / "open" / f"{tid}.md").exists()

@@ -171,13 +171,21 @@ agents: [claude.haiku.001]
 ```
 
 `arbite init` initialises whichever sink is selected, and `arbite sink info`
-reports what is active and where. Creating a database-backed project is a config
-edit or one flag, not a different command:
+reports what is active and where. Creating a database-backed project is one flag,
+not a different command — and `init` **writes the choice into `arbite.yaml`**
+(created if missing, every other key left alone), so the store you just set up is
+the one every later command reads, including commands an agent runs with no flags
+at all:
 
 ```bash
-arbite init --sink sqlite
-arbite --sink sqlite list next --tier high
+arbite init --sink sqlite        # creates the database AND sets sink: sqlite
+arbite list next --tier high     # ...so no flag is needed from here on
+arbite --sink file list          # a one-off against the other store still works
 ```
+
+`arbite migrate` does the same for its destination, since that is where the tickets
+now live. An `ARBITE_SINK` selection is treated as this-process-only: it is reported
+rather than written to committed config.
 
 If the database file is used, add it to `.gitignore`: unlike the file sink, it is
 binary and won't produce a readable history.
@@ -243,13 +251,16 @@ reads through one sink and writes through the other, a `file → sqlite → file
 round trip that reproduces the original files byte for byte is the end-to-end test
 of the whole interface; `tests/test_cli.py` asserts exactly that.
 
-Two things worth being explicit about, because both are easy to assume wrongly:
+Three things worth being explicit about, because all are easy to assume wrongly:
 
-- **`arbite init --sink sqlite` does not migrate anything.** It creates the store.
-  Existing tickets stay in the file store until you run `migrate`, and until
-  `sink: sqlite` is in the config (or you pass `--sink sqlite`) every command still
-  reads the files. `.arbite/AGENTS.md` warns in bold when a store exists that no
-  command would select.
+- **`arbite init --sink sqlite` does not migrate anything.** It creates the store and
+  makes it the project default. Existing tickets stay in the file store until you run
+  `migrate`.
+- **A store that nothing selects is called out.** If a project ends up holding
+  tickets in a store no command would read — a deleted `sink:` key, an `ARBITE_SINK`
+  one-off, an unfinished migration — commands warn on stderr, and the generated
+  `.arbite/AGENTS.md` carries a bold warning naming that store and its ticket count,
+  because the wrong store looks exactly like an empty one.
 - **`--prune` retires the old store** once the copy is verified: after migrating, it
   deletes the source tickets, so `arbite migrate --to sqlite --prune` followed by
   `sink: sqlite` leaves exactly one store. It refuses outright if any ticket was
@@ -508,14 +519,12 @@ Using the database sink instead of files. `--sink` is a *per-command* choice, so
 either pass it every time or make it the project default — one line of config:
 
 ```bash
-# A new project on the database sink
-arbite init --sink sqlite                  # creates .arbite/arbite.db + AGENTS.md
-printf 'sink: sqlite\n' >> arbite.yaml     # make every later command use it
+# A new project on the database sink: one command, and the choice sticks
+arbite init --sink sqlite                  # creates arbite.db and sets sink: sqlite
 arbite sink info                           # which store, where, what it supports
 
-# Or bring an existing file-based project across, then switch
-arbite migrate --to sqlite                 # copies every ticket; source untouched
-printf 'sink: sqlite\n' >> arbite.yaml
+# Or bring an existing file-based project across
+arbite migrate --to sqlite                 # copies every ticket and selects the database
 arbite doctor                              # verify the new store
 
 # ...and once you are satisfied, retire the old store (destructive)

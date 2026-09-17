@@ -398,6 +398,14 @@ implementations satisfy one contract:
 Design notes that were judgement calls, recorded here because they are the kind of
 thing worth re-litigating deliberately rather than by accident:
 
+- **The choice is written down, not remembered.** `arbite init` and a successful
+  `arbite migrate` write `sink: <kind>` into `arbite.yaml`, so the store a command
+  created or copied into is the one later commands read. A per-command flag stays a
+  legitimate one-off, but a *project* whose tickets live in a store nothing selects
+  is a trap: from the outside an unselected store is indistinguishable from an empty
+  backlog, so commands warn on stderr and the generated guide names the stray store
+  and its ticket count. (An `ARBITE_SINK` selection is reported, never written -- it
+  is one process's decision, not the project's.)
 - **The status→location side effect belongs to the sink.** Commands set `status` and
   call `update()`; only the file sink knows that means relocating a file.
 - **Compare-and-swap is an argument, not a method.** `Expect(status=..., assignee=...)`

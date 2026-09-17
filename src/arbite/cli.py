@@ -168,6 +168,31 @@ def _warn_about_an_unused_database(args, sink) -> None:
         )
 
 
+def _has_tickets(sink) -> bool:
+    """Whether a store holds anything, tolerating one that was never created."""
+    try:
+        return bool(sink.ids())
+    except ArbiteError:
+        return False
+
+
+def _find_stale_store(just_created, active, arbite_dir):
+    """A store in this project that holds tickets and that nothing selects, if any.
+
+    This is the state a deleted `sink:` key, an `ARBITE_SINK` one-off or an
+    unfinished migration leaves behind, and from the outside it is indistinguishable
+    from an empty backlog -- so the guide an agent follows calls it out in bold
+    rather than quietly describing only the store that happens to be selected."""
+    candidates = [just_created]
+    for kind in SINK_KINDS:
+        if kind != active.kind:
+            candidates.append(build_sink(config.SinkSpec(kind=kind), arbite_dir))
+    for candidate in candidates:
+        if candidate.kind != active.kind and _has_tickets(candidate):
+            return _describe_safely(candidate)
+    return None
+
+
 def _describe_safely(sink) -> SinkInfo:
     """A sink's `SinkInfo`, tolerating a store that does not exist yet.
 
@@ -203,8 +228,11 @@ def cmd_init(args):
 
     Which sink it creates is decided exactly like every other command decides --
     `--sink`, then `ARBITE_SINK`, then `sink:` in arbite.yaml, then file -- so
-    setting up a SQLite project is a config edit or one flag, not a different
-    command."""
+    setting up a SQLite project is one flag, not a different command. The store it
+    creates then becomes the project default: `sink:` is written to arbite.yaml
+    (created if missing), so later commands -- including ones an agent runs with no
+    flags -- read the same store. An `ARBITE_SINK` selection is treated as
+    this-process-only and reported rather than written into committed config."""
     spec, project_root = _cwd_sink(args)
     arbite_dir = project_root / config.ARBITE_DIRNAME
     arbite_dir.mkdir(parents=True, exist_ok=True)
@@ -232,16 +260,40 @@ def cmd_init(args):
             scratchpad.write_text(f"# {agent_id}\n\nNo ticket claimed yet.\n", encoding="utf-8")
             print(f"created scratchpad for {agent_id}")
 
+    # Make the choice sticky: the store this command just created becomes the
+    # project default, so no later command -- least of all one an agent runs with
+    # no flags -- can read a different store by accident. A store that exists but
+    # that nothing selects looks exactly like an empty one, and that is the one
+    # failure this project cannot leave silently available.
+    explicit = getattr(args, "sink", None)
+    resolved = config.configured_sink_spec(project_root)
+    if resolved.kind != sink.kind:
+        if not explicit and os.environ.get(config.ENV_SINK):
+            # An environment override is one process's decision, not the project's.
+            print(
+                f"note: {config.ENV_SINK}={sink.kind} selected this store for this command "
+                f"only; run 'arbite init --sink {sink.kind}' to make it the project default"
+            )
+        else:
+            written = config.set_configured_sink(sink.kind, project_root)
+            print(
+                f"set 'sink: {sink.kind}' in {written.name} -- the store this command created "
+                "is now the project default, so plain 'arbite' commands read it"
+            )
+
     parser, subparsers_by_name = build_parser()
     agents_md = arbite_dir / "AGENTS.md"
     # The guide is committed and read by processes other than this one, so it
     # describes the sink a *plain* command will use (committed config only, no
-    # --sink, no environment), and `render` warns when that is not the store this
-    # run just created.
-    default_sink = build_sink(config.configured_sink_spec(project_root), arbite_dir)
+    # --sink, no environment) -- and names any other store here that holds tickets
+    # but that nothing selects.
+    active = build_sink(config.configured_sink_spec(project_root), arbite_dir)
     agents_md.write_text(
         docs.render(
-            parser, subparsers_by_name, _describe_safely(sink), _describe_safely(default_sink)
+            parser,
+            subparsers_by_name,
+            _describe_safely(active),
+            _find_stale_store(sink, active, arbite_dir),
         ),
         encoding="utf-8",
     )
@@ -250,12 +302,6 @@ def cmd_init(args):
         f"project's CLAUDE.md (or similar) at it explicitly, e.g. a line like "
         f"'read {config.ARBITE_DIRNAME}/AGENTS.md', if you want agents to find arbite"
     )
-    if sink.kind != config.DEFAULT_SINK_KIND and config.load_config(project_root).get("sink") is None:
-        print(
-            f"note: this project has no 'sink:' key in arbite.yaml, so plain 'arbite' "
-            f"commands will use the default '{config.DEFAULT_SINK_KIND}' sink. Add "
-            f"'sink: {sink.kind}' to arbite.yaml to make it the default."
-        )
 
 
 def cmd_sink(args):
@@ -1189,11 +1235,15 @@ def cmd_delete(args):
 def cmd_migrate(args):
     """Copy every ticket from one sink into another.
 
-    A copy, never a move: the source is left untouched, so migrating is
-    reversible by simply not switching the config over. Reading every ticket from
-    one sink and writing it to the other exercises the whole interface -- ids,
-    timestamps, body, tags, dependencies, notes, buckets -- which is why this
-    command doubles as the end-to-end proof that two independent sinks agree."""
+    A copy, never a move (unless --prune asks for the cleanup), so migrating is
+    reversible. Reading every ticket from one sink and writing it to the other
+    exercises the whole interface -- ids, timestamps, body, tags, dependencies,
+    notes, buckets -- which is why this command doubles as the end-to-end proof
+    that two independent sinks agree.
+
+    A successful migration also makes the destination the project default: the
+    tickets live there now, and leaving `sink:` pointing at the store you migrated
+    away from is the same silent-wrong-store trap `init` closes."""
     project_root = config.find_project_root()
     source = config.open_sink(args.from_sink, project_root)
     target = config.open_sink_kind(args.to_sink, project_root)
@@ -1279,6 +1329,17 @@ def cmd_migrate(args):
             source.remove(t.id)
         print(f"pruned {len(tickets)} ticket(s) from the {source.kind} sink at {source.root}")
 
+    # The destination holds the tickets now, so it becomes the project default --
+    # otherwise the next plain command would read the store you just migrated away
+    # from, which is the same silent-wrong-store trap `init` closes above.
+    configured = config.configured_sink_spec(project_root)
+    if configured.kind != target.kind:
+        written = config.set_configured_sink(target.kind, project_root)
+        print(
+            f"set 'sink: {target.kind}' in {written.name} -- commands now read the store "
+            "migrated into"
+        )
+
 
 def _target_exists(target) -> bool:
     """Whether the migration target already holds tickets. Used by --dry-run,
@@ -1309,7 +1370,11 @@ def build_parser():
         "want agents to find arbite), and pre-create a scratchpad file under .arbite/agents/ "
         "for every id listed in an 'agents:' list in ./arbite.yaml, if present. Which sink is "
         "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
-        "in ./arbite.yaml, then file. Running it again is safe: it never destroys data.",
+        "in ./arbite.yaml, then file. The store it creates then becomes the project default -- "
+        "'sink:' is written to arbite.yaml, created if it does not exist, so no later command "
+        "reads a different store by accident (an ARBITE_SINK selection is reported instead, "
+        "since that was this process's decision rather than the project's). Running it again is "
+        "safe: it never destroys data.",
     )
     _sink_flag(p_init)
     p_init.set_defaults(func=cmd_init)
@@ -1856,9 +1921,10 @@ def build_parser():
         description="Read every ticket from the source sink (status-managed tickets and "
         "bucketed ones alike) and write it to the destination sink, preserving ids, "
         "timestamps, body, tags, dependencies, notes and buckets verbatim. The source is "
-        "never modified: this is a copy, so migrating is undone by simply not switching the "
-        "config over. Tickets already present in the destination are skipped unless "
-        "--overwrite is given.",
+        "never modified -- this is a copy -- and a successful run makes the destination the "
+        "project default, so later commands read the store the tickets now live in. Tickets "
+        "already present in the destination are skipped unless --overwrite is given; --prune "
+        "additionally retires the source store once the copy is verified.",
     )
     p_migrate.add_argument(
         "--to",

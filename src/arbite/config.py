@@ -1,5 +1,10 @@
 """Project configuration: where the arbite directory is, and which sink to use.
 
+`arbite init` and a successful `arbite migrate` *write* the selection here
+(`set_configured_sink`), so a store that has been created or copied into does not
+then sit there unselected: the committed config is what makes a choice stick for
+every later command, including the ones an agent runs with no flags.
+
 Two jobs that both come down to "find the thing, or say clearly what is missing":
 
 - locate the `.arbite/` directory by walking up from the working directory, so
@@ -15,6 +20,8 @@ reads a static list of known ids so `arbite init` can create scratchpads for the
 from __future__ import annotations
 
 import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -118,6 +125,53 @@ def sink_spec(
     location_key = SINK_LOCATION_KEYS.get(kind, "root")
     root = options.pop(location_key, None)
     return SinkSpec(kind=kind, root=root, options=options)
+
+
+# A top-level `sink:` line. Anchored at column 0 so an indented `sink:` under
+# `sinks:` (a per-sink setting) is never mistaken for the selection itself.
+_SINK_KEY_RE = re.compile(r"^sink\s*:")
+
+
+def set_configured_sink(kind: str, project_root: Optional[Path] = None) -> Path:
+    """Make `kind` the project's default sink, writing it into the config.
+
+    Called by `arbite init` and by a successful `arbite migrate`, so the store a
+    command just created or copied into is the store later commands read: the
+    alternative -- a store that exists but that nothing selects -- looks exactly
+    like an empty one, which is the one failure this project cannot afford to leave
+    silently available.
+
+    The file is edited line by line rather than re-dumped from YAML, so a
+    hand-maintained `arbite.yaml` keeps its comments, key order and anything else in
+    it (`agents:`, per-sink locations). The write is atomic."""
+    project_root = project_root or find_project_root()
+    path = config_path(project_root) or (project_root / CONFIG_FILENAMES[0])
+    line = f"sink: {kind}"
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8").splitlines()
+        replaced = False
+        for index, existing in enumerate(lines):
+            if _SINK_KEY_RE.match(existing):
+                lines[index] = line
+                replaced = True
+                break
+        if not replaced:
+            lines.append(line)
+        text = "\n".join(lines) + "\n"
+    else:
+        text = line + "\n"
+
+    fd, tmp_name = tempfile.mkstemp(prefix=".arbite-config-", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    return path
 
 
 def configured_sink_spec(project_root: Optional[Path] = None) -> SinkSpec:
