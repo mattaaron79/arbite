@@ -1,16 +1,34 @@
-"""arbite CLI: argument parsing and command dispatch."""
+"""arbite CLI: argument parsing and command dispatch.
+
+Every command here talks to a *sink* -- the object resolved by
+`config.open_sink()` -- and never to storage directly. That is the whole point of
+the split: no command knows whether a ticket is a markdown file in a status folder
+or a row in a SQLite database, so `arbite list next` means the same thing in both,
+and the file sink is free to keep relocating files on a status change without any
+of this code being aware of it.
+
+Commands therefore work in terms of ticks and queries, never paths:
+
+- read a ticket with `sink.get(id)`, a set with `sink.query(TicketQuery(...))`;
+- change one by mutating the Ticket and calling `sink.update(...)`, passing an
+  `Expect` built from what was just read so a concurrent change is reported as a
+  conflict instead of being silently overwritten;
+- ask the sink where a ticket is (`sink.location(id)`) only when a human needs to
+  be told, and treat that string as opaque.
+"""
 
 from __future__ import annotations
 
 import argparse
-import heapq
 import json
-import re
 import sys
 from pathlib import Path
 
-from . import __version__, config, docs, ticket as ticket_mod
-from .ticket import STATUSES, TIERS, TYPES, Ticket, TicketError
+from . import __version__, config, docs, graph, schema
+from .errors import ArbiteError, Conflict, TicketError
+from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
+from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
+from .sinks import SINK_KINDS, Expect, build_sink
 
 # Exit codes. Agents drive arbite from shell loops, so "nothing matched" has to
 # be distinguishable from "worked fine" and from "broke" without parsing
@@ -47,15 +65,33 @@ def _json_flag(parser):
     parser.add_argument("--json", action="store_true", help=docs.JSON_HELP)
 
 
+def _sink_flag(parser, suppress=True):
+    """The global --sink selector.
+
+    On subparsers the default is suppressed so that `arbite --sink sqlite list`
+    is not overwritten by the subparser's own default -- argparse stores the
+    subparser's value last, so a plain `default=None` there would silently drop
+    the flag the user gave before the command name."""
+    parser.add_argument(
+        "--sink",
+        metavar="KIND",
+        choices=SINK_KINDS,
+        default=argparse.SUPPRESS if suppress else None,
+        help=f"which storage to use for this command: {', '.join(SINK_KINDS)} "
+        "(default: the 'sink:' key in arbite.yaml, else file)",
+    )
+
+
 def _print_json(payload):
     print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
 
-def _emit_tickets(rows, as_json):
+def _emit_tickets(rows, as_json, sink):
     """Emit a ticket list as JSON or a table, exiting EXIT_EMPTY when empty so a
     caller can branch on 'nothing to do' without matching on message text."""
     if as_json:
-        _print_json([t.to_dict() for t in rows])
+        locations = sink.location_map(rows)
+        _print_json([t.to_dict(locations.get(t.id)) for t in rows])
     elif rows:
         _print_flat(rows)
     else:
@@ -87,37 +123,59 @@ RAW_SHORTCUT_HELP = {
 }
 
 
-def _require_tickets_root() -> Path:
-    tickets_root = config.find_arbite_dir()
-    if tickets_root is None:
-        print(
-            f"error: no {config.ARBITE_DIRNAME}/ directory found (run 'arbite init' first)",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    return tickets_root
+def _cwd_sink(args):
+    """The sink for a command that works on the current directory rather than on
+    an existing project (`arbite init`), so it never inherits a location from a
+    parent directory's config."""
+    project_root = Path.cwd()
+    spec = config.sink_spec(getattr(args, "sink", None), project_root)
+    return spec, project_root
+
+
+def _require_sink(args):
+    """The configured sink, or a clear instruction to initialise one."""
+    return config.open_sink(getattr(args, "sink", None))
+
+
+def _expect_from(ticket: Ticket) -> Expect:
+    """A compare-and-swap token for the exact state just read.
+
+    Every mutating command writes through this, so if anything changed the ticket
+    between the read and the write -- another agent claimed it, someone else
+    closed it -- the write is refused with a Conflict instead of silently
+    discarding that change. Commands that edit prose without changing state
+    (`note`, `set` of a non-status field) still use it; only `move_to_bucket`
+    does not, because filing is not a state change."""
+    return Expect(status=ticket.status, assignee=ticket.assignee)
 
 
 def cmd_init(args):
-    project_root = Path.cwd()
-    tickets_root = project_root / config.ARBITE_DIRNAME
-    for status in ticket_mod.FLAT_STATUS_DIRS:
-        (tickets_root / status).mkdir(parents=True, exist_ok=True)
-    (tickets_root / "closed").mkdir(parents=True, exist_ok=True)
-    # Non-status buckets. Neither is a status -- tickets/notes there are parked,
-    # not workable: wishlist/ holds reclassified wishes (see `arbite raw wish`
-    # and `arbite move ... /wishlist`), planning/ holds planning/roadmap notes
-    # and scratch docs.
-    (tickets_root / "wishlist").mkdir(parents=True, exist_ok=True)
-    (tickets_root / "planning").mkdir(parents=True, exist_ok=True)
-    agents_dir = tickets_root / "agents"
+    """Create the arbite directory and the selected sink's store, then write the
+    agent-facing command reference.
+
+    Which sink it creates is decided exactly like every other command decides --
+    `--sink`, then `ARBITE_SINK`, then `sink:` in arbite.yaml, then file -- so
+    setting up a SQLite project is a config edit or one flag, not a different
+    command."""
+    spec, project_root = _cwd_sink(args)
+    arbite_dir = project_root / config.ARBITE_DIRNAME
+    arbite_dir.mkdir(parents=True, exist_ok=True)
+
+    sink = build_sink(spec, arbite_dir)
+    sink.init()
+    print(f"{sink.kind} sink ready at {sink.root}")
+
+    # Agent scratchpads stay plain files regardless of sink: they are
+    # harness-facing state, not tickets, and deliberately outside the sink
+    # contract.
+    agents_dir = arbite_dir / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"{config.ARBITE_DIRNAME}/ ready at {tickets_root}")
-
     agent_ids = config.load_known_agent_ids(project_root)
     if not agent_ids:
-        print("no agents configured (add an 'agents:' list to arbite.yaml to pre-create scratchpads)")
+        print(
+            "no agents configured (add an 'agents:' list to arbite.yaml to "
+            "pre-create scratchpads)"
+        )
     else:
         for agent_id in agent_ids:
             scratchpad = agents_dir / f"{agent_id}.md"
@@ -127,13 +185,49 @@ def cmd_init(args):
             print(f"created scratchpad for {agent_id}")
 
     parser, subparsers_by_name = build_parser()
-    agents_md = tickets_root / "AGENTS.md"
-    agents_md.write_text(docs.render(parser, subparsers_by_name), encoding="utf-8")
+    agents_md = arbite_dir / "AGENTS.md"
+    agents_md.write_text(
+        docs.render(parser, subparsers_by_name, sink.describe()), encoding="utf-8"
+    )
     print(
         f"AGENTS.md refreshed at {agents_md} -- this is not auto-discovered, so point your "
         f"project's CLAUDE.md (or similar) at it explicitly, e.g. a line like "
         f"'read {config.ARBITE_DIRNAME}/AGENTS.md', if you want agents to find arbite"
     )
+    if sink.kind != config.DEFAULT_SINK_KIND and config.load_config(project_root).get("sink") is None:
+        print(
+            f"note: this project has no 'sink:' key in arbite.yaml, so plain 'arbite' "
+            f"commands will use the default '{config.DEFAULT_SINK_KIND}' sink. Add "
+            f"'sink: {sink.kind}' to arbite.yaml to make it the default."
+        )
+
+
+def cmd_sink(args):
+    """Report or initialise the active sink: which implementation is in use,
+    where its store lives, and what it can do."""
+    action = args.subcommand or "info"
+    if action == "init":
+        sink = config.open_sink(getattr(args, "sink", None), require_initialised=False)
+        sink.init()
+        print(f"{sink.kind} sink ready at {sink.root}")
+        return
+
+    sink = _require_sink(args)
+    info = sink.describe()
+    if args.json:
+        _print_json(info.to_dict())
+        return
+    print(f"sink: {info.kind}")
+    print(f"root: {info.root}")
+    print(f"status is folder location: {'yes' if info.status_is_location else 'no'}")
+    # "support" vs "in use": the capability line and a sink's own list of buckets
+    # in use would otherwise both print under the word "buckets".
+    print(f"buckets supported: {'yes' if info.supports_buckets else 'no'}")
+    if info.details:
+        for key, value in sorted(info.details.items()):
+            print(f"{key}: {value}")
+    counts = ", ".join(f"{status} {n}" for status, n in sorted(info.status_counts.items()))
+    print(f"tickets: {info.ticket_count}{f' ({counts})' if counts else ''}")
 
 
 def cmd_create(args):
@@ -156,23 +250,20 @@ def cmd_create(args):
     if args.priority is not None and args.priority < 1:
         raise TicketError("--priority must be a positive integer (lower = more urgent)")
 
-    tickets_root = _require_tickets_root()
-    existing_ids = {t.id for _, t in ticket_mod.load_all_tickets(tickets_root)}
-    new_id = ticket_mod.gen_id(existing_ids)
-    now = ticket_mod.now()
-
-    description = args.description or (ticket_mod.BLANK_DESCRIPTION if args.blank else "")
-    body = ticket_mod.DEFAULT_BODY.format(description=description)
+    sink = _require_sink(args)
+    now = schema.now()
+    description = args.description or (schema.BLANK_DESCRIPTION if args.blank else "")
+    body = schema.DEFAULT_BODY.format(description=description)
     if args.blank:
-        body = f"{ticket_mod.BLANK_WARNING}\n\n{body}"
+        body = f"{schema.BLANK_WARNING}\n\n{body}"
 
     new_ticket = Ticket(
-        id=new_id,
-        title=args.title or ticket_mod.BLANK_TITLE,
+        id=sink.new_id(),
+        title=args.title or schema.BLANK_TITLE,
         status="open",
-        type=args.type or ticket_mod.BLANK_TYPE,
-        tier=args.tier or ticket_mod.BLANK_TIER,
-        domain=args.domain or ticket_mod.BLANK_DOMAIN,
+        type=args.type or schema.BLANK_TYPE,
+        tier=args.tier or schema.BLANK_TIER,
+        domain=args.domain or schema.BLANK_DOMAIN,
         epic=args.epic,
         priority=args.priority,
         tags=_split_csv(args.tags),
@@ -185,49 +276,48 @@ def cmd_create(args):
         body=body,
     )
 
-    dest = ticket_mod.status_dir("open", tickets_root) / f"{new_id}.md"
-    ticket_mod.save_ticket(new_ticket, dest)
+    sink.create(new_ticket)
+    location = sink.location(new_ticket.id)
     if args.blank:
-        print(f"created blank template {new_id} at {dest} -- fill in the TODOs and save before it's claimed")
+        print(
+            f"created blank template {new_ticket.id} at {location} -- fill in the TODOs "
+            "and save before it's claimed"
+        )
     else:
-        print(f"created {new_id} at {dest}")
+        print(f"created {new_ticket.id} at {location}")
 
 
 def cmd_raw(args):
-    """Create a deliberately unclassified 'raw' ticket in raw/ from a brief
-    request. Only the type and a placeholder title are set; the body explains
-    what still needs to be filled in (title, tier, domain, epic, priority, and
-    an expanded description) before the ticket can be claimed or worked.
-    Status 'raw' keeps it out of raw/'s workable neighbors -- it never shows
-    up in 'arbite list next' until triage sets it to 'open' (or claims it
+    """Create a deliberately unclassified 'raw' ticket from a brief request. Only
+    the type and a placeholder title are set; the body explains what still needs
+    to be filled in (title, tier, domain, epic, priority, and an expanded
+    description) before the ticket can be claimed or worked. Status 'raw' keeps it
+    out of 'arbite list next' until triage sets it to 'open' (or claims it
     directly). The ticket is auto-grouped under the 'classification' epic so
     triage/classification jobs can discover it with 'arbite list next --epic
     classification' or pull the oldest one with 'arbite fetch'. A 'wish' raw
-    ticket carries an extra note: wishlist items are reclassified as 'feature'
-    and filed in .arbite/wishlist/ rather than opened as work."""
-    tickets_root = _require_tickets_root()
-    existing_ids = {t.id for _, t in ticket_mod.load_all_tickets(tickets_root)}
-    new_id = ticket_mod.gen_id(existing_ids)
-    now = ticket_mod.now()
+    ticket carries an extra note: wishlist items are reclassified as 'feature' and
+    filed in the wishlist bucket rather than opened as work."""
+    sink = _require_sink(args)
+    now = schema.now()
     message = " ".join(args.message)
+    # The id is minted first because a wish's note names the ticket it belongs to.
+    new_id = sink.new_id()
 
-    description = ticket_mod.RAW_DESCRIPTION.format(message=message)
+    description = schema.RAW_DESCRIPTION.format(message=message)
     if args.type == "memo":
-        description = f"{description}\n\n{ticket_mod.MEMO_RAW_NOTE}"
+        description = f"{description}\n\n{schema.MEMO_RAW_NOTE}"
     elif args.type == "wish":
-        description = f"{description}\n\n{ticket_mod.WISH_RAW_NOTE.format(id=new_id)}"
-        (tickets_root / "wishlist").mkdir(parents=True, exist_ok=True)
-
-    body = ticket_mod.DEFAULT_BODY.format(description=description)
+        description = f"{description}\n\n{schema.WISH_RAW_NOTE.format(id=new_id)}"
 
     new_ticket = Ticket(
         id=new_id,
-        title=ticket_mod.RAW_TITLE_FORMAT.format(type=args.type),
+        title=schema.RAW_TITLE_FORMAT.format(type=args.type),
         status="raw",
         type=args.type,
-        tier=ticket_mod.BLANK_TIER,
-        domain=ticket_mod.BLANK_DOMAIN,
-        epic=ticket_mod.CLASSIFICATION_EPIC,
+        tier=schema.BLANK_TIER,
+        domain=schema.BLANK_DOMAIN,
+        epic=CLASSIFICATION_EPIC,
         priority=None,
         tags=[],
         assignee=None,
@@ -236,32 +326,35 @@ def cmd_raw(args):
         created=now,
         updated=now,
         closed=None,
-        body=body,
+        body=schema.DEFAULT_BODY.format(description=description),
     )
 
-    dest = ticket_mod.status_dir("raw", tickets_root) / f"{new_id}.md"
-    ticket_mod.save_ticket(new_ticket, dest)
+    sink.create(new_ticket)
     print(
-        f"created raw {args.type} ticket {new_id} at {dest} -- classify it "
-        "(title/tier/domain/epic/priority/description) before it can be worked; "
-        f"it is grouped under the '{ticket_mod.CLASSIFICATION_EPIC}' epic until then. "
+        f"created raw {args.type} ticket {new_ticket.id} at {sink.location(new_ticket.id)} -- "
+        "classify it (title/tier/domain/epic/priority/description) before it can be worked; "
+        f"it is grouped under the '{CLASSIFICATION_EPIC}' epic until then. "
         "Pull it for classification with 'arbite fetch'."
     )
 
 
 def cmd_fetch(args):
-    """Pull the oldest raw ticket (status 'raw'), optionally restricted to a type, and
-    print it exactly like 'arbite show' would -- except with a 'derived_note' injected at
-    the top (a JSON field in --json mode, a leading block in text mode) telling the
-    calling agent to classify it and either open it for someone else or claim it now.
-    This is a triage queue, so it's oldest-first (by 'created') rather than priority-
-    ordered like 'list next' -- a raw ticket has no priority yet."""
-    tickets_root = _require_tickets_root()
-    all_tickets = [t for _, t in ticket_mod.load_all_tickets(tickets_root)]
-    candidates = [
-        t for t in all_tickets if t.status == "raw" and (not args.type or t.type == args.type)
-    ]
-    candidates.sort(key=lambda t: (t.created or "", t.id))
+    """Pull the oldest raw ticket (status 'raw'), optionally restricted to a type,
+    and print it exactly like 'arbite show' would -- except with a 'derived_note'
+    injected at the top (a JSON field in --json mode, a leading block in text mode)
+    telling the calling agent to classify it and either open it for someone else or
+    claim it now. This is a triage queue, so it's oldest-first (by 'created')
+    rather than priority-ordered like 'list next' -- a raw ticket has no priority
+    yet."""
+    sink = _require_sink(args)
+    candidates = sink.query(
+        TicketQuery(
+            status=("raw",),
+            type=(args.type,) if args.type else (),
+            order="created_asc",
+            limit=1,
+        )
+    )
 
     if not candidates:
         if args.json:
@@ -272,33 +365,30 @@ def cmd_fetch(args):
         sys.exit(EXIT_EMPTY)
 
     t = candidates[0]
-    path = ticket_mod.status_dir(t.status, tickets_root, t.closed) / f"{t.id}.md"
-    note = ticket_mod.derived_note(t.id, t.type)
+    note = schema.derived_note(t.id, t.type)
     if args.json:
-        data = t.to_dict(path)
+        data = t.to_dict(sink.location(t.id))
         data["derived_note"] = note
         _print_json(data)
     else:
         print(f"derived_note: {note}\n")
-        print(path.read_text(encoding="utf-8"))
+        print(sink.render(t), end="")
 
 
-def _matches_field_filters(args, t):
-    """True if t passes the --status/--tier/--domain/--epic/--priority/--assignee
-    filters. --status is a list of statuses and matches any one of them."""
-    if args.status and t.status not in args.status:
-        return False
-    if args.tier and t.tier != args.tier:
-        return False
-    if args.domain and t.domain != args.domain:
-        return False
-    if args.epic and t.epic != args.epic:
-        return False
-    if args.assignee and t.assignee != args.assignee:
-        return False
-    if args.priority is not None and t.priority != args.priority:
-        return False
-    return True
+def _filter_query(args) -> TicketQuery:
+    """The structured filters shared by every list view.
+
+    Built as a `TicketQuery` so the same selection is expressed once and executed
+    by whichever sink is active, instead of being re-implemented as a Python
+    predicate here."""
+    return TicketQuery(
+        status=tuple(getattr(args, "status", None) or ()),
+        tier=getattr(args, "tier", None),
+        domain=getattr(args, "domain", None),
+        epic=getattr(args, "epic", None),
+        assignee=getattr(args, "assignee", None),
+        priority=getattr(args, "priority", None),
+    ).normalized()
 
 
 def _print_flat(rows):
@@ -333,13 +423,13 @@ def _print_raw_summary(raw):
         by_type.setdefault(t.type, []).append(t)
 
     print(f"raw tickets awaiting classification ({len(raw)}):")
-    for raw_type in ticket_mod.RAW_TYPE_CHOICES:
+    for raw_type in schema.RAW_TYPE_CHOICES:
         rows = by_type.get(raw_type)
         if not rows:
             continue
         print(f"\n{raw_type} ({len(rows)}):")
         for t in rows:
-            request = ticket_mod.raw_captured_request(t)
+            request = schema.raw_captured_request(t)
             if request:
                 print(f"  {t.id}  {request}")
             else:
@@ -349,7 +439,7 @@ def _print_raw_summary(raw):
                 )
 
 
-def _cmd_list_raw(args, all_tickets):
+def _cmd_list_raw(args, sink):
     """Summarize every raw ticket (status 'raw') as a running todo list until a
     classification run drains it. The classification fields of a raw ticket are
     placeholders and its title is always '<type> (raw): Requires
@@ -359,18 +449,18 @@ def _cmd_list_raw(args, all_tickets):
     that `arbite fetch` pulls from -- a stable, chronological backlog a human
     or triage run can scan top to bottom. Exits 2 when nothing is raw yet,
     mirroring the other list views."""
-    raw = [t for t in all_tickets if t.status == "raw"]
-    raw.sort(key=lambda t: (t.created or "", t.id))
+    raw = sink.query(TicketQuery(status=("raw",), order="created_asc"))
 
     if args.json:
         # JSON mode keeps the list contract: an array of ticket dicts whose
         # field names match the frontmatter, plus a derived 'request' field
         # (like `fetch` injects 'derived_note') so a caller can group or
         # display the captured text without parsing the body itself.
+        locations = sink.location_map(raw)
         payload = []
         for t in raw:
-            data = t.to_dict()
-            data["request"] = ticket_mod.raw_captured_request(t)
+            data = t.to_dict(locations.get(t.id))
+            data["request"] = schema.raw_captured_request(t)
             payload.append(data)
         _print_json(payload)
     elif raw:
@@ -381,35 +471,213 @@ def _cmd_list_raw(args, all_tickets):
         sys.exit(EXIT_EMPTY)
 
 
-def _unmet_dependencies(t, by_id):
-    """Ticket ids in t.depends_on that are not closed yet.
+def _warn_cycles(by_id, scope_ids=None):
+    """Report any unsatisfiable depends_on cycle touching the tickets in scope
+    on stderr.
 
-    Readiness is a property of the whole ticket set, never of a filtered
-    subset: a blocker that a --tier/--domain/--epic filter excludes still
-    blocks, so by_id must always be every known ticket. Dependency ids that
-    don't resolve to a ticket are ignored rather than blocking forever."""
-    return [d for d in t.depends_on if d in by_id and by_id[d].status != "closed"]
+    A topological order that silently appends cycle members hands agents work
+    that will never become workable. Warn rather than fail, so one bad edge
+    doesn't take down every query; `arbite doctor` reports the same cycles as a
+    hard problem."""
+    for chain in graph.cycle_warnings(by_id, scope_ids):
+        print(
+            f"warning: dependency cycle, these tickets can never become workable: {chain}",
+            file=sys.stderr,
+        )
 
 
-def _is_workable(t, by_id):
-    """True if every ticket t depends on is closed (see _unmet_dependencies)."""
-    return not _unmet_dependencies(t, by_id)
+def _print_topo(by_id, selected_ids, sink, as_json=False, count=None):
+    """Print the selected tickets in topological dependency order.
+
+    The order is always computed over by_id (every ticket), so a blocker that
+    the caller's filters exclude still holds back the tickets that depend on
+    it; the filter is applied afterwards, as a pure selection over the
+    already-ordered result."""
+    _warn_cycles(by_id, selected_ids)
+    rows = [by_id[tid] for tid in graph.topo_order(by_id) if tid in selected_ids]
+    _emit_tickets(apply_limit(rows, count), as_json, sink)
 
 
-def _dependency_closure(by_id, root_ids):
-    """All ticket ids reachable from root_ids by following depends_on (roots included)."""
-    scope = set()
-    stack = list(root_ids)
-    while stack:
-        tid = stack.pop()
-        if tid in scope:
+def _cmd_list_next(args, sink, every):
+    """Print the next open ticket(s) that are actually workable -- every ticket
+    they depend on is closed -- most urgent (lowest priority number) first.
+    Readiness is decided against the complete ticket set, so an unmet
+    dependency holds a ticket back whatever tier/domain/epic its blocker sits
+    at; --tier/--domain/--epic then narrow the workable candidates, and
+    anything that isn't `open` is never considered. If nothing workable matches
+    the filters, that's an answer: nothing at that tier/domain/epic is ready
+    yet, and the exit code is 2.
+
+    With --claim, the single most urgent candidate is claimed in the same
+    command. That closes the race in the obvious two-step version (`list next`
+    then `claim`): between those two commands another agent can claim the
+    ticket you were just handed, and both agents then work it."""
+    by_id = {t.id: t for t in every}
+    candidates = sink.query(
+        TicketQuery(
+            status=("open",),
+            tier=args.tier,
+            domain=args.domain,
+            epic=args.epic,
+            order="next",
+        )
+    )
+    candidates = [t for t in candidates if graph.is_workable(t, by_id)]
+
+    if not candidates:
+        # "Nothing is ready" and "everything is deadlocked" look identical from
+        # the outside, so say which one it is rather than leaving an agent to
+        # poll a queue that can never produce work.
+        _warn_cycles(by_id)
+
+    # `next` answers "what should I work on", so it returns one ticket unless
+    # the caller asks for a batch.
+    wanted = 1 if args.count is None else args.count
+
+    if not args.claim:
+        _emit_tickets(candidates[:wanted], args.json, sink)
+        return
+
+    if not candidates:
+        # Nothing to claim is not an error; the exit code carries it.
+        _emit_tickets([], args.json, sink)
+        return
+
+    # Walk candidates in order, claiming until we have `wanted` of them: if
+    # another agent wins the race for one, move on to the next rather than
+    # failing the whole dispatch. Each claim is individually atomic, so a
+    # partial batch is a correct result, not a broken one.
+    claimed = []
+    errors = []
+    for candidate in candidates:
+        if len(claimed) == wanted:
+            break
+        # The expectation is taken from the ticket as read, *before* the mutation
+        # below: taken afterwards it would describe the new state rather than the
+        # state the write has to replace.
+        expect = _expect_from(candidate)
+        candidate.status = "in_progress"
+        candidate.assignee = args.claim
+        candidate.updated = schema.now()
+        try:
+            sink.update(candidate, expect=expect)
+        except Conflict as e:
+            # Lost the race for this one. The next candidate is untouched, so the
+            # loop simply moves on to it.
+            errors.append(str(e))
             continue
-        scope.add(tid)
-        t = by_id.get(tid)
-        if t is None:
-            continue
-        stack.extend(t.depends_on)
-    return scope
+        claimed.append(candidate)
+
+    if not claimed:
+        raise TicketError(
+            "every workable ticket was claimed by another agent first: " + "; ".join(errors)
+        )
+
+    if args.json:
+        locations = sink.location_map(claimed)
+        _print_json([t.to_dict(locations.get(t.id)) for t in claimed])
+    else:
+        _print_flat(claimed)
+        # The table is the result; the claim receipts are commentary on stderr.
+        # Flush first so the two streams stay in order when stdout is a pipe.
+        sys.stdout.flush()
+        for t in claimed:
+            print(f"claimed {t.id} for {args.claim} -> {sink.location(t.id)}", file=sys.stderr)
+    if len(claimed) < wanted:
+        # Say so explicitly, and say why: a dispatcher that asked for 3 and got
+        # 2 needs to know whether the queue ran dry or it lost races, because
+        # those call for different responses (wait vs. retry immediately).
+        if errors:
+            reason = f"{len(errors)} were claimed by another agent first"
+        else:
+            reason = "no more workable tickets match"
+        sys.stdout.flush()
+        print(
+            f"note: asked for {wanted} ticket(s), claimed {len(claimed)} -- {reason}",
+            file=sys.stderr,
+        )
+
+
+def cmd_list(args):
+    if args.count is not None and args.count < 1:
+        raise TicketError(f"--count must be a positive integer, got {args.count}")
+    sink = _require_sink(args)
+
+    # `every` includes tickets filed in buckets, because readiness and the
+    # dependency graph are properties of the whole set: a blocker parked in the
+    # wishlist still blocks. Listing, on the other hand, shows only tickets that
+    # are in the status workflow, which is the sink's default for a query.
+    every = sink.query(TicketQuery(buckets=("*",)))
+    by_id = {t.id: t for t in every}
+    tic_ids = set(resolve_terms(list(by_id), _split_csv(args.tic))) if args.tic else set()
+
+    if args.subcommand == "next":
+        _cmd_list_next(args, sink, every)
+        return
+
+    if args.subcommand == "raw":
+        _cmd_list_raw(args, sink)
+        return
+
+    if args.tree or args.topo:
+        if tic_ids:
+            # --tic roots the tree/topo at those tickets and pulls in every
+            # transitive dependency beneath them (other field filters are ignored).
+            scope_ids = graph.dependency_closure(by_id, tic_ids) & set(by_id)
+        else:
+            scope_ids = {t.id for t in sink.query(_filter_query(args))}
+            if not scope_ids:
+                _emit_tickets([], args.json, sink)
+                return
+        if args.topo:
+            _print_topo(by_id, scope_ids, sink, args.json, args.count)
+            return
+        scope = {tid: by_id[tid] for tid in scope_ids}
+        roots = [tid for tid in tic_ids if tid in by_id] if tic_ids else graph.tree_roots(scope, [])
+        # A tree has no single flat length to cap, so --count limits the number
+        # of top-level roots shown; each one still prints its full subtree,
+        # since a truncated dependency chain would be actively misleading.
+        roots = apply_limit(
+            sorted(roots, key=lambda tid: (scope[tid].priority_sort_key(), tid)), args.count
+        )
+        _warn_cycles(by_id, scope_ids)
+        if args.json:
+            _print_json(_tree_payload(scope, roots))
+        else:
+            _print_tree(scope, roots)
+        return
+
+    # Flat list: field filters plus the --tic id filter.
+    rows = sink.query(_filter_query(args).evolve(order="flat"))
+    if tic_ids:
+        rows = [t for t in rows if t.id in tic_ids]
+    _emit_tickets(apply_limit(rows, args.count), args.json, sink)
+
+
+def _tree_payload(scope, roots):
+    """The dependency forest as nested JSON-serialisable dicts, mirroring what
+    _print_tree renders. A ticket already on the current path is emitted with
+    "cycle": true and not descended into."""
+    def child_key(d):
+        return (scope[d].priority_sort_key(), d)
+
+    def node(tid, seen):
+        t = scope[tid]
+        data = t.to_dict()
+        data["path"] = None
+        if tid in seen:
+            data["cycle"] = True
+            data["depends"] = []
+            return data
+        seen = seen | {tid}
+        children = sorted((d for d in t.depends_on if d in scope), key=child_key)
+        data["depends"] = [node(d, seen) for d in children]
+        return data
+
+    return [
+        node(tid, set())
+        for tid in sorted(roots, key=lambda tid: (scope[tid].priority_sort_key(), tid))
+    ]
 
 
 def _print_tree(scope, roots):
@@ -433,306 +701,14 @@ def _print_tree(scope, roots):
         walk(tid, "", set())
 
 
-def _topo_order(scope):
-    """Kahn's algorithm over scope: dependencies are emitted before the tickets that
-    depend on them; when several tickets are ready at once (siblings), the most urgent
-    (lowest priority number) is emitted first, then id for a stable tie-break.
-
-    Only unmet dependencies (see _unmet_dependencies) constrain the order -- a closed
-    dependency is already satisfied, so it must not hold its dependent back. Callers
-    pass the full ticket set as scope so that a ticket excluded by their filters still
-    orders the tickets that depend on it."""
-    indegree = {tid: len(_unmet_dependencies(t, scope)) for tid, t in scope.items()}
-    dependents = {tid: [] for tid in scope}
-    for tid, t in scope.items():
-        for d in _unmet_dependencies(t, scope):
-            dependents[d].append(tid)
-    heap = []
-    for tid, t in scope.items():
-        if indegree[tid] == 0:
-            heapq.heappush(heap, (t.priority_sort_key(), tid))
-    order = []
-    while heap:
-        _, tid = heapq.heappop(heap)
-        order.append(tid)
-        for parent in dependents[tid]:
-            indegree[parent] -= 1
-            if indegree[parent] == 0:
-                heapq.heappush(heap, (scope[parent].priority_sort_key(), parent))
-    # Any node never emitted (e.g. a depends_on cycle) is appended in priority order.
-    emitted = set(order)
-    leftover = sorted(
-        (tid for tid in scope if tid not in emitted),
-        key=lambda tid: (scope[tid].priority_sort_key(), tid),
-    )
-    order.extend(leftover)
-    return order
-
-
-def _tree_payload(scope, roots):
-    """The dependency forest as nested JSON-serialisable dicts, mirroring what
-    _print_tree renders. A ticket already on the current path is emitted with
-    "cycle": true and not descended into."""
-    def child_key(d):
-        return (scope[d].priority_sort_key(), d)
-
-    def node(tid, seen):
-        t = scope[tid]
-        data = t.to_dict()
-        if tid in seen:
-            data["cycle"] = True
-            data["depends"] = []
-            return data
-        seen = seen | {tid}
-        children = sorted((d for d in t.depends_on if d in scope), key=child_key)
-        data["depends"] = [node(d, seen) for d in children]
-        return data
-
-    return [
-        node(tid, set())
-        for tid in sorted(roots, key=lambda tid: (scope[tid].priority_sort_key(), tid))
-    ]
-
-
-def _live_cycles(by_id):
-    """Dependency cycles that are actually unsatisfiable.
-
-    A closed ticket satisfies anything depending on it, so a loop with even one
-    closed member is already cut and its remaining tickets can still become
-    workable -- reporting those would cry wolf on ordinary history. Only a
-    cycle in which every member is still open/in_progress/blocked/shelved is a
-    real deadlock: each ticket waits on another that waits back, and none can
-    ever be worked."""
-    return [
-        cycle
-        for cycle in ticket_mod.find_cycles(by_id)
-        if all(by_id[tid].status != "closed" for tid in cycle)
-    ]
-
-
-def _warn_cycles(by_id, scope_ids=None):
-    """Report any unsatisfiable depends_on cycle touching the tickets in scope
-    on stderr.
-
-    A topological order that silently appends cycle members hands agents work
-    that will never become workable. Warn rather than fail, so one bad edge
-    doesn't take down every query; `arbite doctor` reports the same cycles as a
-    hard problem."""
-    cycles = _live_cycles(by_id)
-    if scope_ids is not None:
-        cycles = [c for c in cycles if any(tid in scope_ids for tid in c)]
-    for cycle in cycles:
-        chain = " -> ".join(cycle + [cycle[0]])
-        print(
-            f"warning: dependency cycle, these tickets can never become workable: {chain}",
-            file=sys.stderr,
-        )
-    return cycles
-
-
-def _apply_count(rows, count):
-    """Cap a result list to --count entries. None means no cap; the rows are
-    already in the view's own order, so this always keeps the most relevant
-    ones (most urgent first for a flat list, dependencies first for --topo)."""
-    return rows if count is None else rows[:count]
-
-
-def _print_topo(by_id, selected_ids, as_json=False, count=None):
-    """Print the selected tickets in topological dependency order.
-
-    The order is always computed over by_id (every ticket), so a blocker that
-    the caller's filters exclude still holds back the tickets that depend on
-    it; the filter is applied afterwards, as a pure selection over the
-    already-ordered result."""
-    _warn_cycles(by_id, selected_ids)
-    rows = [by_id[tid] for tid in _topo_order(by_id) if tid in selected_ids]
-    _emit_tickets(_apply_count(rows, count), as_json)
-
-
-def _cmd_list_next(args, tickets_root, all_tickets):
-    """Print the next open ticket(s) that are actually workable -- every ticket
-    they depend on is closed -- most urgent (lowest priority number) first.
-    Readiness is decided against the complete ticket set, so an unmet
-    dependency holds a ticket back whatever tier/domain/epic its blocker sits
-    at; --tier/--domain/--epic then narrow the workable candidates, and
-    anything that isn't `open` is never considered. If nothing workable matches
-    the filters, that's an answer: nothing at that tier/domain/epic is ready
-    yet, and the exit code is 2.
-
-    With --claim, the single most urgent candidate is claimed in the same
-    command. That closes the race in the obvious two-step version (`list next`
-    then `claim`): between those two commands another agent can claim the
-    ticket you were just handed, and both agents then work it."""
-    by_id = {t.id: t for t in all_tickets}
-    candidates = [
-        t
-        for t in all_tickets
-        if t.status == "open"
-        and _is_workable(t, by_id)
-        and (not args.tier or t.tier == args.tier)
-        and (not args.domain or t.domain == args.domain)
-        and (not args.epic or t.epic == args.epic)
-    ]
-    # Every candidate is workable, so none depends on another of them: the
-    # topological order restricted to this set is exactly priority order.
-    candidates.sort(key=lambda t: (t.priority_sort_key(), t.id))
-
-    if not candidates:
-        # "Nothing is ready" and "everything is deadlocked" look identical from
-        # the outside, so say which one it is rather than leaving an agent to
-        # poll a queue that can never produce work.
-        _warn_cycles(by_id)
-
-    # `next` answers "what should I work on", so it returns one ticket unless
-    # the caller asks for a batch.
-    wanted = 1 if args.count is None else args.count
-
-    if not args.claim:
-        _emit_tickets(candidates[:wanted], args.json)
-        return
-
-    if not candidates:
-        # Nothing to claim is not an error; the exit code carries it.
-        _emit_tickets([], args.json)
-        return
-
-    # Walk candidates in order, claiming until we have `wanted` of them: if
-    # another agent wins the race for one, move on to the next rather than
-    # failing the whole dispatch. Each claim is individually atomic, so a
-    # partial batch is a correct result, not a broken one.
-    claimed = []
-    errors = []
-    for candidate in candidates:
-        if len(claimed) == wanted:
-            break
-        path = ticket_mod.status_dir(candidate.status, tickets_root, candidate.closed) / f"{candidate.id}.md"
-        try:
-            new_path = ticket_mod.claim_ticket(path, candidate, tickets_root, args.claim)
-        except TicketError as e:
-            errors.append(str(e))
-            continue
-        claimed.append((candidate, new_path))
-
-    if not claimed:
-        raise TicketError(
-            "every workable ticket was claimed by another agent first: " + "; ".join(errors)
-        )
-
-    if args.json:
-        _print_json([t.to_dict(p) for t, p in claimed])
-    else:
-        _print_flat([t for t, _ in claimed])
-        # The table is the result; the claim receipts are commentary on stderr.
-        # Flush first so the two streams stay in order when stdout is a pipe.
-        sys.stdout.flush()
-        for t, new_path in claimed:
-            print(f"claimed {t.id} for {args.claim} -> {new_path}", file=sys.stderr)
-    if len(claimed) < wanted:
-        # Say so explicitly, and say why: a dispatcher that asked for 3 and got
-        # 2 needs to know whether the queue ran dry or it lost races, because
-        # those call for different responses (wait vs. retry immediately).
-        if errors:
-            reason = f"{len(errors)} were claimed by another agent first"
-        else:
-            reason = "no more workable tickets match"
-        sys.stdout.flush()
-        print(
-            f"note: asked for {wanted} ticket(s), claimed {len(claimed)} -- {reason}",
-            file=sys.stderr,
-        )
-
-
-def _resolve_tic_terms(all_tickets, terms):
-    """Expand each --tic term into every ticket id it matches by wildcard
-    (substring) search, e.g. 'f6' resolves to tic-f607. Each term must match
-    at least one ticket (TicketError otherwise). Returns a sorted set of ids."""
-    by_id = {t.id: t for t in all_tickets}
-    resolved = []
-    for term in terms:
-        term_lower = term.lower()
-        matches = sorted(tid for tid in by_id if term_lower in tid.lower())
-        if not matches:
-            raise TicketError(f"no ticket found matching '{term}'")
-        resolved.extend(matches)
-    return sorted(set(resolved))
-
-
-def cmd_list(args):
-    if args.count is not None and args.count < 1:
-        raise TicketError(f"--count must be a positive integer, got {args.count}")
-    tickets_root = _require_tickets_root()
-    all_tickets = [t for _, t in ticket_mod.load_all_tickets(tickets_root)]
-    by_id = {t.id: t for t in all_tickets}
-    tic_ids = set(_resolve_tic_terms(all_tickets, _split_csv(args.tic)))
-
-    if args.subcommand == "next":
-        _cmd_list_next(args, tickets_root, all_tickets)
-        return
-
-    if args.subcommand == "raw":
-        _cmd_list_raw(args, all_tickets)
-        return
-
-    if args.tree or args.topo:
-        if tic_ids:
-            # --tic roots the tree/topo at those tickets and pulls in every
-            # transitive dependency beneath them (other field filters are ignored).
-            scope = {
-                tid: by_id[tid]
-                for tid in _dependency_closure(by_id, tic_ids)
-                if tid in by_id
-            }
-        else:
-            scope = {t.id: t for t in all_tickets if _matches_field_filters(args, t)}
-            if not scope:
-                _emit_tickets([], args.json)
-                return
-        if args.topo:
-            _print_topo(by_id, set(scope), args.json, args.count)
-            return
-        if tic_ids:
-            roots = [tid for tid in tic_ids if tid in by_id]
-        else:
-            # Forest roots are the tickets nothing else depends on.
-            roots = [
-                tid
-                for tid in scope
-                if not any(tid in other.depends_on for other in scope.values())
-            ]
-            if not roots:
-                roots = list(scope)
-        # A tree has no single flat length to cap, so --count limits the number
-        # of top-level roots shown; each one still prints its full subtree,
-        # since a truncated dependency chain would be actively misleading.
-        roots = _apply_count(
-            sorted(roots, key=lambda tid: (scope[tid].priority_sort_key(), tid)), args.count
-        )
-        _warn_cycles(by_id, set(scope))
-        if args.json:
-            _print_json(_tree_payload(scope, roots))
-        else:
-            _print_tree(scope, roots)
-        return
-
-    # Flat list: field filters plus the --tic id filter.
-    rows = [
-        t
-        for t in all_tickets
-        if _matches_field_filters(args, t) and (not tic_ids or t.id in tic_ids)
-    ]
-    # Within each status, more urgent (lower priority number) tickets come first;
-    # tickets without a priority set sort last so they don't jump the queue.
-    rows.sort(key=lambda t: (t.status, t.priority_sort_key(), t.id))
-    _emit_tickets(_apply_count(rows, args.count), args.json)
-
-
 def cmd_claim(args):
     """Claim a ticket for an agent. Claiming is a compare-and-swap, not a
     blind write: a ticket already assigned to somebody else is refused unless
-    --force, and the move into in_progress/ is itself atomic, so two agents
-    racing for the same ticket can't both come away believing they own it."""
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    --force, and the write carries the expectation that the ticket is still in
+    the state it was read in, so two agents racing for the same ticket can't
+    both come away believing they own it."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
     previous = t.assignee
     if previous and previous != args.agent and not args.force:
         raise TicketError(
@@ -740,42 +716,48 @@ def cmd_claim(args):
             "pass --force to take it over"
         )
     if previous and previous != args.agent:
-        ticket_mod.append_note(
-            t, args.agent, f"Claim taken over from {previous} (--force)."
-        )
-    new_path = ticket_mod.claim_ticket(path, t, tickets_root, args.agent)
-    print(f"claimed {t.id} for {args.agent} -> {new_path}")
+        schema.append_note(t, args.agent, f"Claim taken over from {previous} (--force).")
+    expect = _expect_from(t)
+    t.status = "in_progress"
+    t.assignee = args.agent
+    t.updated = schema.now()
+    sink.update(t, expect=expect)
+    print(f"claimed {t.id} for {args.agent} -> {sink.location(t.id)}")
 
 
 def cmd_release(args):
     """Return a claimed ticket to open/ and clear its assignee.
 
-    The counterpart to claim: an agent that stops work part-way (out of scope,
-    out of context, wrong capability tier) needs one command that unassigns and
+    The counterpart to claim: an agent that stops work part-way (out of scope, out of
+    context, wrong capability tier) needs one command that unassigns and
     reopens together, so the ticket becomes visible to `list next` again rather
-    than sitting in in_progress/ owned by nobody who is still working it."""
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    than sitting in_progress owned by nobody who is still working it."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
     if t.status == "open" and t.assignee is None:
         raise TicketError(f"ticket {t.id} is already open and unassigned")
     previous = t.assignee
+    expect = _expect_from(t)
     message = "Released." if not args.reason else f"Released: {args.reason}"
-    ticket_mod.append_note(t, args.agent, message)
+    schema.append_note(t, args.agent, message)
     t.assignee = None
     t.blocked_by = None
-    t.updated = ticket_mod.now()
-    new_path = ticket_mod.move_ticket(path, t, tickets_root, "open")
+    t.status = "open"
+    t.updated = schema.now()
+    sink.update(t, expect=expect)
     owner = f" (was {previous})" if previous else ""
-    print(f"released {t.id}{owner} -> {new_path}")
+    print(f"released {t.id}{owner} -> {sink.location(t.id)}")
 
 
 def cmd_block(args):
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    expect = _expect_from(t)
     t.blocked_by = args.reason
-    t.updated = ticket_mod.now()
-    new_path = ticket_mod.move_ticket(path, t, tickets_root, "blocked")
-    print(f"blocked {t.id} ({args.reason}) -> {new_path}")
+    t.status = "blocked"
+    t.updated = schema.now()
+    sink.update(t, expect=expect)
+    print(f"blocked {t.id} ({args.reason}) -> {sink.location(t.id)}")
 
 
 def cmd_unblock(args):
@@ -783,10 +765,10 @@ def cmd_unblock(args):
 
     The symmetric counterpart to `block`. Doing this with `set status` leaves
     blocked_by populated, so the ticket claims to be stalled by something in
-    every listing while sitting in open/ -- exactly the frontmatter drift the
+    every listing while sitting in open -- exactly the frontmatter drift the
     folder-is-truth rule exists to prevent."""
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
     if t.status != "blocked":
         raise TicketError(f"ticket {t.id} is not blocked (status: {t.status})")
     reason = t.blocked_by
@@ -794,96 +776,104 @@ def cmd_unblock(args):
     message = f"Unblocked: {args.reason}" if args.reason else "Unblocked."
     if reason:
         message = f"{message.rstrip('.')} (was blocked by: {reason})."
-    ticket_mod.append_note(t, args.agent, message)
+    expect = _expect_from(t)
+    schema.append_note(t, args.agent, message)
     t.blocked_by = None
-    t.updated = ticket_mod.now()
+    t.updated = schema.now()
     # Back to whoever was working it if it is still assigned, otherwise open.
     dest = "in_progress" if (t.assignee and not args.open) else "open"
+    t.status = dest
     if dest == "open":
         t.assignee = None
-    new_path = ticket_mod.move_ticket(path, t, tickets_root, dest)
-    print(f"unblocked {t.id}{was} -> {new_path}")
+    sink.update(t, expect=expect)
+    print(f"unblocked {t.id}{was} -> {sink.location(t.id)}")
 
 
 def cmd_close(args):
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
-    t.closed = ticket_mod.now()
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    expect = _expect_from(t)
+    t.closed = schema.now()
     t.updated = t.closed
-    new_path = ticket_mod.move_ticket(path, t, tickets_root, "closed")
-    print(f"closed {t.id} -> {new_path}")
+    t.status = "closed"
+    sink.update(t, expect=expect)
+    print(f"closed {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_reopen(args):
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
     if t.status == "open":
         raise TicketError(f"ticket {t.id} is already open")
+    expect = _expect_from(t)
     t.closed = None
     t.blocked_by = None
-    t.updated = ticket_mod.now()
-    ticket_mod.append_note(t, args.agent, "Reopened.")
-    new_path = ticket_mod.move_ticket(path, t, tickets_root, "open")
-    print(f"reopened {t.id} -> {new_path}")
+    t.status = "open"
+    t.updated = schema.now()
+    schema.append_note(t, args.agent, "Reopened.")
+    sink.update(t, expect=expect)
+    print(f"reopened {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_shelve(args):
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
-    t.updated = ticket_mod.now()
-    message = "Shelved."
-    if args.reason:
-        message = f"Shelved: {args.reason}"
-    ticket_mod.append_note(t, "system", message)
-    new_path = ticket_mod.move_ticket(path, t, tickets_root, "shelved")
-    print(f"shelved {t.id} -> {new_path}")
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    expect = _expect_from(t)
+    t.status = "shelved"
+    t.updated = schema.now()
+    message = "Shelved." if not args.reason else f"Shelved: {args.reason}"
+    schema.append_note(t, "system", message)
+    sink.update(t, expect=expect)
+    print(f"shelved {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_unshelve(args):
     """Bring a shelved ticket back to open/.
 
     The counterpart to shelve: a ticket that was parked (deprioritized or
-    paused) is moved back to open/ so it shows up in `arbite list next` again.
-    The assignee and any stale block reason are cleared -- an unshelved ticket
-    is back in the unclaimed pool, not reserved for whoever parked it."""
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    paused) is moved back into the open status so it shows up in
+    `arbite list next` again. The assignee and any stale block reason are
+    cleared -- an unshelved ticket is back in the unclaimed pool, not reserved
+    for whoever parked it."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
     if t.status != "shelved":
         raise TicketError(f"ticket {t.id} is not shelved (status: {t.status})")
-    t.updated = ticket_mod.now()
-    message = "Unshelved."
-    if args.reason:
-        message = f"Unshelved: {args.reason}"
-    ticket_mod.append_note(t, "system", message)
+    expect = _expect_from(t)
+    t.updated = schema.now()
+    message = "Unshelved." if not args.reason else f"Unshelved: {args.reason}"
+    schema.append_note(t, "system", message)
     t.assignee = None
     t.blocked_by = None
-    new_path = ticket_mod.move_ticket(path, t, tickets_root, "open")
-    print(f"unshelved {t.id} -> {new_path}")
+    t.status = "open"
+    sink.update(t, expect=expect)
+    print(f"unshelved {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_note(args):
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id)
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
     message = " ".join(args.message)
-    ticket_mod.append_note(t, args.agent, message)
-    t.updated = ticket_mod.now()
-    ticket_mod.save_ticket(t, path)
+    expect = _expect_from(t)
+    schema.append_note(t, args.agent, message)
+    t.updated = schema.now()
+    sink.update(t, expect=expect)
     print(f"added note to {t.id} by {args.agent}")
 
 
 def cmd_show(args):
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id)
+    sink = _require_sink(args)
+    t = sink.get(args.id)
     if args.json:
-        _print_json(t.to_dict(path))
+        _print_json(t.to_dict(sink.location(t.id)))
         return
-    print(path.read_text(encoding="utf-8"))
+    print(sink.render(t), end="")
 
 
 def cmd_deps(args):
-    tickets_root = _require_tickets_root()
-    _, start = ticket_mod.find_ticket(tickets_root, args.id)
-    by_id = {t.id: t for _, t in ticket_mod.load_all_tickets(tickets_root)}
+    sink = _require_sink(args)
+    start = sink.get(args.id)
+    by_id = {t.id: t for t in sink.query(TicketQuery(buckets=("*",)))}
 
     if args.json:
         def node(tid, seen):
@@ -893,6 +883,7 @@ def cmd_deps(args):
                 # caller can tell "no dependencies" from "dependency deleted".
                 return {"id": tid, "missing": True, "depends": []}
             data = t.to_dict()
+            data["path"] = None
             if tid in seen:
                 data["cycle"] = True
                 data["depends"] = []
@@ -924,148 +915,60 @@ def cmd_depend(args):
     """Set or clear a ticket's depends_on. With two arguments, <tic_a> is made to
     depend on <tic_b> (added to its depends_on, deduplicated). With a single
     argument, all of <tic_a>'s dependencies are cleared."""
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    expect = _expect_from(t)
     if args.dep is None:
         t.depends_on = []
-        t.updated = ticket_mod.now()
-        ticket_mod.save_ticket(t, path)
+        t.updated = schema.now()
+        sink.update(t, expect=expect)
         print(f"cleared dependencies of {t.id}")
         return
-    _, dep = ticket_mod.find_ticket(tickets_root, args.dep, unique=True)
+    dep = sink.get(args.dep, unique=True)
     if dep.id == t.id:
         raise TicketError(f"ticket {t.id} cannot depend on itself")
     if dep.id not in t.depends_on:
         t.depends_on.append(dep.id)
-        t.updated = ticket_mod.now()
-        ticket_mod.save_ticket(t, path)
+        t.updated = schema.now()
+        sink.update(t, expect=expect)
         print(f"{t.id} now depends on {dep.id}")
     else:
         print(f"{t.id} already depends on {dep.id}")
 
 
-def _find_any_ticket(tickets_root: Path, term: str):
-    """Resolve a ticket id to (path, Ticket) by scanning every markdown file
-    under the arbite root, including non-status folders (wishlist/, planning/)
-    that the normal status-folder scan skips. `arbite move` uses this so it can
-    move a ticket that is already filed in such a folder, not just one sitting
-    in a status folder. An exact id always wins; otherwise an ambiguous match
-    is an error listing the candidates."""
-    term_lower = term.lower()
-    matches = []
-    for path in tickets_root.rglob("*.md"):
-        if path.name == "AGENTS.md":
-            # AGENTS.md and agent scratchpads aren't tickets and won't parse as
-            # one; skip them so a stray parse error can't be mistaken for a
-            # candidate or silently collapse the search.
-            continue
-        try:
-            t = ticket_mod.load_ticket(path)
-        except TicketError:
-            continue
-        if term_lower in t.id.lower():
-            matches.append((path, t))
-    matches.sort(key=lambda pair: pair[1].id)
-    if not matches:
-        raise TicketError(f"no ticket found matching '{term}'")
-    exact = [m for m in matches if m[1].id.lower() == term.lower()]
-    if exact:
-        return exact[0]
-    if len(matches) > 1:
-        candidates = ", ".join(t.id for _, t in matches)
-        raise TicketError(
-            f"'{term}' is ambiguous -- it matches {len(matches)} tickets: "
-            f"{candidates}. Pass a full ticket id."
-        )
-    return matches[0]
-
-
 def cmd_move(args):
-    """Move a ticket's file to a folder under the arbite root without changing
-    its status or frontmatter -- a raw file move, nothing more. <folder> is
-    root-relative, like '/' for the arbite root itself or '/wishlist' for
-    .arbite/wishlist/; the destination folder is created if it doesn't exist.
-    Because it does not touch status/updated, use it to file tickets into
-    non-status buckets (wishlist/, planning/), and use the status commands
-    (claim/block/close/...) for any move that should change state."""
-    tickets_root = _require_tickets_root()
-    path, t = _find_any_ticket(tickets_root, args.id)
+    """File a ticket somewhere other than its status location, or bring it back.
+
+    `<folder>` is root-relative, and what it means is the sink's business: the
+    file sink moves the ticket's file (a folder, created if missing), the SQLite
+    sink records a bucket. '/' returns the ticket to where its status says it
+    belongs, which is the only way to un-file a ticket without changing its
+    status. Nothing here changes a field -- use the status commands
+    (claim/block/close/...) for moves that are state changes, which also un-file
+    the ticket automatically."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
 
     folder = args.folder.strip()
     if not folder.startswith("/"):
         raise TicketError(
-            f"<folder> must be a root-relative path like '/' (the arbite root) or "
-            f"'/wishlist', got '{args.folder}'"
+            f"<folder> must be a root-relative path like '/wishlist', or '/' to return "
+            f"the ticket to its status location, got '{args.folder}'"
         )
-    # Root-relative -> absolute under tickets_root, dropping empty/'.' segments
-    # and refusing '..' so a folder can never escape the arbite root.
+    # Root-relative -> bucket name, dropping empty/'.' segments and refusing '..'
+    # so a ticket can never be filed outside the arbite root.
     parts = [p for p in folder[1:].split("/") if p and p != "."]
     if any(p == ".." for p in parts):
         raise TicketError(
             f"<folder> may not contain '..' (it must stay under the arbite root): '{folder}'"
         )
-    dest_dir = tickets_root.joinpath(*parts) if parts else tickets_root
-    dest_path = dest_dir / path.name
+    bucket = "/".join(parts) if parts else None
 
-    if dest_path == path:
-        print(f"{t.id} is already at {dest_path}")
+    if sink.bucket(t.id) == bucket:
+        print(f"{t.id} is already at {sink.location(t.id)}")
         return
-    if dest_path.exists():
-        raise TicketError(f"a file already exists at {dest_path}")
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    path.replace(dest_path)
-    print(f"moved {t.id} -> {dest_path}")
-
-
-# Fields `arbite set` accepts: every frontmatter field except the structural id
-# (the id is the filename, generated by `arbite create` and never renamed by
-# hand), plus 'body' for the freeform markdown body.
-SETTABLE_PROPERTIES = (set(ticket_mod.FIELD_ORDER) | {"body"}) - {"id"}
-
-# Optional text fields: an empty quoted value clears them back to None.
-_CLEARABLE_TEXT_FIELDS = {"epic", "assignee", "blocked_by", "closed"}
-
-
-def _validate_field(prop: str, value: str) -> None:
-    """Reject values `arbite create` would never have produced.
-
-    `set` is the one way to write any field by hand, so without this it is the
-    hole every controlled vocabulary leaks through -- a typo'd tier or a
-    free-text date silently persists and then quietly fails to match the
-    filters that route work to agents."""
-    if value == "":
-        return
-    if prop == "status" and value not in STATUSES:
-        raise TicketError(f"invalid status '{value}' (valid: {', '.join(STATUSES)})")
-    if prop == "type" and value not in TYPES:
-        raise TicketError(f"invalid type '{value}' (valid: {', '.join(TYPES)})")
-    if prop == "tier" and value not in TIERS:
-        raise TicketError(f"invalid tier '{value}' (valid: {', '.join(TIERS)})")
-    if prop == "priority":
-        try:
-            if int(value) < 1:
-                raise TicketError(
-                    f"priority must be a positive integer, got '{value}' (lower = more urgent)"
-                )
-        except ValueError:
-            raise TicketError(f"priority must be an integer, got '{value}'")
-    if prop in ticket_mod.DATE_FIELDS and not ticket_mod.DATE_PATTERN.match(value):
-        raise TicketError(
-            f"{prop} must be a YYYY-MM-DD date or YYYY-MM-DDTHH:MM:SS timestamp, got '{value}'"
-        )
-
-
-def _coerce_set_value(prop: str, value: str):
-    """Convert a CLI string into the typed value a ticket property expects:
-    lists (tags/depends_on) are comma-split, priority is parsed as an int, and an
-    empty quoted value clears optional/list/int fields."""
-    if prop in ("tags", "depends_on"):
-        return _split_csv(value)
-    if prop == "priority":
-        return None if value == "" else int(value)
-    if value == "" and prop in _CLEARABLE_TEXT_FIELDS:
-        return None
-    return value
+    sink.move_to_bucket(t.id, bucket)
+    print(f"moved {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_set(args):
@@ -1073,10 +976,11 @@ def cmd_set(args):
     PROPERTY VALUE pairs (any number per call); quote any value that spans more
     than one word. Type-aware: 'tags'/'depends_on' are comma-separated lists,
     'priority' must be an integer, and an empty quoted value ('') clears a field.
-    A 'status' change also moves the ticket file so folder and frontmatter stay in
-    sync (and auto-dates 'closed' when a ticket is set to closed)."""
-    tickets_root = _require_tickets_root()
-    path, t = ticket_mod.find_ticket(tickets_root, args.id, unique=True)
+    A 'status' change also un-files the ticket (the file sink moves it) so status
+    and location stay in sync, and auto-dates 'closed' when a ticket is set to
+    closed."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
     assignments = args.assignments
     if len(assignments) % 2 != 0:
         raise TicketError(
@@ -1088,13 +992,14 @@ def cmd_set(args):
     # Validate every property name and value before mutating anything, so a bad
     # call leaves the ticket untouched.
     for prop, value in pairs:
-        if prop not in SETTABLE_PROPERTIES:
+        if prop not in schema.SETTABLE_PROPERTIES:
             raise TicketError(
                 f"unknown ticket property '{prop}' "
-                f"(valid: {', '.join(sorted(SETTABLE_PROPERTIES))})"
+                f"(valid: {', '.join(sorted(schema.SETTABLE_PROPERTIES))})"
             )
-        _validate_field(prop, value)
+        schema.validate_field(prop, value)
 
+    expect = _expect_from(t)
     original_status = t.status
     new_status = None
     updated_given = False
@@ -1103,56 +1008,23 @@ def cmd_set(args):
             new_status = value
         if prop == "updated":
             updated_given = True
-        setattr(t, prop, _coerce_set_value(prop, value))
+        setattr(t, prop, schema.coerce_field_value(prop, value))
 
     if not updated_given:
-        t.updated = ticket_mod.now()
+        t.updated = schema.now()
 
     if new_status is not None and new_status != original_status:
-        # A real status change also moves the file (mirrors claim/close/etc.);
-        # moving to closed auto-dates 'closed' like `arbite close` does.
+        # A real status change also re-files the ticket (the file sink relocates
+        # the file, the database sink clears its bucket), mirroring
+        # claim/close/etc.; moving to closed auto-dates 'closed' like
+        # `arbite close` does.
         if new_status == "closed" and t.closed is None:
             t.closed = t.updated
-        new_path = ticket_mod.move_ticket(path, t, tickets_root, new_status)
-        print(f"set {', '.join(prop for prop, _ in pairs)} on {t.id} -> {new_path}")
-    else:
-        ticket_mod.save_ticket(t, path)
-        print(f"set {', '.join(prop for prop, _ in pairs)} on {t.id} at {path}")
+        t.status = new_status
 
-
-def _ticket_field_value(t: Ticket, name: str) -> str:
-    """String form of a ticket field for searching; 'body' is the markdown body."""
-    if name == "body":
-        return t.body or ""
-    value = getattr(t, name, None)
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return ", ".join(str(v) for v in value)
-    return str(value)
-
-
-def _compile_matcher(pattern: str, use_regex: bool, use_wildcard: bool, ignore_case: bool = True):
-    """Build a text->bool matcher from the search pattern and mode flags. Default is a
-    case-insensitive substring match; -w treats '*' as 'any' (simple globbing); -r uses
-    the pattern as a regular expression (invalid patterns raise TicketError)."""
-    flags = re.IGNORECASE if ignore_case else 0
-    if use_regex:
-        try:
-            rx = re.compile(pattern, flags)
-        except re.error as e:
-            raise TicketError(f"invalid regex '{pattern}': {e}")
-        return lambda text: rx.search(text) is not None
-    if use_wildcard:
-        # Translate simple globs: everything is literal except '*' = any text (incl. empty).
-        rx = re.compile(re.escape(pattern).replace(r"\*", ".*"), flags)
-        return lambda text: rx.search(text) is not None
-    needle = pattern.lower()
-    return lambda text: needle in text.lower()
-
-
-# Fields `arbite search --params` accepts: every frontmatter field plus the body.
-SEARCH_PARAMS = set(ticket_mod.FIELD_ORDER) | {"body"}
+    sink.update(t, expect=expect)
+    what = ", ".join(prop for prop, _ in pairs)
+    print(f"set {what} on {t.id} at {sink.location(t.id)}")
 
 
 def cmd_search(args):
@@ -1161,247 +1033,159 @@ def cmd_search(args):
     every field plus the body, the default). Matching is a case-insensitive substring
     by default; -w adds simple wildcards ('*' = any text) and -r treats the text as a
     regular expression."""
-    tickets_root = _require_tickets_root()
+    sink = _require_sink(args)
     params = _split_csv(args.params) or ["all"]
-    if "all" in params:
-        params = sorted(SEARCH_PARAMS)
-    unknown = [p for p in params if p not in SEARCH_PARAMS]
-    if unknown:
-        raise TicketError(
-            f"unknown ticket field(s) to search: {', '.join(unknown)} "
-            f"(valid: all, body, {', '.join(ticket_mod.FIELD_ORDER)})"
-        )
-    matcher = _compile_matcher(" ".join(args.search_text), args.regex, args.wildcard)
-    rows = [
-        t
-        for _, t in ticket_mod.load_all_tickets(tickets_root)
-        if (not args.status or t.status in args.status)
-        and any(matcher(_ticket_field_value(t, p)) for p in params)
-    ]
-    rows.sort(key=lambda t: (t.status, t.priority_sort_key(), t.id))
-    _emit_tickets(rows, args.json)
+    mode = "regex" if args.regex else "wildcard" if args.wildcard else "substring"
+    text = TextMatch(" ".join(args.search_text), mode=mode, fields=tuple(params))
 
-
-def _expected_dir_status(path: Path, tickets_root: Path):
-    """The status a ticket file's location implies, or None if it isn't in a
-    recognised status folder."""
-    try:
-        rel = path.relative_to(tickets_root)
-    except ValueError:
-        return None
-    parts = rel.parts
-    if len(parts) == 2 and parts[0] in ticket_mod.FLAT_STATUS_DIRS:
-        return parts[0]
-    if len(parts) == 3 and parts[0] == "closed":
-        return "closed"
-    return None
+    q = TicketQuery(
+        status=tuple(args.status or ()),
+        text=text,
+        order="flat",
+    )
+    _emit_tickets(sink.query(q), args.json, sink)
 
 
 def cmd_doctor(args):
     """Check the invariants nothing else enforces, and optionally repair them.
 
-    The whole design rests on the ticket's folder being the single source of
-    truth, with frontmatter mirroring it -- but tickets are plain files in a git
-    repo. Humans `mv` them, merges and rebases resurrect and mangle them, and a
-    crash mid-move can strand a temp file. Every arbite command keeps the
-    invariant; nothing until now noticed when something outside arbite broke
-    it, which meant drift stayed invisible until an agent acted on a wrong
-    status. Exits 3 when problems remain, so this can gate CI or an agent's
-    startup."""
-    tickets_root = _require_tickets_root()
-    problems = []
+    The checks themselves live in the sink, because part of the point of a
+    pluggable store is that its failure modes differ: a file sink can suffer
+    frontmatter/folder drift, a stray temp file or an archive in the wrong month,
+    while a database sink can suffer a stale derived index or structural
+    corruption. The checks that mean the same thing either way -- invalid field
+    values, deadlocked dependencies, a claimed ticket with no assignee -- are
+    shared, so `doctor` cannot mean two different things per sink.
 
-    def report(kind, detail, ticket_id=None, fixed=False, path=None):
-        problems.append(
-            {
-                "kind": kind,
-                "detail": detail,
-                "id": ticket_id,
-                "path": str(path) if path else None,
-                "fixed": fixed,
-            }
-        )
-
-    # Unparseable files first: they can't take part in any later check, and a
-    # ticket arbite cannot read is invisible to every listing.
-    loaded = []
-    for path in ticket_mod.iter_ticket_paths(tickets_root):
-        try:
-            loaded.append((path, ticket_mod.load_ticket(path)))
-        except TicketError as e:
-            report("unreadable", str(e), path=path)
-
-    # Crash artifacts from an interrupted save/move. The content is intact, so
-    # this is a recoverable ticket, not a lost one -- but only if someone looks.
-    for status_dir_name in list(ticket_mod.FLAT_STATUS_DIRS) + ["closed"]:
-        base = tickets_root / status_dir_name
-        if not base.is_dir():
-            continue
-        for tmp in base.rglob(f"{ticket_mod.TMP_PREFIX}*"):
-            if tmp.is_file():
-                report(
-                    "stray_temp_file",
-                    f"leftover temp file from an interrupted write: {tmp} "
-                    "(inspect it; it holds the full ticket content)",
-                    path=tmp,
-                )
-
-    by_id = {}
-    duplicates = {}
-    for path, t in loaded:
-        if t.id in by_id:
-            duplicates.setdefault(t.id, [by_id[t.id][0]]).append(path)
-        else:
-            by_id[t.id] = (path, t)
-    for tid, paths in duplicates.items():
-        report(
-            "duplicate_id",
-            f"{len(paths)} files share id {tid}: {', '.join(str(p) for p in paths)} "
-            "(resolve by hand -- arbite cannot know which is current)",
-            ticket_id=tid,
-        )
-
-    for path, t in loaded:
-        expected = _expected_dir_status(path, tickets_root)
-        if expected is None:
-            report("stray_file", f"ticket file outside any status folder: {path}", t.id, path=path)
-            continue
-
-        # The core invariant: folder wins, frontmatter is corrected to match.
-        if t.status != expected:
-            if args.fix:
-                stale = t.status
-                t.status = expected
-                ticket_mod.save_ticket(t, path)
-                report(
-                    "status_drift",
-                    f"frontmatter said '{stale}' but the file sits in {expected}/ "
-                    f"-- corrected to '{expected}' (folder is source of truth)",
-                    t.id, fixed=True, path=path,
-                )
-            else:
-                report(
-                    "status_drift",
-                    f"frontmatter says status '{t.status}' but the file sits in "
-                    f"{expected}/ -- the folder is source of truth",
-                    t.id, path=path,
-                )
-
-        if expected == "closed":
-            if not t.closed:
-                report("closed_without_date", "closed ticket has no 'closed' date", t.id, path=path)
-            else:
-                month = t.closed[:7]
-                actual_month = path.parent.name
-                if month != actual_month:
-                    if args.fix:
-                        new_path = ticket_mod.move_ticket(path, t, tickets_root, "closed")
-                        report(
-                            "wrong_archive_month",
-                            f"closed {t.closed} but archived under {actual_month}/ "
-                            f"-- moved to {new_path.parent.name}/",
-                            t.id, fixed=True, path=new_path,
-                        )
-                    else:
-                        report(
-                            "wrong_archive_month",
-                            f"closed {t.closed} but archived under closed/{actual_month}/ "
-                            f"(expected closed/{month}/)",
-                            t.id, path=path,
-                        )
-
-        if expected == "in_progress" and not t.assignee:
-            report(
-                "in_progress_unassigned",
-                "in_progress but has no assignee -- nobody is accountable for it and "
-                "'list next' will never offer it; release it or claim it",
-                t.id, path=path,
-            )
-        if expected == "blocked" and not t.blocked_by:
-            report(
-                "blocked_without_reason",
-                "blocked but blocked_by is empty -- nothing records what is stalling it",
-                t.id, path=path,
-            )
-        if expected != "closed" and t.closed:
-            report(
-                "closed_date_on_open_ticket",
-                f"not closed but has a 'closed' date of {t.closed}",
-                t.id, path=path,
-            )
-
-        for dep in t.depends_on:
-            if dep not in by_id:
-                report(
-                    "dangling_dependency",
-                    f"depends_on '{dep}', which is not a known ticket "
-                    "(readiness silently ignores it, so this ticket can look workable "
-                    "when its real prerequisite is gone)",
-                    t.id, path=path,
-                )
-        if t.id in t.depends_on:
-            report("self_dependency", "depends on itself", t.id, path=path)
-
-        for prop, value in (("status", t.status), ("type", t.type), ("tier", t.tier)):
-            if value is None:
-                continue
-            # `arbite raw` and `create --blank` deliberately write TODO
-            # placeholders for a human or triage job to replace. Those are
-            # pending work, not corruption -- flagging them would leave doctor
-            # permanently failing in any repo with an untriaged ticket, which
-            # is exactly when its exit code needs to mean something.
-            if str(value).startswith("TODO:"):
-                continue
-            try:
-                _validate_field(prop, str(value))
-            except TicketError as e:
-                report("invalid_field", str(e), t.id, path=path)
-        for date_field in ticket_mod.DATE_FIELDS:
-            value = getattr(t, date_field)
-            if value and not ticket_mod.DATE_PATTERN.match(str(value)):
-                report(
-                    "invalid_field",
-                    f"{date_field} is not a valid date/timestamp "
-                    f"(YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS): '{value}'",
-                    t.id, path=path,
-                )
-
-    # Cycles are checked over the whole graph: an unsatisfiable loop means
-    # every ticket in it is permanently unworkable, however it is filtered.
-    tickets_by_id = {tid: pair[1] for tid, pair in by_id.items()}
-    for cycle in _live_cycles(tickets_by_id):
-        chain = " -> ".join(cycle + [cycle[0]])
-        report(
-            "dependency_cycle",
-            f"dependency cycle -- none of these can ever become workable: {chain}",
-            cycle[0],
-        )
+    Exits 3 when problems remain, so this can gate CI or an agent's startup."""
+    sink = _require_sink(args)
+    problems = sink.check(fix=args.fix)
+    info = sink.describe()
+    fixed = sum(1 for p in problems if p.fixed)
+    remaining = sum(1 for p in problems if not p.fixed)
 
     if args.json:
         _print_json(
             {
-                "tickets_checked": len(loaded),
-                "problems": problems,
-                "fixed": sum(1 for p in problems if p["fixed"]),
-                "remaining": sum(1 for p in problems if not p["fixed"]),
+                "sink": {"kind": info.kind, "root": info.root},
+                "tickets_checked": info.ticket_count,
+                "problems": [p.to_dict() for p in problems],
+                "fixed": fixed,
+                "remaining": remaining,
             }
         )
     else:
         if not problems:
-            print(f"checked {len(loaded)} tickets: no problems found")
+            print(f"checked {info.ticket_count} tickets: no problems found")
         else:
             for p in problems:
-                prefix = "fixed" if p["fixed"] else "problem"
-                where = f" [{p['id']}]" if p["id"] else ""
-                print(f"{prefix}{where} {p['kind']}: {p['detail']}")
-            fixed = sum(1 for p in problems if p["fixed"])
-            remaining = len(problems) - fixed
-            print(f"\nchecked {len(loaded)} tickets: {remaining} problem(s), {fixed} fixed")
+                prefix = "fixed" if p.fixed else "problem"
+                where = f" [{p.ticket_id}]" if p.ticket_id else ""
+                print(f"{prefix}{where} {p.kind}: {p.detail}")
+            print(
+                f"\nchecked {info.ticket_count} tickets: {remaining} problem(s), {fixed} fixed"
+            )
             if remaining and not args.fix:
                 print("re-run with --fix to repair what arbite can correct automatically")
 
-    if any(not p["fixed"] for p in problems):
+    if remaining:
         sys.exit(EXIT_PROBLEMS)
+
+
+def cmd_delete(args):
+    """Delete a ticket outright.
+
+    Gated behind --force because it is irreversible, and it records a
+    'Deleted by <agent>' note immediately before removing the ticket so the last
+    state a ticket ever had is attributable. The receipt (id, title, location,
+    note) is printed and included in --json, so a calling agent can log what it
+    destroyed even though the ticket is gone."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    if not args.force:
+        raise TicketError(
+            f"refusing to delete {t.id} without --force (deletion is irreversible; "
+            f"'arbite close {t.id}' archives it instead)"
+        )
+    note = f"Deleted by {args.agent}" + (f": {args.reason}" if args.reason else ".")
+    location = sink.location(t.id)
+    if not args.dry_run:
+        expect = _expect_from(t)
+        schema.append_note(t, args.agent, note)
+        t.updated = schema.now()
+        sink.update(t, expect=expect)
+        sink.remove(t.id)
+    if args.json:
+        payload = t.to_dict(location)
+        payload.update({"deleted": not args.dry_run, "note": note})
+        _print_json(payload)
+    else:
+        verb = "would delete" if args.dry_run else "deleted"
+        print(f"{verb} {t.id} ({t.title}) from {location}")
+
+
+def cmd_migrate(args):
+    """Copy every ticket from one sink into another.
+
+    A copy, never a move: the source is left untouched, so migrating is
+    reversible by simply not switching the config over. Reading every ticket from
+    one sink and writing it to the other exercises the whole interface -- ids,
+    timestamps, body, tags, dependencies, notes, buckets -- which is why this
+    command doubles as the end-to-end proof that two independent sinks agree."""
+    project_root = config.find_project_root()
+    source = config.open_sink(args.from_sink, project_root)
+    target = config.open_sink_kind(args.to_sink, project_root)
+    if source.kind == str(target.kind) and str(source.root) == str(target.root):
+        raise TicketError("source and destination are the same sink; nothing to migrate")
+
+    tickets = source.query(TicketQuery(buckets=("*",)))
+    if not tickets:
+        print(f"no tickets found in the {source.kind} sink at {source.root}")
+        sys.exit(EXIT_EMPTY)
+
+    if args.dry_run:
+        verb = "would migrate"
+        skipped = sum(1 for t in tickets if target.exists(t.id)) if _target_exists(target) else 0
+        print(
+            f"{verb} {len(tickets)} ticket(s) from {source.kind} to {target.kind} "
+            f"at {target.root}" + (f" ({skipped} already present, skipped)" if skipped else "")
+        )
+        return
+
+    target.init()
+    migrated = 0
+    overwritten = 0
+    skipped = []
+    for t in tickets:
+        if target.exists(t.id):
+            if not args.overwrite:
+                skipped.append(t.id)
+                continue
+            target.remove(t.id)
+            overwritten += 1
+        target.create(t)
+        bucket = source.bucket(t.id)
+        if bucket:
+            target.move_to_bucket(t.id, bucket)
+        migrated += 1
+
+    summary = (
+        f"migrated {migrated} ticket(s) from {source.kind} to {target.kind} at {target.root}"
+    )
+    if overwritten:
+        summary += f" ({overwritten} overwritten)"
+    if skipped:
+        summary += f" ({len(skipped)} already present, skipped: {', '.join(sorted(skipped))})"
+    print(summary)
+
+
+def _target_exists(target) -> bool:
+    """Whether the migration target already holds tickets. Used by --dry-run,
+    which must not create the target's store merely to report on it."""
+    try:
+        return bool(target.ids())
+    except ArbiteError:
+        return False
 
 
 def build_parser():
@@ -1409,40 +1193,62 @@ def build_parser():
     render .arbite/AGENTS.md's command reference straight from these parsers
     (every usage line and flag, compacted rather than dumped as --help text), so
     that doc can't drift from the real CLI."""
-    parser = argparse.ArgumentParser(prog="arbite", description="File-based ticketing system")
+    parser = argparse.ArgumentParser(prog="arbite", description="Ticket sink CLI")
     parser.add_argument("--version", action="version", version=f"arbite {__version__}")
+    _sink_flag(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
 
     p_init = sub.add_parser(
         "init",
-        help="create .arbite/ folder structure and agent scratchpads",
-        description="Create .arbite/{raw,open,in_progress,blocked,shelved,closed,wishlist,planning,agents}/ "
-        "in the current directory (like 'git init'), write .arbite/AGENTS.md (the command "
-        "reference, not auto-discovered -- point your project's CLAUDE.md or similar at it "
-        "explicitly if you want agents to find arbite), and pre-create a scratchpad file "
-        "under .arbite/agents/ for every id listed in an 'agents:' list in ./arbite.yaml, "
-        "if present. wishlist/ and planning/ are non-status buckets: wishlist/ holds "
-        "reclassified wishes, planning/ holds planning notes and scratch docs.",
+        help="create the arbite directory and initialise the selected sink",
+        description="Create .arbite/ in the current directory (like 'git init'), initialise "
+        "the selected sink (status folders and buckets for the file sink; the database and "
+        "its schema for the sqlite sink), write .arbite/AGENTS.md (the command reference, not "
+        "auto-discovered -- point your project's CLAUDE.md or similar at it explicitly if you "
+        "want agents to find arbite), and pre-create a scratchpad file under .arbite/agents/ "
+        "for every id listed in an 'agents:' list in ./arbite.yaml, if present. Which sink is "
+        "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
+        "in ./arbite.yaml, then file. Running it again is safe: it never destroys data.",
     )
+    _sink_flag(p_init)
     p_init.set_defaults(func=cmd_init)
+
+    p_sink = sub.add_parser(
+        "sink",
+        help="show or initialise the active sink",
+        description="Report which sink is in use, where its store lives, and what it supports "
+        "(status_is_location, buckets, per-status ticket counts), or with 'init' create the "
+        "store for the selected sink. The sink is chosen by --sink, then ARBITE_SINK, then a "
+        "'sink:' key in arbite.yaml, then the default (file).",
+    )
+    p_sink.add_argument(
+        "subcommand",
+        nargs="?",
+        choices=["info", "init"],
+        metavar="SUBCOMMAND",
+        help="'info' (default) reports the active sink; 'init' creates its store if missing",
+    )
+    _sink_flag(p_sink)
+    _json_flag(p_sink)
+    p_sink.set_defaults(func=cmd_sink)
 
     p_create = sub.add_parser(
         "create",
-        help="create a new ticket in open/",
-        description="Create a new ticket in open/ with a generated id (tic-XXXX). "
+        help="create a new ticket in the open status",
+        description="Create a new ticket with a generated id (tic-XXXX). "
         "--title/--type/--tier/--domain are required unless --blank is given.",
     )
     p_create.add_argument("--title", help="short ticket title (required unless --blank)")
     p_create.add_argument(
         "--type",
-        choices=ticket_mod.CREATE_TYPES,
+        choices=schema.CREATE_TYPES,
         help="kind of work (required unless --blank)",
     )
     p_create.add_argument(
         "--tier",
         choices=TIERS,
         help="agent capability tier required to work this ticket "
-        f"({ticket_mod.TIER_VALUES}). {ticket_mod.TIER_HELP} "
+        f"({schema.TIER_VALUES}). {schema.TIER_HELP} "
         "Required unless --blank.",
     )
     p_create.add_argument(
@@ -1476,12 +1282,13 @@ def build_parser():
         "TODO placeholders if not given, and adds a body warning telling agents not to claim it "
         "until it's been filled in and saved",
     )
+    _sink_flag(p_create)
     p_create.set_defaults(func=cmd_create)
 
     p_raw = sub.add_parser(
         "raw",
-        help="create an unclassified raw ticket in raw/ from a brief request",
-        description="Capture a brief request as a raw ticket in raw/, with status 'raw' (so "
+        help="create an unclassified raw ticket from a brief request",
+        description="Capture a brief request as a raw ticket, with status 'raw' (so "
         "it never shows up in 'arbite list next'). Sets the type and title to '<type> (raw): "
         "Requires Classification', leaves tier/domain/priority as TODO placeholders, "
         "auto-groups the ticket under the 'classification' epic (so triage/classification "
@@ -1491,15 +1298,16 @@ def build_parser():
         "before it can be claimed or worked. Use 'memo' when the request is to update "
         "project notes / documentation rather than make a code change. Use 'wish' for a "
         "wishlist item: the ticket notes that wishlist items are reclassified as 'feature' "
-        "and filed in .arbite/wishlist/ rather than opened as work.",
+        "and filed in the wishlist bucket rather than opened as work.",
     )
     p_raw.add_argument(
         "type",
-        choices=ticket_mod.RAW_TYPE_CHOICES,
+        choices=schema.RAW_TYPE_CHOICES,
         metavar="TYPE",
         help="kind of raw ticket: memo | feature | bug | wish",
     )
     p_raw.add_argument("message", metavar="MESSAGE", nargs="+", help=docs.MESSAGE_HELP)
+    _sink_flag(p_raw)
     p_raw.set_defaults(func=cmd_raw)
 
     # Shorthand subcommands: `arbite bug <message>` == `arbite raw bug <message>`,
@@ -1512,11 +1320,12 @@ def build_parser():
             help=_help,
             description=f"Shorthand for 'arbite raw {_name} <message>': capture a raw "
             f"{_name} ticket exactly as that command would, in one shorter word. Creates a "
-            "status 'raw' ticket in raw/ with the type set accordingly, grouped under the "
+            "status 'raw' ticket with the type set accordingly, grouped under the "
             "'classification' epic; classify it (title/tier/domain/epic/priority/description) "
             "before it can be claimed or worked.",
         )
         p_shortcut.add_argument("message", metavar="MESSAGE", nargs="+", help=docs.MESSAGE_HELP)
+        _sink_flag(p_shortcut)
         p_shortcut.set_defaults(func=cmd_raw, type=_name)
 
     p_fetch = sub.add_parser(
@@ -1529,18 +1338,19 @@ def build_parser():
         "to classify the ticket (title/tier/domain/epic/priority/description) and then "
         "either set status to 'open' (if just triaging) or claim it immediately (if going "
         "to work it now). A wish raw ticket is classified differently: it is reclassified "
-        "as 'feature' and filed in .arbite/wishlist/ instead of being opened or claimed. "
+        "as 'feature' and filed in the wishlist bucket instead of being opened or claimed. "
         "Exits 2 if no raw ticket matches.",
     )
     p_fetch.add_argument(
         "type",
         nargs="?",
         default=None,
-        choices=ticket_mod.RAW_TYPE_CHOICES,
+        choices=schema.RAW_TYPE_CHOICES,
         metavar="TYPE",
         help="restrict to raw tickets of this type: memo | feature | bug | wish (default: any type)",
     )
     _json_flag(p_fetch)
+    _sink_flag(p_fetch)
     p_fetch.set_defaults(func=cmd_fetch)
 
     p_list = sub.add_parser(
@@ -1559,7 +1369,7 @@ def build_parser():
         "--tier",
         choices=TIERS,
         help="filter by agent capability tier; with 'next', pass your own tier so you "
-        f"are only offered work you can actually do. {ticket_mod.TIER_HELP}",
+        f"are only offered work you can actually do. {schema.TIER_HELP}",
     )
     p_list.add_argument("--domain", help="filter by domain")
     p_list.add_argument("--epic", help="filter by epic (the larger initiative a ticket belongs to), e.g. 'mesh-pipeline'")
@@ -1624,6 +1434,7 @@ def build_parser():
         "workable ticket is claimed instead",
     )
     _json_flag(p_list)
+    _sink_flag(p_list)
     p_list.set_defaults(func=cmd_list)
 
     p_search = sub.add_parser(
@@ -1670,16 +1481,17 @@ def build_parser():
         help="text to search for (joined with spaces if multiple words)",
     )
     _json_flag(p_search)
+    _sink_flag(p_search)
     p_search.set_defaults(func=cmd_search)
 
     p_claim = sub.add_parser(
         "claim",
-        help="move a ticket to in_progress/ and assign it",
-        description="Move a ticket to in_progress/, set its assignee, and update "
-        "status/updated. The claim is a compare-and-swap: a ticket already assigned to "
-        "another agent is refused unless --force, and the move itself is atomic, so two "
-        "agents racing for the same ticket cannot both end up believing they own it. "
-        "(Identity assignment and liveness remain the agent harness's job.)",
+        help="claim a ticket: assign it and mark it in progress",
+        description="Set a ticket's assignee, status and updated together. The claim is a "
+        "compare-and-swap: a ticket already assigned to another agent is refused unless "
+        "--force, and the write only lands if the ticket is still in the state it was read "
+        "in, so two agents racing for the same ticket cannot both end up believing they own "
+        "it. (Identity assignment and liveness remain the agent harness's job.)",
     )
     p_claim.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_claim.add_argument("--agent", required=True, help="agent id claiming the ticket, e.g. claude.haiku.001 (required)")
@@ -1689,16 +1501,17 @@ def build_parser():
         help="take over a ticket already assigned to another agent (records the takeover "
         "as a note); without this, claiming someone else's ticket is an error",
     )
+    _sink_flag(p_claim)
     p_claim.set_defaults(func=cmd_claim)
 
     p_release = sub.add_parser(
         "release",
-        help="return a claimed ticket to open/ and clear its assignee",
-        description="The counterpart to claim: move a ticket back to open/, clear "
-        "its assignee and any block reason, append a timestamped note, and update "
-        "status/updated. Use it when an agent stops work part-way -- out of scope, out of "
-        "context, or the wrong capability tier -- so the ticket becomes visible to "
-        "'arbite list next' again instead of sitting in in_progress/ owned by nobody.",
+        help="return a claimed ticket to the open status and clear its assignee",
+        description="The counterpart to claim: reopen a ticket, clear its assignee and any "
+        "block reason, append a timestamped note, and update status/updated. Use it when an "
+        "agent stops work part-way -- out of scope, out of context, or the wrong capability "
+        "tier -- so the ticket becomes visible to 'arbite list next' again instead of sitting "
+        "claimed by nobody who is still working it.",
     )
     p_release.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_release.add_argument(
@@ -1709,27 +1522,28 @@ def build_parser():
     p_release.add_argument(
         "--reason", default="", help="why it's being released; included in the note (optional)"
     )
+    _sink_flag(p_release)
     p_release.set_defaults(func=cmd_release)
 
     p_block = sub.add_parser(
         "block",
-        help="move a ticket to blocked/",
-        description="Move a ticket to blocked/, set blocked_by, and update status/updated.",
+        help="mark a ticket blocked",
+        description="Set status to blocked, set blocked_by, and update updated.",
     )
     p_block.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_block.add_argument(
         "--reason", required=True, help="why it's stalled: freeform text or another ticket id (required)"
     )
+    _sink_flag(p_block)
     p_block.set_defaults(func=cmd_block)
 
     p_unblock = sub.add_parser(
         "unblock",
         help="clear a ticket's block and move it back into play",
         description="The counterpart to block: clear blocked_by, append a timestamped note "
-        "recording what the block was, and move the ticket out of blocked/ -- back "
-        "to in_progress/ if it is still assigned, otherwise to open/. Prefer this over "
-        "'arbite set status', which leaves blocked_by populated so the ticket keeps "
-        "claiming to be stalled in every listing.",
+        "recording what the block was, and set the ticket back to in_progress if it is still "
+        "assigned, otherwise to open. Prefer this over 'arbite set status', which leaves "
+        "blocked_by populated so the ticket keeps claiming to be stalled in every listing.",
     )
     p_unblock.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_unblock.add_argument(
@@ -1743,24 +1557,28 @@ def build_parser():
     p_unblock.add_argument(
         "--open",
         action="store_true",
-        help="send it to open/ and clear the assignee even if it is still assigned, "
-        "instead of returning it to in_progress/ for its current owner",
+        help="send it back to open and clear the assignee even if it is still assigned, "
+        "instead of returning it to in_progress for its current owner",
     )
+    _sink_flag(p_unblock)
     p_unblock.set_defaults(func=cmd_unblock)
 
     p_close = sub.add_parser(
         "close",
-        help="move a ticket to closed/YYYY-MM/",
-        description="Move a ticket to closed/YYYY-MM/ (by today's date) and set status/closed/updated.",
+        help="close a ticket",
+        description="Set status to closed, stamp the closed date, and update updated. A file "
+        "sink additionally archives the ticket by close month; other sinks just record it.",
     )
     p_close.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    _sink_flag(p_close)
     p_close.set_defaults(func=cmd_close)
 
     p_reopen = sub.add_parser(
         "reopen",
-        help="move a ticket back to open/ (reopen it)",
-        description="Move a ticket that is not currently open back to open/: clear its "
-        "closed date and block reason, append an automatic 'Reopened' note, and update status/updated.",
+        help="reopen a ticket (back to the open status)",
+        description="Set a ticket that is not currently open back to open: clear its "
+        "closed date and block reason, append an automatic 'Reopened' note, and update "
+        "status/updated.",
     )
     p_reopen.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_reopen.add_argument(
@@ -1769,12 +1587,13 @@ def build_parser():
         help="agent id (or 'system') attributed on the automatic reopen note, e.g. "
         "claude.haiku.001 (default: system)",
     )
+    _sink_flag(p_reopen)
     p_reopen.set_defaults(func=cmd_reopen)
 
     p_shelve = sub.add_parser(
         "shelve",
-        help="move a ticket to shelved/ (shelve it)",
-        description="Move a ticket to shelved/, set status/updated, and append an automatic "
+        help="shelve a ticket (park it for later)",
+        description="Set status to shelved, update updated, and append an automatic "
         "timestamped note recording that it was shelved (including --reason if given).",
     )
     p_shelve.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
@@ -1783,12 +1602,13 @@ def build_parser():
         default="",
         help="why it's being shelved; included in the automatic note (optional)",
     )
+    _sink_flag(p_shelve)
     p_shelve.set_defaults(func=cmd_shelve)
 
     p_unshelve = sub.add_parser(
         "unshelve",
-        help="move a shelved ticket back to open/ (unshelve it)",
-        description="Move a shelved ticket back to open/, clear its assignee and any block "
+        help="move a shelved ticket back to open (unshelve it)",
+        description="Set a shelved ticket back to open, clear its assignee and any block "
         "reason, append an automatic timestamped note recording that it was unshelved "
         "(including --reason if given), and update status/updated. The counterpart to "
         "shelve: once unshelved, the ticket is available via 'arbite list next' again.",
@@ -1799,6 +1619,7 @@ def build_parser():
         default="",
         help="why it's being unshelved; included in the automatic note (optional)",
     )
+    _sink_flag(p_unshelve)
     p_unshelve.set_defaults(func=cmd_unshelve)
 
     p_note = sub.add_parser(
@@ -1806,18 +1627,21 @@ def build_parser():
         help="append a timestamped, agent-identified note to a ticket",
         description="Append a timestamped, agent-identified entry to a ticket's '## Notes' "
         "section (blank line between entries) and update 'updated'. Agents should prefer "
-        "this over directly editing a ticket file to leave progress notes.",
+        "this over directly editing a ticket, so attribution and timestamps stay "
+        "consistent.",
     )
     p_note.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_note.add_argument("agent", metavar="AGENT_ID", help="agent id leaving the note, e.g. claude.haiku.001")
     p_note.add_argument("message", metavar="MESSAGE", nargs="+", help="note text (joined with spaces if multiple words)")
+    _sink_flag(p_note)
     p_note.set_defaults(func=cmd_note)
 
     p_show = sub.add_parser(
-        "show", help="print a ticket's full contents", description="Print a ticket's raw markdown file (frontmatter + body)."
+        "show", help="print a ticket's full contents", description="Print a ticket in its canonical form: YAML frontmatter plus markdown body, exactly as a file sink would store it."
     )
     p_show.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP_READONLY)
     _json_flag(p_show)
+    _sink_flag(p_show)
     p_show.set_defaults(func=cmd_show)
 
     p_deps = sub.add_parser(
@@ -1827,6 +1651,7 @@ def build_parser():
     )
     p_deps.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP_READONLY)
     _json_flag(p_deps)
+    _sink_flag(p_deps)
     p_deps.set_defaults(func=cmd_deps)
 
     p_depend = sub.add_parser(
@@ -1845,27 +1670,29 @@ def build_parser():
         default=None,
         help="ticket that <TIC_A> depends on; omit to clear all of <TIC_A>'s dependencies",
     )
+    _sink_flag(p_depend)
     p_depend.set_defaults(func=cmd_depend)
 
     p_move = sub.add_parser(
         "move",
-        help="move a ticket file to a folder under the arbite root (e.g. /wishlist)",
-        description="Move a ticket's file to a folder under the arbite root, without "
-        "changing its status or frontmatter. <folder> is root-relative: '/' is the arbite "
-        "root itself (e.g. .arbite/), '/wishlist' is .arbite/wishlist/, and a longer path "
-        "like '/planning/ideas' nests folders. The destination folder is created if it "
-        "doesn't exist. This is deliberately a raw file move -- it does not update "
-        "status/updated -- so use it to file tickets into non-status buckets (wishlist/, "
-        "planning/), and use the status commands (claim/block/close/...) for any move that "
-        "should change state.",
+        help="file a ticket in a bucket (e.g. /wishlist), or '/' to un-file it",
+        description="File a ticket somewhere other than its status location, without changing "
+        "any field. <folder> is root-relative: '/wishlist' files it in the wishlist bucket, "
+        "'/planning/ideas' in a nested one, and '/' returns it to wherever its status says it "
+        "belongs. What a bucket physically is depends on the sink: a folder under the arbite "
+        "root for the file sink (created if missing), a recorded bucket for the SQLite sink. "
+        "This is deliberately not a state change, so a status command (claim/close/block/...) "
+        "is what you want for anything that should change state -- and those un-file the "
+        "ticket for you.",
     )
     p_move.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_move.add_argument(
         "folder",
         metavar="FOLDER",
-        help="root-relative destination folder, e.g. '/' for the arbite root or "
-        "'/wishlist' for .arbite/wishlist/",
+        help="root-relative destination, e.g. '/wishlist', or '/' to return the ticket to "
+        "its status location",
     )
+    _sink_flag(p_move)
     p_move.set_defaults(func=cmd_move)
 
     p_set = sub.add_parser(
@@ -1875,9 +1702,8 @@ def build_parser():
         "are given as PROPERTY VALUE pairs and any number can be set in one call; quote "
         "any value that spans more than one word. Type-aware: 'tags' and 'depends_on' "
         "are comma-separated lists, 'priority' must be an integer, and an empty quoted "
-        "value ('') clears a field. If 'status' is set, the ticket is moved to the "
-        "matching folder so folder and frontmatter never disagree (moving to 'closed' "
-        "auto-dates 'closed'). 'id' is structural and cannot be set.",
+        "value ('') clears a field. If 'status' is set, the ticket is re-filed to match "
+        "(moving to 'closed' auto-dates 'closed'). 'id' is structural and cannot be set.",
     )
     p_set.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_set.add_argument(
@@ -1888,30 +1714,107 @@ def build_parser():
         "quote any value that spans more than one word, and use an empty quoted value "
         "('') to clear a field",
     )
+    _sink_flag(p_set)
     p_set.set_defaults(func=cmd_set)
+
+    p_delete = sub.add_parser(
+        "delete",
+        help="delete a ticket outright (requires --force)",
+        description="Remove a ticket from the store entirely. Irreversible, so it requires "
+        "--force, and it records a 'Deleted by <agent>' note immediately before removing the "
+        "ticket so the last state it ever had is attributable. The receipt (id, title, "
+        "location, note) is printed and included in --json. Use 'arbite close' to archive a "
+        "ticket instead of destroying it.",
+    )
+    p_delete.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_delete.add_argument(
+        "--force",
+        action="store_true",
+        help="confirm the deletion; without it the command refuses (required)",
+    )
+    p_delete.add_argument(
+        "--agent",
+        default="system",
+        help="agent id attributed on the deletion note (default: system)",
+    )
+    p_delete.add_argument(
+        "--reason", default="", help="why it's being deleted; included in the note (optional)"
+    )
+    p_delete.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be deleted and make no change",
+    )
+    _json_flag(p_delete)
+    _sink_flag(p_delete)
+    p_delete.set_defaults(func=cmd_delete)
+
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="copy every ticket from one sink into another",
+        description="Read every ticket from the source sink (status-managed tickets and "
+        "bucketed ones alike) and write it to the destination sink, preserving ids, "
+        "timestamps, body, tags, dependencies, notes and buckets verbatim. The source is "
+        "never modified: this is a copy, so migrating is undone by simply not switching the "
+        "config over. Tickets already present in the destination are skipped unless "
+        "--overwrite is given.",
+    )
+    p_migrate.add_argument(
+        "--to",
+        dest="to_sink",
+        required=True,
+        choices=SINK_KINDS,
+        metavar="KIND",
+        help=f"destination sink kind: {', '.join(SINK_KINDS)} (required)",
+    )
+    p_migrate.add_argument(
+        "--from",
+        dest="from_sink",
+        default=None,
+        choices=SINK_KINDS,
+        metavar="KIND",
+        help="source sink kind (default: the sink this command would otherwise use "
+        "-- --sink/ARBITE_SINK/config)",
+    )
+    p_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report how many tickets would be migrated and change nothing",
+    )
+    p_migrate.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace destination tickets that already use one of the source ids, instead "
+        "of skipping them",
+    )
+    _sink_flag(p_migrate)
+    p_migrate.set_defaults(func=cmd_migrate)
 
     p_doctor = sub.add_parser(
         "doctor",
-        help="check ticket integrity (folder/frontmatter drift, cycles, dangling deps)",
-        description="Check the invariants nothing else enforces and report what it finds. "
-        "Tickets are plain files in a git repo -- humans move them, merges and rebases "
-        "mangle them, and a crash mid-write can strand a temp file -- so the folder/"
-        "frontmatter sync rule that every arbite command upholds can still be broken from "
-        "outside. Detects status drift (the folder is authoritative), duplicate ids, "
-        "unreadable tickets, stray/temp files, dependency cycles, dangling and self "
-        "dependencies, wrong closed/YYYY-MM archive months, in_progress tickets with no "
-        "assignee, blocked tickets with no reason, and invalid field values. Exits 3 if "
-        "any problem remains, so it can gate CI or an agent's startup.",
+        help="check ticket integrity (drift, cycles, dangling deps, stale indexes)",
+        description="Check the invariants nothing else enforces and report what it finds, "
+        "then exit 3 if any problem remains. The shared checks cover duplicate ids, invalid "
+        "field values, dependency cycles, dangling and self dependencies, in_progress "
+        "tickets with no assignee, blocked tickets with no reason, and closed-date "
+        "mismatches. The sink adds its own: for the file sink, frontmatter/folder drift (the "
+        "folder is authoritative), stray temp files from an interrupted write, and closed "
+        "tickets archived under the wrong month; for the SQLite sink, a note index that has "
+        "drifted from the ticket body, orphaned index rows, an unexpected schema version and "
+        "structural database corruption. --fix repairs only what is unambiguous.",
     )
     p_doctor.add_argument(
         "--fix",
         action="store_true",
-        help="repair what can be corrected unambiguously: frontmatter status is rewritten "
-        "to match the folder it sits in, and closed tickets are moved into the archive "
-        "month matching their close date. Anything needing a judgement call (duplicate "
-        "ids, dependency cycles, missing data) is only reported",
+        help="repair what can be corrected unambiguously: for the file sink, frontmatter "
+        "status is rewritten to match the folder a ticket sits in, tickets loose in the root "
+        "are re-filed, and closed tickets are moved into the archive month matching their "
+        "close date; for the SQLite sink, a stale note index is rebuilt from the body and "
+        "orphaned index rows are removed. Anything needing a judgement call (duplicate ids, "
+        "dependency cycles, missing data) is only reported",
     )
     _json_flag(p_doctor)
+    _sink_flag(p_doctor)
     p_doctor.set_defaults(func=cmd_doctor)
 
     return parser, dict(sub.choices)
@@ -1935,7 +1838,7 @@ def main():
     args = parser.parse_args()
     try:
         args.func(args)
-    except TicketError as e:
+    except ArbiteError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(EXIT_ERROR)
 

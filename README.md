@@ -1,11 +1,18 @@
-# arbite — a file-based ticketing system for git repos and AI agents
+# arbite — a ticket store for git repos and AI agents, with pluggable sinks
 
-`arbite` is a small Python CLI that keeps a project's task list as **plain markdown
-files inside the repo**, under a `.arbite/` directory. Tickets are never stored in a
-database or behind a server: they are files with YAML frontmatter, and a ticket's
-**status is represented by the folder it sits in**. Moving a ticket between folders
-*is* the state change, and because filenames stay stable across moves, `git log
---follow` on a ticket file traces its whole lifecycle for free.
+`arbite` is a small Python CLI that keeps a project's task list durable and
+inspectable while AI agents (and humans) work on it. Tickets are never behind a
+server or a daemon: they live in a **sink**, and the default sink is the
+filesystem — plain markdown files with YAML frontmatter under a `.arbite/`
+directory, where a ticket's **status is represented by the folder it sits in**.
+Moving a ticket between folders *is* the state change, and because filenames stay
+stable across moves, `git log --follow` on a ticket file traces its whole
+lifecycle for free.
+
+The storage is pluggable. An opt-in `sqlite` sink keeps the same tickets in one
+database file, where `status` is a column and queries are real SQL. Every command,
+field, exit code and `--json` payload is identical whichever sink is in use — see
+[Sinks](#sinks).
 
 ## Example AGENTS.md
 
@@ -31,16 +38,20 @@ arbite bug The thing doesn't work that I want to work!
 arbite feature Make the button glow when hovering
 arbite memo The readme probably needs to be updated
 
+Which store am I using, and where is it?
+arbite sink info
+
 ---
 
 ## Why
 
 Agent-driven work tends to leave state in places that don't survive a new session:
 an agent's own memory file, a chat transcript, a stale assumption about what it was
-doing. Since the repo is already the durable, shared, versioned medium, arbite makes
-the ticket's **folder location the single source of truth** for its state. Any other
-record — an agent scratchpad, a prior session's notes — is treated as a *hint* to be
-verified against the actual ticket, never as authority.
+doing. Since the repo is already the durable, shared, versioned medium, arbite
+puts the tickets there and makes one location the single source of truth for a
+ticket's state. Any other record — an agent scratchpad, a prior session's notes —
+is treated as a *hint* to be verified against the actual ticket, never as
+authority.
 
 Two constraints shaped most of the design:
 
@@ -75,20 +86,29 @@ See AGENTS_EXAMPLE.md, which tells the agent to classify and work raw tickets wh
 
 ## Goals
 
-- **Zero infrastructure.** No database, no daemon, no lock service. A clone of the
-  repo is a complete working instance.
-- **`ls` as a status board.** An agent or human should be able to tell what is
-  actionable from folder names alone, without opening any file.
-- **One invariant, enforced everywhere.** The frontmatter `status` mirrors the
-  folder, and every state-changing command performs the file move *and* the
-  frontmatter update in a single operation so the two can never disagree.
-- **Safe under concurrency.** Claiming is atomic; races resolve to exactly one
-  winner, and a lost race is reported, not silently overwritten.
+- **Zero infrastructure.** No daemon, no lock service, no server to run. The
+  default sink is a directory of files; the alternative is one SQLite file, which
+  the Python standard library already knows how to open. Either way a clone of the
+  repo (or a copied file) is a complete working instance.
+- **One storage interface, two implementations.** Commands talk to a sink, not to
+  files or tables, so the *behavior* agents depend on — claiming, readiness,
+  ordering, exit codes — is identical whichever store is in use, and a new backend
+  has one contract to satisfy rather than a CLI to re-implement.
+- **`ls` as a status board.** With the file sink, an agent or human can tell what
+  is actionable from folder names alone, without opening any file.
+- **One invariant per sink, enforced everywhere.** With the file sink, the
+  frontmatter `status` mirrors the folder, and every state-changing command
+  performs the file move *and* the frontmatter update in a single operation so the
+  two can never disagree.
+- **Safe under concurrency.** Claiming is a compare-and-swap on both sinks; races
+  resolve to exactly one winner, and a lost race is reported, not silently
+  overwritten.
 - **Machine-first interfaces.** JSON output for every read query, distinct exit
   codes for success / error / empty / integrity-problems.
 - **A self-describing command surface.** `arbite init` regenerates
-  [`docs.py`](src/arbite/docs.py:1)-rendered `.arbite/AGENTS.md` straight from
-  argparse's own `--help`, so the agent-facing docs cannot drift from the CLI.
+  [`docs.py`](src/arbite/docs.py)-rendered `.arbite/AGENTS.md` straight from
+  argparse's own `--help`, and words it for the sink actually in use, so the
+  agent-facing docs cannot drift from the CLI *or* lie about the storage.
 - **A dependency graph, not just a list.** Tickets can declare structural
   `depends_on` links, and `arbite list next` returns work in topological order.
 - **Recoverable history.** Plain files plus git; no proprietary format to migrate.
@@ -102,12 +122,14 @@ original rationale):
   avoiding collisions, and detecting abandoned work belong to an external *agent
   harness*. arbite only reads a static list of known agent ids from
   `arbite.yaml`/`.arbite.yaml` so `arbite init` can pre-create scratchpads —
-  see [`load_known_agent_ids()`](src/arbite/config.py:38).
+  see [`load_known_agent_ids()`](src/arbite/config.py).
 - **Scheduling or dispatching work.** arbite answers "what is workable"; getting an
   agent started on it is the caller's job.
 - **A UI, web service, or notifications.** The CLI is the interface.
 - **Enforcing policy beyond data integrity.** arbite refuses to corrupt state and
   reports drift; it does not police who may do what.
+- **A distributed store.** Each sink is a single local store — a directory or a
+  database file. Across machines the repo (or the file) is the unit of exchange.
 
 Planned but *not* part of arbite: any claim-on-startup collision detection or
 timestamp-based staleness checks. The claim operation is corruption prevention
@@ -115,9 +137,126 @@ only.
 
 ---
 
+## Sinks
+
+A **sink** is where tickets live. It is selected per command, and everything above
+it is storage-neutral.
+
+| | `file` (default) | `sqlite` |
+| --- | --- | --- |
+| Storage | markdown files under `.arbite/` | one database at `.arbite/arbite.db` |
+| Status lives in | the folder the ticket sits in | a `status` column |
+| State change is | a file move + frontmatter rewrite | a row update |
+| Buckets (`arbite move`) | folders (`wishlist/`, `planning/ideas`) | a `bucket` column |
+| History | `git log --follow` per ticket | database backups |
+| Best for | committed, reviewable, greppable tickets | filtering/joining at scale |
+| Runtime dependency | none beyond PyYAML | none (`sqlite3` is in the stdlib) |
+
+### Selecting a sink
+
+Highest precedence first:
+
+1. `--sink <kind>` on any command (before or after the command name)
+2. the `ARBITE_SINK` environment variable
+3. a `sink:` key in `arbite.yaml` / `.arbite.yaml`
+4. the default: `file`
+
+```yaml
+# arbite.yaml
+sink: sqlite
+sinks:
+  file:   { root: .arbite }            # optional location overrides
+  sqlite: { path: .arbite/arbite.db }
+agents: [claude.haiku.001]
+```
+
+`arbite init` initialises whichever sink is selected, and `arbite sink info`
+reports what is active and where. Creating a database-backed project is a config
+edit or one flag, not a different command:
+
+```bash
+arbite init --sink sqlite
+arbite --sink sqlite list next --tier high
+```
+
+If the database file is used, add it to `.gitignore`: unlike the file sink, it is
+binary and won't produce a readable history.
+
+### The interface
+
+Commits to storage go through one CRUD-shaped surface
+([`sinks/base.py`](src/arbite/sinks/base.py)):
+
+| Method | Verb | Notes |
+| --- | --- | --- |
+| `new_id()`, `create(ticket)` | Create | a duplicate id is a conflict, not an overwrite |
+| `get(id, unique=False)` | Read | a wildcard id resolves; mutations pass `unique=True` and refuse ambiguity |
+| `get_many(ids)`, `exists(id)`, `query(TicketQuery)`, `notes(id)` | Read | one query vocabulary, two implementations |
+| `render(ticket)`, `location(id)`, `describe_location`-style `location_map(tickets)` | Read | `render` is the ticket's canonical text on *both* sinks; a location is an opaque string |
+| `update(ticket, expect=None)`, `add_note(...)` | Update | `expect` is the compare-and-swap token |
+| `delete(id)` | Delete | irreversible; the CLI requires `--force` |
+| `bucket(id)`, `move_to_bucket(id, bucket)` | — | filing, which is not a state change |
+| `check(fix=False)` | — | integrity: shared checks plus the sink's own |
+
+Three deliberate properties of that surface:
+
+- **The status→location side effect belongs to the sink.** A command sets
+  `status` and calls `update()`; only the file sink knows that this means moving a
+  file, and only the SQLite sink knows it means writing a column. That is what
+  makes "status is folder location" a *feature of the file sink* rather than an
+  assumption baked into every command.
+- **Compare-and-swap is an argument, not a separate method.** `update(ticket,
+  expect=Expect(status="open", assignee=None))` means "write this only if the
+  ticket is still open and unassigned" — a claim. The file sink enforces it with an
+  exclusive create at the destination file; the SQLite sink with a conditional
+  `UPDATE` inside a transaction. One write path, so a claim cannot bypass it.
+- **Queries are storage-neutral and verified.** `TicketQuery` names the filters
+  (status, type, tier, domain, epic, assignee, priority, ids, buckets, text, order,
+  limit) and [`query.py`](src/arbite/query.py) holds the reference implementation.
+  The SQLite sink answers structured filters with SQL, but text matching runs
+  through the same matcher as the file sink — SQLite's `LIKE` folds case in ASCII
+  only, so pushing a substring search into it can return a *different* answer.
+
+### Integrity checking per sink
+
+`arbite doctor` reports the checks that mean the same thing anywhere (duplicate
+ids, invalid field values, dependency cycles, dangling and self dependencies,
+`in_progress` without an assignee, `blocked` without a reason, closed-date
+mismatches) and then the ones that don't:
+
+- **file sink** — frontmatter/folder drift (the folder wins), a ticket left loose
+  in the arbite root, temp files stranded by an interrupted write, a closed ticket
+  archived in the wrong month, unreadable files;
+- **sqlite sink** — a note index that has drifted from the ticket body, orphaned
+  index rows, an unexpected schema version, structural database corruption.
+
+`--fix` repairs only what is unambiguous, and exits `3` while problems remain, so
+it can gate CI or an agent's startup.
+
+### Moving tickets between sinks
+
+`arbite migrate --to <kind>` copies every ticket — status-managed ones and
+bucketed ones — into the other sink, preserving ids, timestamps, body, tags,
+dependencies, notes and buckets verbatim. It never touches the source, so a
+migration is undone by not switching the config over. Because it reads through one
+sink and writes through the other, a `file → sqlite → file` round trip that
+reproduces the original files byte for byte is the end-to-end test of the whole
+interface; `tests/test_cli.py` asserts exactly that.
+
+---
+
 ## Design principles
 
-- **Status is folder location.** `status` in the frontmatter mirrors the folder and
+- **Storage is a sink.** One interface ([`sinks/base.py`](src/arbite/sinks/base.py)),
+  two implementations ([`file.py`](src/arbite/sinks/file.py),
+  [`sqlite.py`](src/arbite/sinks/sqlite.py)) that share no storage code. A second
+  implementation is only worth having if it is genuinely second, so the sink that
+  has no files has no file-shaped shortcuts.
+- **The schema is one thing, not a copy per sink.** [`schema.py`](src/arbite/schema.py)
+  owns the `Ticket` model, the controlled vocabularies, the markdown form and the
+  `## Notes` derivation. Both sinks render tickets with the same
+  `Ticket.to_markdown()`, which is why `arbite show` looks identical on either.
+- **Status is folder location — in the file sink.** `status` mirrors the folder and
   must never be allowed to drift from it. When something outside arbite breaks that
   pairing (a hand `mv`, a merge, a rebase, an interrupted write), `arbite doctor`
   reports it and — with `--fix` — rewrites the frontmatter to match the folder,
@@ -126,19 +265,22 @@ only.
   `in_progress/`, and `closed/2026-08/`, so moves show up as folder-move commits
   under `git log --follow`.
 - **Atomic writes and moves.** Saves stage a complete temp file and `os.replace`
-  it into position ([`_write_atomic()`](src/arbite/ticket.py:297)); moves stage into
-  the destination, unlink the source, then rename. The worst case of a crash is a
-  visible, recoverable temp file — never two files sharing one id.
-- **Compare-and-swap claiming.** Claiming uses an `O_CREAT|O_EXCL` create at the
-  destination as the mutex ([`claim_ticket()`](src/arbite/ticket.py:459)); two agents
-  racing for the same ticket cannot both come away believing they own it.
+  it into position; moves stage into the destination, unlink the source, then
+  rename. The worst case of a crash is a visible, recoverable temp file — never two
+  files sharing one id.
+- **Compare-and-swap claiming.** Claiming never blind-writes: the expectation is
+  checked and enforced *inside* the storage operation that performs it, so two
+  agents racing for the same ticket cannot both come away believing they own it.
 - **Ambiguity is an error for mutations.** Commands that modify a ticket require an
   unambiguous id and list the candidates otherwise; read-only commands keep the
   convenience of the first alphabetical match.
 - **Controlled vocabularies live in one place.** `STATUSES`, `TYPES`, `TIERS` and
-  friends in [`ticket.py`](src/arbite/ticket.py:16) are validated by both `set` and
-  `doctor`, and interpolated into `.arbite/AGENTS.md`, so the docs, the CLI and the
-  validator cannot drift apart.
+  friends in [`schema.py`](src/arbite/schema.py) are validated by `set`, `create`
+  and every sink's `check`, and interpolated into `.arbite/AGENTS.md`, so the docs,
+  the CLI and the validator cannot drift apart.
+- **The docs must be true for the sink in use.** `.arbite/AGENTS.md` is rendered
+  from the sink's own capabilities, so a database-backed project is never told that
+  "the folder is the source of truth".
 
 ---
 
@@ -148,13 +290,15 @@ The package exposes the console script `arbite`, providing:
 
 | Area | Commands |
 | --- | --- |
-| Setup | `init` |
-| Creation | `create` (incl. `--blank` scaffolding), `raw <memo\|feature\|bug\|wish>` plus the one-word shortcuts `bug` / `feature` / `memo` / `wish` |
+| Setup | `init`, `sink [info\|init]` |
+| Creation | `create` (incl. `--blank` scaffolding), `raw <memo\|feature\|bug\|wish>` plus the one-word shortcuts `bug` / `feature` / `wish` / `memo` |
 | Triage | `fetch [type]` (oldest raw ticket + injected `derived_note`), `list raw` |
 | Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
 | Lifecycle | `claim`, `release`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen` |
 | Authoring | `note`, `set`, `depend`, `move` |
+| Storage | `migrate --to <sink>` |
 | Integrity | `doctor [--fix]` |
+| Destruction | `delete <id> --force` |
 
 Key behaviours worth calling out:
 
@@ -163,30 +307,31 @@ Key behaviours worth calling out:
   filter by `--tier` / `--domain` / `--epic`. If nothing is ready it exits `2`; if
   everything is deadlocked it says so on stderr instead of leaving an agent polling a
   queue that can never yield work.
-- **`arbite list next --claim <agent_id>`** selects *and* claims in one atomic step,
+- **`arbite list next --claim <agent_id>`** selects *and* claims in one step,
   closing the race inherent in calling `list next` then `claim`. If it loses the race
   for the top ticket it takes the next workable one rather than failing.
 - **`--count N`** turns `list next` into a batch pull; with `--claim` each claim is
-  individually atomic, so a short batch is a correct result, reported as such.
+  individually a compare-and-swap, so a short batch is a correct result, reported as
+  such.
 - **`arbite fetch`** implements the triage queue: it pulls the oldest `raw` ticket
   and prints it with a `derived_note` (a JSON field in `--json` mode, a leading block
   otherwise) telling the caller exactly how to classify it.
-- **`arbite doctor`** checks the invariants nothing else enforces: status drift,
-  duplicate ids, unreadable tickets, stray temp files, unsatisfiable dependency
-  cycles, dangling and self dependencies, wrong `closed/YYYY-MM` months,
-  `in_progress` with no assignee, `blocked` with no reason, and invalid field values.
-  `--fix` repairs only the unambiguous cases; anything needing a judgement call is
-  reported, never guessed. It exits `3` when problems remain, so it can gate CI or an
-  agent's startup.
+- **`arbite move`** files a ticket in a bucket (`/wishlist`, `/planning/ideas`) or
+  returns it to its status location (`/`). It changes no field, so it is not a state
+  change — status commands un-file a ticket for you.
+- **`arbite delete`** destroys a ticket and refuses to do so without `--force`; it
+  records a `Deleted by <agent>` note first and prints a receipt. `close` is usually
+  what you want.
+- **`arbite doctor`** checks the invariants nothing else enforces and exits `3` when
+  problems remain — see [Integrity checking per sink](#integrity-checking-per-sink).
 
 `CLAUDE.md` records a handful of deliberately open judgement calls — validation
 strictness for `domain`/`tags`, the `deps` visualization format, and whether
-`blocked_by` should support multiple blockers — plus a standing rule to ask before
-schema changes.
+`blocked_by` should support multiple blockers.
 
 ---
 
-## On-disk layout
+## Storage: what a file sink project looks like
 
 ```
 .arbite/
@@ -209,13 +354,20 @@ schema changes.
 
 - `raw/`, `open/`, `in_progress/`, `blocked/`, `shelved/` are **status folders**.
 - `closed/` archives monthly by close date so it doesn't become one flat directory.
-- `wishlist/` and `planning/` are **non-status buckets**, not statuses: parked
-  wishes and planning notes respectively. `arbite init` creates both.
+- `wishlist/` and `planning/` are **buckets**, not statuses: a ticket filed in one
+  is out of the status workflow (so `list next` never offers it) and keeps whatever
+  status it had. `planning/` is for planning notes that aren't tickets at all;
+  `arbite init` creates both, and a markdown file there is only treated as a ticket
+  if it is named like one (`tic-XXXX.md`).
 - `agents/` holds one scratchpad file per known agent identity (no required schema),
-  pre-created from the `agents:` list in `arbite.yaml` / `.arbite.yaml`.
+  pre-created from the `agents:` list in `arbite.yaml` / `.arbite.yaml`. Scratchpads
+  stay files whichever sink is active: they are harness-facing state, not tickets.
 - `AGENTS.md` is regenerated on every `arbite init`. It is **not auto-discovered** —
   a project that wants agents to find arbite must point at it explicitly (e.g. a line
   in its own `CLAUDE.md` like "read `.arbite/AGENTS.md`").
+
+A SQLite-sink project has the same `.arbite/agents/` directories and `AGENTS.md`,
+with `arbite.db` in place of the status folders.
 
 ### Ticket format
 
@@ -223,7 +375,7 @@ schema changes.
 ---
 id: tic-a1b2
 title: Fix off-by-one in vertex normal calc
-status: open              # raw | open | in_progress | blocked | shelved | closed — mirrors folder
+status: open              # raw | open | in_progress | blocked | shelved | closed — mirrors the folder
 type: bug                 # bug | feature | refactor | chore | memo | wish
 tier: medium              # low | medium | high | frontier — agent capability tier required
 domain: mesh              # routing: mesh, image_gen, audio_gen, ui, io, ...
@@ -246,6 +398,11 @@ Free text description of the task.
 ## Notes
 - 2026-08-06T14:32:09 claude.haiku.001: progress update, appended over time.
 ```
+
+This is the same schema on both sinks, and `arbite show` prints it in this form
+either way. The SQLite sink additionally indexes the `## Notes` section into rows so
+notes are queryable, but the body stays authoritative: the index is rebuilt from it,
+and `doctor` reports if the two disagree.
 
 The independent axes are easy to conflate, so they are deliberately separate fields:
 
@@ -280,11 +437,12 @@ pipx install .
 ```
 
 For active development, prefer an editable local install (pipx does not support
-editable installs the way pip does):
+editable installs the way pip does), and install the test extra:
 
 ```bash
-pip install -e .
+pip install -e ".[dev]"
 arbite --version
+pytest
 ```
 
 Helper scripts in [`scripts/`](scripts/) wrap `pipx install "." --force` to reinstall
@@ -329,44 +487,75 @@ arbite close tic-a1b2
 arbite doctor --fix
 ```
 
+Opting into the database sink instead, or in addition:
+
+```bash
+arbite init --sink sqlite             # same tickets, different store
+arbite sink info                      # which store, where, and what it supports
+arbite migrate --to sqlite            # copy every ticket across (source untouched)
+arbite --sink sqlite list --status open --domain mesh
+```
+
 ## Agent-facing conventions
 
 These exist because agents, not humans, are the main callers:
 
-- **`--json`** on `list`, `list next`, `fetch`, `show`, `search`, `deps` and
-  `doctor` emits machine-readable output whose field names match the frontmatter. The
-  human table format is explicitly *not* a stable interface.
+- **`--json`** on `list`, `list next`, `fetch`, `show`, `search`, `deps`, `doctor`,
+  `sink` and `delete` emits machine-readable output whose field names match the
+  frontmatter. The human table format is explicitly *not* a stable interface. The
+  `path` field is whatever the sink calls a ticket's location (a file path, or
+  `sqlite:/…/arbite.db#tic-a1b2`).
 - **Exit codes** let a shell loop branch without matching message text: `0` success
   with results, `1` error, `2` the query ran but matched nothing, `3` `doctor` found
   problems.
 - **Prefer `list next --claim`** over `list next` followed by `claim`; the two-step
   version has a race another agent can win.
-- **Prefer `arbite note`** over hand-editing a ticket file, so attribution and
-  timestamps stay consistent.
+- **Prefer `arbite note`** over hand-editing a ticket, so attribution and timestamps
+  stay consistent.
 - **Resume by verifying, not remembering.** Check your own scratchpad for a
-  last-known ticket id, then confirm the ticket is actually in `.arbite/in_progress/`
-  with `assignee` matching your id; the folder is ground truth, the scratchpad is a
-  hint. If it is absent, stale, or mismatched, scan `in_progress/` for a ticket
-  assigned to you.
+  last-known ticket id, then confirm the ticket really is claimed by you — with the
+  file sink that means it sits in `.arbite/in_progress/` with `assignee` matching
+  your id; with any sink, `arbite show <id> --json` settles it. The store is ground
+  truth, the scratchpad is a hint. If it is absent, stale, or mismatched, scan for a
+  ticket assigned to you with `arbite list --assignee <your-id>`.
 - **Stay at or below your tier.** Pass your own tier to `arbite list next --tier`, so
   you are only offered work you can actually do.
+- **Don't assume the storage.** Use `arbite sink info` rather than reaching for a
+  file path; a path that works on one sink does not exist on the other.
 
 ---
 
 ## Repository layout
 
 ```
-pyproject.toml          packaging + console-script entry point
+pyproject.toml          packaging + console-script entry point (+ pytest config)
 CLAUDE.md               the original design spec and rationale
 src/arbite/
   __init__.py           package version
   cli.py                argument parsing, command dispatch, exit codes
-  ticket.py             ticket read/write, frontmatter parsing, atomic moves, claiming
-  config.py             locating .arbite/ and loading known agent ids
+  schema.py             the Ticket model, controlled vocabularies, markdown format,
+                        notes derivation, field validation
+  query.py              TicketQuery / TextMatch: the storage-neutral query vocabulary
+  graph.py              dependency closure, readiness, topological order, cycles
+  errors.py             the exception hierarchy every command and sink reports through
+  sinks/
+    base.py             the TicketSink CRUD interface + the checks shared by all sinks
+    file.py             the file sink: status folders, atomic moves, temp-file recovery
+    sqlite.py           the sqlite sink: normalized tables, SQL queries, note index
+    __init__.py         the sink registry
+  config.py             locating .arbite/ and resolving which sink to use
   docs.py               renders .arbite/AGENTS.md from the real argparse output
+                        and the active sink's capabilities
+tests/
+  test_sink_conformance.py  one suite, run against every sink
+  test_file_sink.py         file-specific: folders, drift, temp files, archives
+  test_sqlite_sink.py       sqlite-specific: schema, note index, pushdown parity
+  test_cli.py               end-to-end argv, exit codes, --json, migrate round trip
+  test_graph.py             dependency-graph semantics, pinned
+  test_query.py             query vocabulary semantics, pinned
 scripts/
-  seed_demo.py          generates ~2.5 months of realistic seed tickets for the
-                        local .arbite/, via the same code paths the CLI uses
+  seed_demo.py          generates ~2.5 months of realistic seed tickets for either
+                        sink (--sink file|sqlite), via the same code paths the CLI uses
   update-arbite.bat     reinstall the checkout into global pipx (Windows)
   update-arbite.sh      reinstall the checkout into global pipx (Linux/macOS)
 ```
@@ -375,6 +564,8 @@ scripts/
 
 The core system is implemented: creation, listing and filtering, dependency-ordered
 `list next`, raw capture plus triage, the full claim/release/block/unblock/shelve/
-close/reopen lifecycle, notes, `set`/`move`/`depend`, and the `doctor` integrity
-checker. `CLAUDE.md` remains the canonical record of the design; open judgement calls
-and any schema change should be raised there before implementation.
+close/reopen lifecycle, notes, `set`/`move`/`depend`, the `doctor` integrity checker,
+the sink abstraction with both the file and SQLite implementations, sink selection
+and `sink info`, `delete`, and `migrate`. `CLAUDE.md` remains the canonical record of
+the design; open judgement calls and any schema change should be raised there before
+implementation.
