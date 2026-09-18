@@ -1,0 +1,497 @@
+{
+  "schema_version": 1,
+  "planning_date": "2026-09-18",
+  "status": "created",
+  "tickets": [
+    {
+      "key": "C01",
+      "title": "Define versioned coordination records and application operations",
+      "tier": "high",
+      "dependencies": [],
+      "epic": "shared-directory-coordination",
+      "scope": "Introduce storage-neutral workspace, attempt, claim, read observation, operation receipt, artifact and event models. Add schema revisions, opaque IDs, UTC times and JSON result/error vocabulary. Establish an application layer for guarded multi-record operations without embedding policy in argparse or SQL.",
+      "acceptance": [
+        "Record fields and invariants match the coordination plan; legacy tickets and timestamps remain readable.",
+        "One authoritative store binding per workspace is modeled; attempt generations and operation IDs are explicit.",
+        "Define sink transaction/serialization and recovery interfaces for later tickets; current file and SQLite commands still work.",
+        "Document compatibility restrictions and distinguish identity attribution from authentication."
+      ],
+      "validation": "Model serialization and validation tests, old-store fixtures, existing schema/CLI regression tests.",
+      "likely_files": "src/arbite/schema.py, errors.py, sinks/base.py; new application/domain modules",
+      "id": "tic-d471",
+      "depends_on": [],
+      "description": "Planning key: C01\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nIntroduce storage-neutral workspace, attempt, claim, read observation, operation receipt, artifact and event models. Add schema revisions, opaque IDs, UTC times and JSON result/error vocabulary. Establish an application layer for guarded multi-record operations without embedding policy in argparse or SQL.\n\n## Acceptance criteria\n- Record fields and invariants match the coordination plan; legacy tickets and timestamps remain readable.\n- One authoritative store binding per workspace is modeled; attempt generations and operation IDs are explicit.\n- Define sink transaction/serialization and recovery interfaces for later tickets; current file and SQLite commands still work.\n- Document compatibility restrictions and distinguish identity attribution from authentication.\n\n## Validation\nModel serialization and validation tests, old-store fixtures, existing schema/CLI regression tests.\n\n## Likely touch points\nsrc/arbite/schema.py, errors.py, sinks/base.py; new application/domain modules\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C02",
+      "title": "Implement transactional coordination storage and durable events in both sinks",
+      "tier": "high",
+      "dependencies": [
+        "C01"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Implement record revision checks, store-local multi-record operations and event append with a stable cursor. File sink uses recoverable journal/process serialization; SQLite uses transactions. A small coarse operation lock is acceptable; no daemon or ticket-duration process lock.",
+      "acceptance": [
+        "Concurrent updates cannot lose fields under unchanged status/assignee; use explicit revisions.",
+        "Related state and events commit together or recover deterministically; retries deduplicate operation IDs.",
+        "Process death does not leave a permanent runtime lock; durable ticket/file claims are unaffected.",
+        "Both sinks have equivalent outcomes; no hidden SQLite requirement for the file sink."
+      ],
+      "validation": "Multiprocess conflicting revisions and events; process death around commit; rollback and idempotent retry; run both-sink conformance.",
+      "likely_files": "src/arbite/sinks/base.py, file.py, sqlite.py; coordination storage modules; tests/test_sink_conformance.py",
+      "id": "tic-12a4",
+      "depends_on": [
+        "tic-d471"
+      ],
+      "description": "Planning key: C02\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nImplement record revision checks, store-local multi-record operations and event append with a stable cursor. File sink uses recoverable journal/process serialization; SQLite uses transactions. A small coarse operation lock is acceptable; no daemon or ticket-duration process lock.\n\n## Acceptance criteria\n- Concurrent updates cannot lose fields under unchanged status/assignee; use explicit revisions.\n- Related state and events commit together or recover deterministically; retries deduplicate operation IDs.\n- Process death does not leave a permanent runtime lock; durable ticket/file claims are unaffected.\n- Both sinks have equivalent outcomes; no hidden SQLite requirement for the file sink.\n\n## Validation\nMultiprocess conflicting revisions and events; process death around commit; rollback and idempotent retry; run both-sink conformance.\n\n## Likely touch points\nsrc/arbite/sinks/base.py, file.py, sqlite.py; coordination storage modules; tests/test_sink_conformance.py\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C03",
+      "title": "Create work attempts and guard every ticket acquisition path",
+      "tier": "high",
+      "dependencies": [
+        "C02"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Create/end durable attempts on ticket acquisition/transitions and enforce readiness atomically. Route direct claim and list-next claim through the application layer. Add explicit adoption for legacy in-progress tickets and generation revocation for explicit administrative takeover.",
+      "acceptance": [
+        "Direct claim cannot bypass unmet dependencies, placeholder classification, invalid status or another active attempt.",
+        "Claim and dependency-edit/reopen races have a documented serial outcome; reopening a prerequisite emits invalidation without silently undoing work.",
+        "Set/status/assignee, force, batch claim, release, block, shelve and reopen cannot bypass attempt ownership.",
+        "Store activity timestamps without expiration logic. Leave extension hooks for file cleanup; until C09 integrates it, refuse transitions with active file claims rather than leak them."
+      ],
+      "validation": "Concurrent claims, stale-generation calls, dependency changes racing claim, legacy adoption, all lifecycle entry points and batch claims on both sinks.",
+      "likely_files": "src/arbite/cli.py, graph.py, application lifecycle module, sink operations",
+      "id": "tic-c4d2",
+      "depends_on": [
+        "tic-12a4"
+      ],
+      "description": "Planning key: C03\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nCreate/end durable attempts on ticket acquisition/transitions and enforce readiness atomically. Route direct claim and list-next claim through the application layer. Add explicit adoption for legacy in-progress tickets and generation revocation for explicit administrative takeover.\n\n## Acceptance criteria\n- Direct claim cannot bypass unmet dependencies, placeholder classification, invalid status or another active attempt.\n- Claim and dependency-edit/reopen races have a documented serial outcome; reopening a prerequisite emits invalidation without silently undoing work.\n- Set/status/assignee, force, batch claim, release, block, shelve and reopen cannot bypass attempt ownership.\n- Store activity timestamps without expiration logic. Leave extension hooks for file cleanup; until C09 integrates it, refuse transitions with active file claims rather than leak them.\n\n## Validation\nConcurrent claims, stale-generation calls, dependency changes racing claim, legacy adoption, all lifecycle entry points and batch claims on both sinks.\n\n## Likely touch points\nsrc/arbite/cli.py, graph.py, application lifecycle module, sink operations\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C04",
+      "title": "Bind workspaces and implement exclusive file claims with canonical paths",
+      "tier": "high",
+      "dependencies": [
+        "C03"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Bind a workspace to one authoritative store; implement canonical file identity, exclusive claim sets and explicit file release. Validate ticket/attempt/generation on every ownership operation. Return conflicts immediately with holder details.",
+      "acceptance": [
+        "All-or-nothing multi-path claims; unrelated paths can be owned independently; reentrant acquisition is explicitly idempotent.",
+        "Reacquisition revokes old read/claim tokens; no automatic expiry or stealing.",
+        "Reject root escape, protected .arbite/.git state, symlink components, special files and hard-linked mutation targets; handle supported case semantics.",
+        "Creation/rename destinations and duplicate-store selection cannot evade ownership; conflicting binding requires explicit quiescent rebind."
+      ],
+      "validation": "Two-process file races, partial-set rollback, aliases/traversal/missing parents, store switch and explicit release/reacquire tests.",
+      "likely_files": "New workspace/path/claim modules, config.py, application layer and both sinks",
+      "id": "tic-0742",
+      "depends_on": [
+        "tic-c4d2"
+      ],
+      "description": "Planning key: C04\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nBind a workspace to one authoritative store; implement canonical file identity, exclusive claim sets and explicit file release. Validate ticket/attempt/generation on every ownership operation. Return conflicts immediately with holder details.\n\n## Acceptance criteria\n- All-or-nothing multi-path claims; unrelated paths can be owned independently; reentrant acquisition is explicitly idempotent.\n- Reacquisition revokes old read/claim tokens; no automatic expiry or stealing.\n- Reject root escape, protected .arbite/.git state, symlink components, special files and hard-linked mutation targets; handle supported case semantics.\n- Creation/rename destinations and duplicate-store selection cannot evade ownership; conflicting binding requires explicit quiescent rebind.\n\n## Validation\nTwo-process file races, partial-set rollback, aliases/traversal/missing parents, store switch and explicit release/reacquire tests.\n\n## Likely touch points\nNew workspace/path/claim modules, config.py, application layer and both sinks\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C05",
+      "title": "Build recoverable file-operation intent and artifact journal",
+      "tier": "high",
+      "dependencies": [
+        "C04"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Implement the filesystem/sink durability bridge before exposing mutation commands. Persist operation intent and exact before/after artifacts, stage bytes, apply under operation serialization and finalize receipts. Support recovery state machines for replace/create/remove/rename.",
+      "acceptance": [
+        "Successful proxy changes cannot lack durable recoverable evidence; artifact capacity errors fail before applying bytes.",
+        "Idempotent retries do not apply an edit twice, and errors disclose when bytes may have changed.",
+        "Recovery recognizes before/after states; unknown external bytes preserve evidence and require explicit resolution.",
+        "Lifecycle operations can serialize against pending writes; no daemon, inferred worker death or silent rollback of unrelated changes."
+      ],
+      "validation": "Fault injection at every intent/artifact/stage/apply/finalize boundary, including sink failure after replacement and rename interruption, across both sinks.",
+      "likely_files": "New operation journal, artifact and filesystem adapter modules; sink recovery hooks",
+      "id": "tic-5196",
+      "depends_on": [
+        "tic-0742"
+      ],
+      "description": "Planning key: C05\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nImplement the filesystem/sink durability bridge before exposing mutation commands. Persist operation intent and exact before/after artifacts, stage bytes, apply under operation serialization and finalize receipts. Support recovery state machines for replace/create/remove/rename.\n\n## Acceptance criteria\n- Successful proxy changes cannot lack durable recoverable evidence; artifact capacity errors fail before applying bytes.\n- Idempotent retries do not apply an edit twice, and errors disclose when bytes may have changed.\n- Recovery recognizes before/after states; unknown external bytes preserve evidence and require explicit resolution.\n- Lifecycle operations can serialize against pending writes; no daemon, inferred worker death or silent rollback of unrelated changes.\n\n## Validation\nFault injection at every intent/artifact/stage/apply/finalize boundary, including sink failure after replacement and rename interruption, across both sinks.\n\n## Likely touch points\nNew operation journal, artifact and filesystem adapter modules; sink recovery hooks\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C06",
+      "title": "Expose bounded file discovery and versioned read tools",
+      "tier": "medium",
+      "dependencies": [
+        "C04"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Add file list/search/read/probe CLI operations with JSON, bounded output and optional line ranges. Record observations and return full-file digest and claim-generation information. Reads do not acquire exclusive ownership.",
+      "acceptance": [
+        "Reading another attempt's claimed file returns an explicit busy owner and non-writable receipt; optional fail-if-busy is supported.",
+        "Write-authorizing tokens require a fresh read after acquisition by the current attempt; partial reads still identify the whole-file version.",
+        "Absent-path probe supports safe create; search/list results do not authorize mutation.",
+        "Output limits/pagination and unsupported encoding/file types are explicit; no silent content truncation presented as complete."
+      ],
+      "validation": "Range/encoding/absent-file reads, foreign claims, pre-acquisition reads, bounded search, safe path validation and both-sink observation persistence.",
+      "likely_files": "src/arbite/cli.py; new file read/discovery services; tests for file CLI",
+      "id": "tic-9710",
+      "depends_on": [
+        "tic-0742"
+      ],
+      "description": "Planning key: C06\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nAdd file list/search/read/probe CLI operations with JSON, bounded output and optional line ranges. Record observations and return full-file digest and claim-generation information. Reads do not acquire exclusive ownership.\n\n## Acceptance criteria\n- Reading another attempt's claimed file returns an explicit busy owner and non-writable receipt; optional fail-if-busy is supported.\n- Write-authorizing tokens require a fresh read after acquisition by the current attempt; partial reads still identify the whole-file version.\n- Absent-path probe supports safe create; search/list results do not authorize mutation.\n- Output limits/pagination and unsupported encoding/file types are explicit; no silent content truncation presented as complete.\n\n## Validation\nRange/encoding/absent-file reads, foreign claims, pre-acquisition reads, bounded search, safe path validation and both-sink observation persistence.\n\n## Likely touch points\nsrc/arbite/cli.py; new file read/discovery services; tests for file CLI\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C07",
+      "title": "Expose version-checked whole-file writes and exact targeted edits",
+      "tier": "high",
+      "dependencies": [
+        "C05",
+        "C06"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Add whole-file write and targeted text-edit commands over the journal engine. Accept stdin/payload files; validate ownership and current digest inside the operation boundary. Apply exact edit batches once with explicit occurrence rules.",
+      "acceptance": [
+        "Two competing operations using one token cannot both succeed; stale token changes no bytes.",
+        "Create requires an absent-path token; whole writes support binary bytes and preserve supported existing permissions.",
+        "Ambiguous/missing/overlapping edit selections reject the whole batch; no fuzzy editing or partial application.",
+        "Preserve untouched byte/newline content; every successful mutation invalidates the old read token and returns receipt/version data."
+      ],
+      "validation": "Competing token reuse, outside-write drift, CRLF/Unicode, exact edit ambiguity and batch failure, binary/large input and permission preservation tests.",
+      "likely_files": "File mutation services, cli.py, journal integration tests",
+      "id": "tic-baa7",
+      "depends_on": [
+        "tic-5196",
+        "tic-9710"
+      ],
+      "description": "Planning key: C07\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nAdd whole-file write and targeted text-edit commands over the journal engine. Accept stdin/payload files; validate ownership and current digest inside the operation boundary. Apply exact edit batches once with explicit occurrence rules.\n\n## Acceptance criteria\n- Two competing operations using one token cannot both succeed; stale token changes no bytes.\n- Create requires an absent-path token; whole writes support binary bytes and preserve supported existing permissions.\n- Ambiguous/missing/overlapping edit selections reject the whole batch; no fuzzy editing or partial application.\n- Preserve untouched byte/newline content; every successful mutation invalidates the old read token and returns receipt/version data.\n\n## Validation\nCompeting token reuse, outside-write drift, CRLF/Unicode, exact edit ambiguity and batch failure, binary/large input and permission preservation tests.\n\n## Likely touch points\nFile mutation services, cli.py, journal integration tests\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C08",
+      "title": "Expose tracked file creation, removal and rename operations",
+      "tier": "high",
+      "dependencies": [
+        "C07"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Complete common source mutation coverage with remove and rename plus safe parent creation. Reuse claims, read tokens, artifact journal and recovery rather than shell operations. No recursive delete.",
+      "acceptance": [
+        "Rename obtains source/destination ownership and validates both versions or destination absence.",
+        "Conflicting destination or invalid path leaves both paths unchanged on ordinary refusal.",
+        "Receipts preserve deleted bytes and both rename paths; interrupted operations recover honestly.",
+        "Safe missing parents are supported; unsupported file types, metadata operations and recursive deletion fail explicitly."
+      ],
+      "validation": "Rename target races, deletion/recreation token invalidation, interrupted rename, binary delete evidence and root/link boundary tests.",
+      "likely_files": "File mutation/path services, cli.py and journal tests",
+      "id": "tic-2cef",
+      "depends_on": [
+        "tic-baa7"
+      ],
+      "description": "Planning key: C08\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nComplete common source mutation coverage with remove and rename plus safe parent creation. Reuse claims, read tokens, artifact journal and recovery rather than shell operations. No recursive delete.\n\n## Acceptance criteria\n- Rename obtains source/destination ownership and validates both versions or destination absence.\n- Conflicting destination or invalid path leaves both paths unchanged on ordinary refusal.\n- Receipts preserve deleted bytes and both rename paths; interrupted operations recover honestly.\n- Safe missing parents are supported; unsupported file types, metadata operations and recursive deletion fail explicitly.\n\n## Validation\nRename target races, deletion/recreation token invalidation, interrupted rename, binary delete evidence and root/link boundary tests.\n\n## Likely touch points\nFile mutation/path services, cli.py and journal tests\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C09",
+      "title": "Cascade ticket lifecycle changes through file ownership and receipts",
+      "tier": "high",
+      "dependencies": [
+        "C08"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Integrate close/release/block/shelve/takeover with pending-operation reconciliation, attempt finalization and file claim release. Remove temporary lifecycle refusal paths from C03 where cleanup is now safe. Preserve current bytes on yielding.",
+      "acceptance": [
+        "Successful close finalizes evidence and releases every claim for the attempt; a concurrent old-generation write cannot succeed afterward.",
+        "Release/block/shelve end attempts, preserve partial work and record handoff/reason; resume requires a new attempt and fresh file reads.",
+        "Explicit takeover revokes old ownership with reason; reopen never resurrects tokens.",
+        "Generic set/force/delete cannot bypass cleanup or destroy historical evidence; pending ambiguous writes prevent a false clean close."
+      ],
+      "validation": "Close-vs-write multiprocess race, crash during cleanup, every lifecycle command, stale worker after takeover, block/unblock and historical delete policy.",
+      "likely_files": "Application lifecycle/operation services, cli.py, sink operations",
+      "id": "tic-b675",
+      "depends_on": [
+        "tic-2cef"
+      ],
+      "description": "Planning key: C09\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nIntegrate close/release/block/shelve/takeover with pending-operation reconciliation, attempt finalization and file claim release. Remove temporary lifecycle refusal paths from C03 where cleanup is now safe. Preserve current bytes on yielding.\n\n## Acceptance criteria\n- Successful close finalizes evidence and releases every claim for the attempt; a concurrent old-generation write cannot succeed afterward.\n- Release/block/shelve end attempts, preserve partial work and record handoff/reason; resume requires a new attempt and fresh file reads.\n- Explicit takeover revokes old ownership with reason; reopen never resurrects tokens.\n- Generic set/force/delete cannot bypass cleanup or destroy historical evidence; pending ambiguous writes prevent a false clean close.\n\n## Validation\nClose-vs-write multiprocess race, crash during cleanup, every lifecycle command, stale worker after takeover, block/unblock and historical delete policy.\n\n## Likely touch points\nApplication lifecycle/operation services, cli.py, sink operations\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C10",
+      "title": "Expose automatic change receipts and net ticket change views",
+      "tier": "medium",
+      "dependencies": [
+        "C09"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Add changes/attempt/evidence queries showing touched files, ordered operations, before/after references and net changes. Separate mechanical evidence from agent summaries and external drift. Include read observations without flooding ordinary output.",
+      "acceptance": [
+        "Create/edit/delete/rename/binary and edit-then-revert are accurately represented; net diff does not erase operation history.",
+        "Ticket and attempt views are bounded/JSON-capable and reference verifiable artifacts.",
+        "Closure does not need an LLM summary to produce a file-change manifest.",
+        "Outside tool writes are labeled observed/unattributed when detected, not falsely assigned to the current agent."
+      ],
+      "validation": "Known mutation sequence with exact artifact reconstruction and net diff; binary output; closed/reopened attempts and pagination.",
+      "likely_files": "New evidence/query modules, cli.py, artifact store",
+      "id": "tic-ccd3",
+      "depends_on": [
+        "tic-b675"
+      ],
+      "description": "Planning key: C10\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nAdd changes/attempt/evidence queries showing touched files, ordered operations, before/after references and net changes. Separate mechanical evidence from agent summaries and external drift. Include read observations without flooding ordinary output.\n\n## Acceptance criteria\n- Create/edit/delete/rename/binary and edit-then-revert are accurately represented; net diff does not erase operation history.\n- Ticket and attempt views are bounded/JSON-capable and reference verifiable artifacts.\n- Closure does not need an LLM summary to produce a file-change manifest.\n- Outside tool writes are labeled observed/unattributed when detected, not falsely assigned to the current agent.\n\n## Validation\nKnown mutation sequence with exact artifact reconstruction and net diff; binary output; closed/reopened attempts and pagination.\n\n## Likely touch points\nNew evidence/query modules, cli.py, artifact store\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C11",
+      "title": "Add coordination migrations, exports and integrity recovery",
+      "tier": "high",
+      "dependencies": [
+        "C10"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Extend schema upgrades, doctor and file/SQLite migration to coordination records and artifacts. Require quiescence before store switching and verify referential integrity and artifact hashes.",
+      "acceptance": [
+        "Old stores migrate without invented execution history; existing ticket content survives.",
+        "Doctor reports orphan claims, invalid generations, missing artifacts, pending intents and binding/revision drift; fixes only unambiguous cases.",
+        "Quiescent file-to-SQLite-to-file transfer preserves attempts, receipts and references; active/pending operations prevent migration.",
+        "Destination verification precedes authoritative rebinding; cursor namespaces and retained history are explicit."
+      ],
+      "validation": "Legacy upgrade fixtures, corrupted artifact/pending-intent diagnostics, failure during migration, active-state refusal and full round-trip conformance.",
+      "likely_files": "Both sinks, migrate/doctor CLI, artifact export modules, migration tests",
+      "id": "tic-d047",
+      "depends_on": [
+        "tic-ccd3"
+      ],
+      "description": "Planning key: C11\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nExtend schema upgrades, doctor and file/SQLite migration to coordination records and artifacts. Require quiescence before store switching and verify referential integrity and artifact hashes.\n\n## Acceptance criteria\n- Old stores migrate without invented execution history; existing ticket content survives.\n- Doctor reports orphan claims, invalid generations, missing artifacts, pending intents and binding/revision drift; fixes only unambiguous cases.\n- Quiescent file-to-SQLite-to-file transfer preserves attempts, receipts and references; active/pending operations prevent migration.\n- Destination verification precedes authoritative rebinding; cursor namespaces and retained history are explicit.\n\n## Validation\nLegacy upgrade fixtures, corrupted artifact/pending-intent diagnostics, failure during migration, active-state refusal and full round-trip conformance.\n\n## Likely touch points\nBoth sinks, migrate/doctor CLI, artifact export modules, migration tests\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "C12",
+      "title": "Validate and document the shared-directory proxy workflow",
+      "tier": "medium",
+      "dependencies": [
+        "C11"
+      ],
+      "epic": "shared-directory-coordination",
+      "scope": "Deliver the owner-facing two-agent shared-folder recipe and agent mandate, update README scope and generated docs source, and run end-to-end acceptance. Include takeover/recovery and external-tool limitations. This is an integration acceptance ticket, not merely prose.",
+      "acceptance": [
+        "Docs instruct agents to use arbite discovery/read/mutation tools and reread after claims/ticket boundaries.",
+        "Document no runner/daemon/automatic stale takeover, test/build output handling, evidence storage growth and the optional external enforcement boundary.",
+        "Two processes demonstrate independent file work, contested ownership, stale-read refusal and close cleanup on both sinks.",
+        "Full existing regression suite and new multiprocess/crash tests pass; unresolved platform limits are documented accurately."
+      ],
+      "validation": "Run full pytest suite plus documented disposable-workspace recipe using both sinks; regenerate guidance through docs.py/init in fixtures.",
+      "likely_files": "README.md, src/arbite/docs.py, AGENTS_EXAMPLE.md as authorized feature documentation, tests",
+      "id": "tic-d60f",
+      "depends_on": [
+        "tic-d047"
+      ],
+      "description": "Planning key: C12\nHandoff: .arbite/planning/shared-directory-coordination.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nDeliver the owner-facing two-agent shared-folder recipe and agent mandate, update README scope and generated docs source, and run end-to-end acceptance. Include takeover/recovery and external-tool limitations. This is an integration acceptance ticket, not merely prose.\n\n## Acceptance criteria\n- Docs instruct agents to use arbite discovery/read/mutation tools and reread after claims/ticket boundaries.\n- Document no runner/daemon/automatic stale takeover, test/build output handling, evidence storage growth and the optional external enforcement boundary.\n- Two processes demonstrate independent file work, contested ownership, stale-read refusal and close cleanup on both sinks.\n- Full existing regression suite and new multiprocess/crash tests pass; unresolved platform limits are documented accurately.\n\n## Validation\nRun full pytest suite plus documented disposable-workspace recipe using both sinks; regenerate guidance through docs.py/init in fixtures.\n\n## Likely touch points\nREADME.md, src/arbite/docs.py, AGENTS_EXAMPLE.md as authorized feature documentation, tests\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/shared-directory-coordination.md"
+    },
+    {
+      "key": "B01",
+      "title": "Add passive worker profiles and eligibility declarations",
+      "tier": "medium",
+      "dependencies": [
+        "C03"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Persist optional provider-neutral worker profiles with tier, tools/capabilities, locality, cost metadata/units, declared capacity, enabled state and checkin timestamps. Support register/show/list/update/disable without launching agents.",
+      "acceptance": [
+        "Configured profile is authoritative; per-call declarations cannot silently elevate its tier.",
+        "Ad-hoc IDs still work on unrestricted tickets; unknown fields fail constrained eligibility with reasons.",
+        "Provider/model labels do not trigger API calls; credentials are never stored in profiles.",
+        "Declared availability/activity is not displayed as verified liveness; profile disable preserves historical references."
+      ],
+      "validation": "Both-sink profile persistence, tier/capability/unknown cost validation, ad-hoc compatibility, disable/history tests.",
+      "likely_files": "Worker models/services, cli.py, both sinks",
+      "id": "tic-799e",
+      "depends_on": [
+        "tic-c4d2"
+      ],
+      "description": "Planning key: B01\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nPersist optional provider-neutral worker profiles with tier, tools/capabilities, locality, cost metadata/units, declared capacity, enabled state and checkin timestamps. Support register/show/list/update/disable without launching agents.\n\n## Acceptance criteria\n- Configured profile is authoritative; per-call declarations cannot silently elevate its tier.\n- Ad-hoc IDs still work on unrestricted tickets; unknown fields fail constrained eligibility with reasons.\n- Provider/model labels do not trigger API calls; credentials are never stored in profiles.\n- Declared availability/activity is not displayed as verified liveness; profile disable preserves historical references.\n\n## Validation\nBoth-sink profile persistence, tier/capability/unknown cost validation, ad-hoc compatibility, disable/history tests.\n\n## Likely touch points\nWorker models/services, cli.py, both sinks\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    },
+    {
+      "key": "B02",
+      "title": "Add atomic coordinator reservations over explicit ticket sets",
+      "tier": "high",
+      "dependencies": [
+        "C03"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Implement reservation ownership independently of execution assignment. Support explicit sets and snapshot expansion from an epic; atomic membership update/release and overlap prevention.",
+      "acceptance": [
+        "Reservation alone does not set tickets in_progress or create attempts.",
+        "Reserve-vs-claim and overlapping reservations have one serial outcome; partial set reservation never leaks.",
+        "New epic tickets are not silently included; nested reservations are refused.",
+        "Direct claim/set/force respect reservations; releasing active work requires explicit interruption or is refused."
+      ],
+      "validation": "Multiprocess overlap and reserve-vs-claim, snapshot membership, active release refusal and both-sink persistence tests.",
+      "likely_files": "Reservation models/application operations, cli.py and sink records",
+      "id": "tic-ecd0",
+      "depends_on": [
+        "tic-c4d2"
+      ],
+      "description": "Planning key: B02\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nImplement reservation ownership independently of execution assignment. Support explicit sets and snapshot expansion from an epic; atomic membership update/release and overlap prevention.\n\n## Acceptance criteria\n- Reservation alone does not set tickets in_progress or create attempts.\n- Reserve-vs-claim and overlapping reservations have one serial outcome; partial set reservation never leaks.\n- New epic tickets are not silently included; nested reservations are refused.\n- Direct claim/set/force respect reservations; releasing active work requires explicit interruption or is refused.\n\n## Validation\nMultiprocess overlap and reserve-vs-claim, snapshot membership, active release refusal and both-sink persistence tests.\n\n## Likely touch points\nReservation models/application operations, cli.py and sink records\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    },
+    {
+      "key": "B03",
+      "title": "Publish offers and direct assignments with atomic worker pickup",
+      "tier": "high",
+      "dependencies": [
+        "B01",
+        "B02"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Implement offers over tickets, including direct worker assignments and reservation-backed public pickup. Validate eligibility/readiness and create the execution attempt in the same acquisition transaction.",
+      "acceptance": [
+        "Publishing retains coordinator reservation ownership; worker pickup needs no orchestrator round trip.",
+        "Two workers accepting one offer produce exactly one active attempt.",
+        "Withdraw-vs-accept is serialized; withdrawal/release never silently cancels an active worker.",
+        "Direct claim and list-next cannot bypass assignments, requirements or reservation access; cost preferences are not misrepresented as winner guarantees."
+      ],
+      "validation": "Offer/assignment eligibility, concurrent pickup, withdraw races, explicit interruption, force/set bypass regression tests on both sinks.",
+      "likely_files": "Offer records/services, shared readiness/acquisition layer, cli.py",
+      "id": "tic-ea07",
+      "depends_on": [
+        "tic-799e",
+        "tic-ecd0"
+      ],
+      "description": "Planning key: B03\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nImplement offers over tickets, including direct worker assignments and reservation-backed public pickup. Validate eligibility/readiness and create the execution attempt in the same acquisition transaction.\n\n## Acceptance criteria\n- Publishing retains coordinator reservation ownership; worker pickup needs no orchestrator round trip.\n- Two workers accepting one offer produce exactly one active attempt.\n- Withdraw-vs-accept is serialized; withdrawal/release never silently cancels an active worker.\n- Direct claim and list-next cannot bypass assignments, requirements or reservation access; cost preferences are not misrepresented as winner guarantees.\n\n## Validation\nOffer/assignment eligibility, concurrent pickup, withdraw races, explicit interruption, force/set bypass regression tests on both sinks.\n\n## Likely touch points\nOffer records/services, shared readiness/acquisition layer, cli.py\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    },
+    {
+      "key": "B04",
+      "title": "Implement ordered same-worker packages and explicit continuity handoff",
+      "tier": "high",
+      "dependencies": [
+        "B03",
+        "C09"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Bundle ordered tickets into one continuity contract. Accept binds the worker while only the current ready member starts. Validate combined package/dependency graph and implement explicit remaining-work handoff.",
+      "acceptance": [
+        "Later package members cannot be cherry-picked by direct claim; no early in_progress state.",
+        "Same-worker identity is durable but not a promise of the same conversation; each ticket has its own attempt.",
+        "Completion releases file claims through lifecycle and next member requires fresh reads; blocked members do not advance.",
+        "Duplicate memberships/cycles are refused; external prerequisites are explained; explicit rebind preserves completed members and records reason."
+      ],
+      "validation": "Two-member continuity, crash/resume identity, external dependency pause, partial completion/rebind, combined-graph cycles and bypass tests.",
+      "likely_files": "Package models/services, graph.py, readiness layer, cli.py",
+      "id": "tic-38a0",
+      "depends_on": [
+        "tic-ea07",
+        "tic-b675"
+      ],
+      "description": "Planning key: B04\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nBundle ordered tickets into one continuity contract. Accept binds the worker while only the current ready member starts. Validate combined package/dependency graph and implement explicit remaining-work handoff.\n\n## Acceptance criteria\n- Later package members cannot be cherry-picked by direct claim; no early in_progress state.\n- Same-worker identity is durable but not a promise of the same conversation; each ticket has its own attempt.\n- Completion releases file claims through lifecycle and next member requires fresh reads; blocked members do not advance.\n- Duplicate memberships/cycles are refused; external prerequisites are explained; explicit rebind preserves completed members and records reason.\n\n## Validation\nTwo-member continuity, crash/resume identity, external dependency pause, partial completion/rebind, combined-graph cycles and bypass tests.\n\n## Likely touch points\nPackage models/services, graph.py, readiness layer, cli.py\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    },
+    {
+      "key": "B05",
+      "title": "Unify job-board readiness, worker capacity and routing explanations",
+      "tier": "high",
+      "dependencies": [
+        "B04"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Use one readiness evaluator for board queries, list-next, direct claim and package/offer acquisition. Expose structured reasons and distinguish hard requirements from routing hints. Enforce configured capacity during atomic acquisition.",
+      "acceptance": [
+        "Board explains dependency, classification, reservation, continuity and worker constraints; claim rechecks all relevant conditions.",
+        "Active attempts count toward capacity; reservations and future package tickets do not.",
+        "Concurrent/batch acquisition cannot overfill a configured worker; profile changes affect future work without revoking existing attempts.",
+        "Local/low-cost preference is advisory in passive first-eligible pickup; explicit assignment or hard constraints can enforce an owner choice."
+      ],
+      "validation": "Readiness/query parity, concurrent capacity races, tier/capability/cost unknowns, batch partial results and combined exclusion explanations.",
+      "likely_files": "graph/query/application selection services, cli.py, worker profiles",
+      "id": "tic-3c9c",
+      "depends_on": [
+        "tic-38a0"
+      ],
+      "description": "Planning key: B05\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nUse one readiness evaluator for board queries, list-next, direct claim and package/offer acquisition. Expose structured reasons and distinguish hard requirements from routing hints. Enforce configured capacity during atomic acquisition.\n\n## Acceptance criteria\n- Board explains dependency, classification, reservation, continuity and worker constraints; claim rechecks all relevant conditions.\n- Active attempts count toward capacity; reservations and future package tickets do not.\n- Concurrent/batch acquisition cannot overfill a configured worker; profile changes affect future work without revoking existing attempts.\n- Local/low-cost preference is advisory in passive first-eligible pickup; explicit assignment or hard constraints can enforce an owner choice.\n\n## Validation\nReadiness/query parity, concurrent capacity races, tier/capability/cost unknowns, batch partial results and combined exclusion explanations.\n\n## Likely touch points\ngraph/query/application selection services, cli.py, worker profiles\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    },
+    {
+      "key": "B06",
+      "title": "Expose resumable event queries and coordinator progress views",
+      "tier": "medium",
+      "dependencies": [
+        "B04",
+        "C10"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Add one-shot events --after/--limit and reservation progress queries over durable events. Include offer/package/attempt changes with enough IDs for external callers to requery readiness. No watchers or notification delivery.",
+      "acceptance": [
+        "Ordered cursor pagination resumes across process restarts; filters advance cursor consistently and invalid/foreign cursors fail clearly.",
+        "Consumers can deduplicate repeated event delivery by stable ID; only committed/reconciled events appear final.",
+        "Reservation progress distinguishes complete, active, ready, blocked and dependency waiting, with recorded activity not liveness inference.",
+        "Read events are separable from job lifecycle events; dependency completion is a requery hint, not an irrevocable readiness promise."
+      ],
+      "validation": "Filtered/unfiltered cursor pagination, repeated reads, restart/recovery and reservation status fixtures on both sinks.",
+      "likely_files": "Event/progress query services, cli.py, sink cursor APIs",
+      "id": "tic-7431",
+      "depends_on": [
+        "tic-38a0",
+        "tic-ccd3"
+      ],
+      "description": "Planning key: B06\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nAdd one-shot events --after/--limit and reservation progress queries over durable events. Include offer/package/attempt changes with enough IDs for external callers to requery readiness. No watchers or notification delivery.\n\n## Acceptance criteria\n- Ordered cursor pagination resumes across process restarts; filters advance cursor consistently and invalid/foreign cursors fail clearly.\n- Consumers can deduplicate repeated event delivery by stable ID; only committed/reconciled events appear final.\n- Reservation progress distinguishes complete, active, ready, blocked and dependency waiting, with recorded activity not liveness inference.\n- Read events are separable from job lifecycle events; dependency completion is a requery hint, not an irrevocable readiness promise.\n\n## Validation\nFiltered/unfiltered cursor pagination, repeated reads, restart/recovery and reservation status fixtures on both sinks.\n\n## Likely touch points\nEvent/progress query services, cli.py, sink cursor APIs\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    },
+    {
+      "key": "B07",
+      "title": "Preserve job-board records across migrations and integrity checks",
+      "tier": "medium",
+      "dependencies": [
+        "B05",
+        "B06",
+        "C11"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Extend both-sink upgrades/export/migration/doctor to worker profiles, reservations, offers and packages. Keep immutable historical attribution and validate links and combined scheduling invariants.",
+      "acceptance": [
+        "Quiescent transfers preserve owner/worker distinction, continuity binding, completed history and offer states.",
+        "Doctor detects dangling offers, overlapping reservation/package membership and inconsistent attempts without guessing reassignment.",
+        "Active/pending work prevents unsafe store switching; profile removal cannot erase historical actor references.",
+        "Legacy ad-hoc stores need no mandatory registration or central service."
+      ],
+      "validation": "Full file/SQLite round-trip with partial completed package, deliberate integrity damage, legacy upgrade and active transfer refusal.",
+      "likely_files": "Both sinks, migration/export and doctor services, tests",
+      "id": "tic-1dce",
+      "depends_on": [
+        "tic-3c9c",
+        "tic-7431",
+        "tic-d047"
+      ],
+      "description": "Planning key: B07\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nExtend both-sink upgrades/export/migration/doctor to worker profiles, reservations, offers and packages. Keep immutable historical attribution and validate links and combined scheduling invariants.\n\n## Acceptance criteria\n- Quiescent transfers preserve owner/worker distinction, continuity binding, completed history and offer states.\n- Doctor detects dangling offers, overlapping reservation/package membership and inconsistent attempts without guessing reassignment.\n- Active/pending work prevents unsafe store switching; profile removal cannot erase historical actor references.\n- Legacy ad-hoc stores need no mandatory registration or central service.\n\n## Validation\nFull file/SQLite round-trip with partial completed package, deliberate integrity damage, legacy upgrade and active transfer refusal.\n\n## Likely touch points\nBoth sinks, migration/export and doctor services, tests\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    },
+    {
+      "key": "B08",
+      "title": "Validate and document manual multi-provider job-board coordination",
+      "tier": "medium",
+      "dependencies": [
+        "B07",
+        "C12"
+      ],
+      "epic": "multi-provider-job-board",
+      "scope": "Document and demonstrate manually started independent workers, coordinator reservations, direct assignment and public package pickup. Verify complete integration with the file proxy and current CLI. No provider adapters or running processes added.",
+      "acceptance": [
+        "Two differently labeled workers can mix ad-hoc work and reservation offers while respecting tier, capacity, assignment and continuity.",
+        "Package tickets produce separate attempts and proxy receipts, releasing files and rereading between members.",
+        "An external caller can inspect progress/events, exit, and resume querying later; busy/no-work responses need no resident model loop.",
+        "README and generated docs describe new scope and deferrals; full regressions and race acceptance pass for both sinks."
+      ],
+      "validation": "End-to-end recipe with two worker identities, reservation of three tickets (one assigned, two packaged), proxy edits, attempted unauthorized claims, completion, event restart and full pytest suite.",
+      "likely_files": "README.md, src/arbite/docs.py, examples and end-to-end tests",
+      "id": "tic-da32",
+      "depends_on": [
+        "tic-1dce",
+        "tic-d60f"
+      ],
+      "description": "Planning key: B08\nHandoff: .arbite/planning/multi-provider-job-board.md\nShared context: .arbite/planning/README.md\n\n## Outcome and scope\nDocument and demonstrate manually started independent workers, coordinator reservations, direct assignment and public package pickup. Verify complete integration with the file proxy and current CLI. No provider adapters or running processes added.\n\n## Acceptance criteria\n- Two differently labeled workers can mix ad-hoc work and reservation offers while respecting tier, capacity, assignment and continuity.\n- Package tickets produce separate attempts and proxy receipts, releasing files and rereading between members.\n- An external caller can inspect progress/events, exit, and resume querying later; busy/no-work responses need no resident model loop.\n- README and generated docs describe new scope and deferrals; full regressions and race acceptance pass for both sinks.\n\n## Validation\nEnd-to-end recipe with two worker identities, reservation of three tickets (one assigned, two packaged), proxy edits, attempted unauthorized claims, completion, event restart and full pytest suite.\n\n## Likely touch points\nREADME.md, src/arbite/docs.py, examples and end-to-end tests\n\n## Boundaries and handoff\nUse the handoff plan as the detailed contract. Implement this slice only; do not add a daemon, agent launcher, automatic stale recovery, worktree workflow, central database, factory or dashboard. Preserve both-sink behavior. Sibling tickets may touch the same files; coordinate edits or work serially until the proxy exists. Record implementation decisions, validation results, observable behavior and remaining limitations in ticket notes before close.",
+      "plan": ".arbite/planning/multi-provider-job-board.md"
+    }
+  ]
+}
