@@ -111,14 +111,15 @@ TICKET_ID_HELP = docs.TICKET_ID_HELP
 # Read-only commands keep the old convenience: a guess there costs nothing.
 TICKET_ID_HELP_READONLY = docs.TICKET_ID_HELP_READONLY
 
-# `arbite bug|feature|memo|wish <message>` is shorthand for the equally-named
-# `arbite raw <type> <message>` form: they create an identical raw ticket (same
-# status 'raw', same 'classification' epic, same body notes), just with a shorter
-# invocation. Each top-level subcommand is registered in build_parser() from this
-# map so a single type can't drift from its shortcut.
+# `arbite bug|feature|request|memo|wish <message>` is shorthand for the
+# equally-named `arbite raw <type> <message>` form: they create an identical raw
+# ticket (same status 'raw', same 'classification' epic, same body notes), just
+# with a shorter invocation. Each top-level subcommand is registered in
+# build_parser() from this map so a single type can't drift from its shortcut.
 RAW_SHORTCUT_HELP = {
     "bug": "capture a raw bug ticket (shorthand for 'arbite raw bug <message>')",
     "feature": "capture a raw feature ticket (shorthand for 'arbite raw feature <message>')",
+    "request": "capture a raw change-request ticket (shorthand for 'arbite raw request <message>')",
     "memo": "capture a raw memo ticket (shorthand for 'arbite raw memo <message>')",
     "wish": "capture a raw wish ticket (shorthand for 'arbite raw wish <message>')",
 }
@@ -303,6 +304,31 @@ def cmd_init(args):
         f"'read {config.ARBITE_DIRNAME}/AGENTS.md', if you want agents to find arbite"
     )
 
+    # --agents-doc / --claude-doc install the short instructions block into the
+    # project's own doc files, so a harness that auto-reads AGENTS.md / CLAUDE.md
+    # finds arbite without anyone hand-editing those files. The block text lives in
+    # docs.py; here we only decide which files and report what happened.
+    for enabled, filename in (
+        (getattr(args, "agents_doc", False), "AGENTS.md"),
+        (getattr(args, "claude_doc", False), "CLAUDE.md"),
+    ):
+        if not enabled:
+            continue
+        doc_path = project_root / filename
+        outcome = docs.install_instructions(doc_path)
+        if outcome == "created":
+            print(f"created {doc_path} with the arbite instructions block")
+        elif outcome == "prepended":
+            print(
+                f"prepended the arbite instructions block to {doc_path} "
+                "(existing contents left in place)"
+            )
+        else:
+            print(
+                f"{doc_path} already contains the arbite instructions block; "
+                "left unchanged"
+            )
+
 
 def cmd_sink(args):
     """Report or initialise the active sink: which implementation is in use,
@@ -403,9 +429,12 @@ def cmd_raw(args):
     out of 'arbite list next' until triage sets it to 'open' (or claims it
     directly). The ticket is auto-grouped under the 'classification' epic so
     triage/classification jobs can discover it with 'arbite list next --epic
-    classification' or pull the oldest one with 'arbite fetch'. A 'wish' raw
-    ticket carries an extra note: wishlist items are reclassified as 'feature' and
-    filed in the wishlist bucket rather than opened as work."""
+    classification' or pull the oldest one with 'arbite fetch'. A 'request' raw
+    ticket carries an extra note: it is a request for a change, not necessarily a
+    bug or a new feature but a tweak or lateral change, and is treated as ordinary
+    work once classified. A 'wish' raw ticket carries an extra note: wishlist
+    items are reclassified as 'feature' and filed in the wishlist bucket rather
+    than opened as work."""
     sink = _require_sink(args)
     now = schema.now()
     message = " ".join(args.message)
@@ -415,6 +444,8 @@ def cmd_raw(args):
     description = schema.RAW_DESCRIPTION.format(message=message)
     if args.type == "memo":
         description = f"{description}\n\n{schema.MEMO_RAW_NOTE}"
+    elif args.type == "request":
+        description = f"{description}\n\n{schema.REQUEST_RAW_NOTE}"
     elif args.type == "wish":
         description = f"{description}\n\n{schema.WISH_RAW_NOTE.format(id=new_id)}"
 
@@ -1367,7 +1398,8 @@ def build_parser():
         "the selected sink (status folders and buckets for the file sink; the database and "
         "its schema for the sqlite sink), write .arbite/AGENTS.md (the command reference, not "
         "auto-discovered -- point your project's CLAUDE.md or similar at it explicitly if you "
-        "want agents to find arbite), and pre-create a scratchpad file under .arbite/agents/ "
+        "want agents to find arbite, or pass --agents-doc/--claude-doc to have the instructions "
+        "block installed into those files for you), and pre-create a scratchpad file under .arbite/agents/ "
         "for every id listed in an 'agents:' list in ./arbite.yaml, if present. Which sink is "
         "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
         "in ./arbite.yaml, then file. The store it creates then becomes the project default -- "
@@ -1375,6 +1407,21 @@ def build_parser():
         "reads a different store by accident (an ARBITE_SINK selection is reported instead, "
         "since that was this process's decision rather than the project's). Running it again is "
         "safe: it never destroys data.",
+    )
+    p_init.add_argument(
+        "--agents-doc",
+        action="store_true",
+        help="create ./AGENTS.md, or prepend the arbite instructions block to it if the "
+        "file exists without that block, so a harness that reads AGENTS.md finds arbite",
+    )
+    p_init.add_argument(
+        "--claude-doc",
+        "--claud-doc",
+        dest="claude_doc",
+        action="store_true",
+        help="create ./CLAUDE.md, or prepend the arbite instructions block to it if the "
+        "file exists without that block, so Claude Code finds arbite ('--claud-doc' is "
+        "accepted as an alias)",
     )
     _sink_flag(p_init)
     p_init.set_defaults(func=cmd_init)
@@ -1462,15 +1509,18 @@ def build_parser():
         "one with `arbite fetch`), and writes a body explaining that the ticket must be "
         "filled out (a real title, tier, domain, epic, priority, and an expanded description) "
         "before it can be claimed or worked. Use 'memo' when the request is to update "
-        "project notes / documentation rather than make a code change. Use 'wish' for a "
-        "wishlist item: the ticket notes that wishlist items are reclassified as 'feature' "
-        "and filed in the wishlist bucket rather than opened as work.",
+        "project notes / documentation rather than make a code change. Use 'request' for a "
+        "request for a change that is not necessarily a bug or a new feature -- a tweak or "
+        "lateral change to something that already exists; it is ordinary work once "
+        "classified. Use 'wish' for a wishlist item: the ticket notes that wishlist items "
+        "are reclassified as 'feature' and filed in the wishlist bucket rather than opened "
+        "as work.",
     )
     p_raw.add_argument(
         "type",
         choices=schema.RAW_TYPE_CHOICES,
         metavar="TYPE",
-        help="kind of raw ticket: memo | feature | bug | wish",
+        help=f"kind of raw ticket: {' | '.join(schema.RAW_TYPE_CHOICES)}",
     )
     p_raw.add_argument("message", metavar="MESSAGE", nargs="+", help=docs.MESSAGE_HELP)
     _sink_flag(p_raw)
@@ -1513,7 +1563,8 @@ def build_parser():
         default=None,
         choices=schema.RAW_TYPE_CHOICES,
         metavar="TYPE",
-        help="restrict to raw tickets of this type: memo | feature | bug | wish (default: any type)",
+        help=f"restrict to raw tickets of this type: "
+        f"{' | '.join(schema.RAW_TYPE_CHOICES)} (default: any type)",
     )
     _json_flag(p_fetch)
     _sink_flag(p_fetch)
@@ -1574,7 +1625,7 @@ def build_parser():
         "epic, --count to hand a batch of work to several agents at once, and --claim to "
         "take it in the same command. 'raw' prints the whole raw backlog (every status "
         "'raw' ticket) as a running todo list until a classification run drains it: "
-        "grouped by type (memo/feature/bug/wish), one line per ticket showing its id "
+        "grouped by type (memo/feature/request/bug/wish), one line per ticket showing its id "
         "and the request text it was captured from, oldest first -- since every raw "
         "ticket's title is '<type> (raw): Requires Classification' and its "
         "tier/domain/priority/epic are placeholders, the usual flat table would be noise",

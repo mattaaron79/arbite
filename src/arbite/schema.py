@@ -29,8 +29,10 @@ STATUSES = ["raw", "open", "in_progress", "blocked", "shelved", "closed"]
 # offer them (they're captured requests, not something authored directly).
 # Kept here rather than inline in argparse so create, set and doctor all
 # validate against the same list.
-TYPES = ["bug", "feature", "refactor", "chore", "memo", "wish"]
-CREATE_TYPES = ["bug", "feature", "refactor", "chore"]
+TYPES = ["bug", "feature", "request", "refactor", "chore", "memo", "wish"]
+# The types a plain `arbite create` offers: ordinary work, as opposed to the
+# raw-only captures (`memo`, `wish`) whose special handling is described below.
+CREATE_TYPES = ["bug", "feature", "request", "refactor", "chore"]
 
 # Agent capability tiers, ascending. `tier` answers "how capable does the agent
 # working this need to be", which is why it is a ladder rather than a set of
@@ -98,14 +100,14 @@ BLANK_WARNING = (
     "a real description below, and saved the file."
 )
 
-# Raw tickets (`arbite raw <memo|feature|bug> <message>`): deliberately
-# unclassified quick captures. They get status "raw", precisely so they never
-# show up in `arbite list next` -- only the type and a placeholder title are
-# set; everything needed to actually work them (a real title, tier, domain,
-# epic, priority, and an expanded description) is left to be filled in by
-# triage/classification (see `arbite fetch`), which also moves them to status
-# "open" or claims them.
-RAW_TYPE_CHOICES = ["memo", "feature", "bug", "wish"]
+# Raw tickets (`arbite raw <memo|feature|request|bug|wish> <message>`):
+# deliberately unclassified quick captures. They get status "raw", precisely so
+# they never show up in `arbite list next` -- only the type and a placeholder
+# title are set; everything needed to actually work them (a real title, tier,
+# domain, epic, priority, and an expanded description) is left to be filled in
+# by triage/classification (see `arbite fetch`), which also moves them to
+# status "open" or claims them.
+RAW_TYPE_CHOICES = ["memo", "feature", "request", "bug", "wish"]
 
 RAW_TITLE_FORMAT = "{type} (raw): Requires Classification"
 
@@ -138,6 +140,19 @@ RAW_DESCRIPTION = (
 MEMO_RAW_NOTE = (
     "> **Note:** a memo is primarily a request to update any project notes / "
     "documentation that is being maintained, rather than a code change."
+)
+
+# Appended to `arbite raw request` tickets. A request is a request for a change
+# that is not necessarily a bug or a new feature: a tweak or lateral change to
+# existing behaviour, UI, data or docs. It is ordinary work once classified, so
+# unlike a wish it is opened or claimed normally -- the note only records what
+# kind of change a request is, so triage doesn't force it into bug/feature.
+REQUEST_RAW_NOTE = (
+    "> **Note:** this is a **request** for a change -- not necessarily a bug or a new "
+    "feature, but a **tweak or lateral change** to something that already exists "
+    "(behaviour, UI, data or docs). Classify it like any other raw ticket, but when you "
+    "do, keep it as `request`: state the current behaviour, the change being asked for, "
+    "and any acceptance criteria, then open or claim it as ordinary work."
 )
 
 # Appended to `arbite raw wish` tickets. Wishlist items are deliberately NOT

@@ -33,9 +33,10 @@ arbite list --topo --epic <epic_name>
 Get the next workable ticket (if you'd like to specify the ticket to an agent):
 arbite list next
 
-File a quick bug/feature/memo:
+File a quick bug/feature/request/memo:
 arbite bug The thing doesn't work that I want to work!
 arbite feature Make the button glow when hovering
+arbite request Collapse the toolbar when scrolling
 arbite memo The readme probably needs to be updated
 
 Which store am I using, and where is it?
@@ -76,8 +77,10 @@ by small or medium-sized models.
 ## Ticket Creation
 
 Usually it's best to have the agent create the tickets, as a command line interface can be
-cumbersome. However, there are 'raw' tickets that are created via the 'arbite bug|feature|memo|wish' commands.
-Raw tickets need to be classified before they are worked.
+cumbersome. However, there are 'raw' tickets that are created via the
+`arbite bug|feature|request|memo|wish` commands. A `request` is a request for a change that is
+not necessarily a bug or a new feature, but a tweak or lateral change. Raw tickets need to be
+classified before they are worked.
 
 You can view raw tickets via:
 arbite list raw
@@ -319,7 +322,7 @@ The package exposes the console script `arbite`, providing:
 | Area | Commands |
 | --- | --- |
 | Setup | `init`, `sink [info\|init]` |
-| Creation | `create` (incl. `--blank` scaffolding), `raw <memo\|feature\|bug\|wish>` plus the one-word shortcuts `bug` / `feature` / `wish` / `memo` |
+| Creation | `create` (incl. `--blank` scaffolding), `raw <memo\|feature\|request\|bug\|wish>` plus the one-word shortcuts `bug` / `feature` / `request` / `wish` / `memo` |
 | Triage | `fetch [type]` (oldest raw ticket + injected `derived_note`), `list raw` |
 | Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
 | Lifecycle | `claim`, `release`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen` |
@@ -404,7 +407,7 @@ with `arbite.db` in place of the status folders.
 id: tic-a1b2
 title: Fix off-by-one in vertex normal calc
 status: open              # raw | open | in_progress | blocked | shelved | closed — mirrors the folder
-type: bug                 # bug | feature | refactor | chore | memo | wish
+type: bug                 # bug | feature | request | refactor | chore | memo | wish
 tier: medium              # low | medium | high | frontier — agent capability tier required
 domain: mesh              # routing: mesh, image_gen, audio_gen, ui, io, ...
 epic: mesh-pipeline       # larger initiative (optional), freeform grouping label

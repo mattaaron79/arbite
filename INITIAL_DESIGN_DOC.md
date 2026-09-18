@@ -92,7 +92,7 @@ Build this as a Python CLI named `arbite`.
 id: tic-a1b2
 title: Fix off-by-one in vertex normal calc
 status: open              # raw | open | in_progress | blocked | shelved | closed — mirrors folder
-type: bug                  # bug | feature | refactor | chore | memo | wish
+type: bug                  # bug | feature | request | refactor | chore | memo | wish
 tier: medium                # low | medium | high | frontier — agent capability tier required
 domain: mesh                 # what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io
 epic: mesh-pipeline          # larger initiative this ticket belongs to (optional); freeform label for filtering
@@ -189,14 +189,17 @@ Command name: `arbite`. Suggested commands to implement:
 - `arbite create [--priority N] [--epic E]` — create a new ticket in `open/`
   (priority is a numeric urgency index, lower = more urgent, optional; `--epic`
   groups it under a larger initiative)
-- `arbite raw <memo|feature|bug|wish> <message>` — quick-capture an
+- `arbite raw <memo|feature|request|bug|wish> <message>` — quick-capture an
   unclassified ticket with `status: raw` in `raw/` (not `open/`, so it never
   shows up in `arbite list next`); auto-grouped under the `classification`
   epic so triage/classification jobs can find it with `arbite list next
-  --epic classification`. A `wish` raw ticket is a wishlist item: its body
-  notes that wishlist items are to be reclassified as `feature`, classified
-  with the correct tags, description, analysis, and possible epic, then filed
-  in the `wishlist/` folder — not opened as work
+  --epic classification`. A `request` raw ticket is a request for a change
+  that is not necessarily a bug or a new feature, but a tweak or lateral
+  change to something that already exists; its body notes as much, and it is
+  ordinary work once classified (unlike a wish). A `wish` raw ticket is a
+  wishlist item: its body notes that wishlist items are to be reclassified as
+  `feature`, classified with the correct tags, description, analysis, and
+  possible epic, then filed in the `wishlist/` folder — not opened as work
 - `arbite fetch [type]` — pull the oldest raw ticket (`status: raw`,
   optionally filtered by `type`) and print it exactly like `arbite show`
   would (raw markdown, or `--json`), with a `derived_note` injected at the

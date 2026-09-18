@@ -85,6 +85,45 @@ def test_init_creates_the_file_layout_and_a_folder_aware_guide(cli, tmp_project)
     assert "## Where tickets live (the sink)" in guide
 
 
+def test_init_leaves_agent_docs_alone_without_the_flags(cli, tmp_project):
+    """Installing the block is opt-in: a plain `init` must not drop AGENTS.md or
+    CLAUDE.md into a project that never asked for them."""
+    cli("init")
+    assert not (tmp_project / "AGENTS.md").exists()
+    assert not (tmp_project / "CLAUDE.md").exists()
+
+
+def test_init_agents_doc_creates_then_leaves_the_block_alone(cli, tmp_project):
+    """`--agents-doc` writes a new AGENTS.md, and re-running `init` is idempotent:
+    the BEGIN/END demarkations stop a second block being stacked."""
+    output = cli("init", "--agents-doc").stdout
+    doc = (tmp_project / "AGENTS.md").read_text()
+    assert "created" in output and "AGENTS.md" in output
+    assert doc.startswith("<!-- BEGIN ARBITE INSTRUCTIONS -->")
+    assert doc.rstrip().endswith("<!-- END ARBITE INSTRUCTIONS -->")
+    assert "Arbite Ticketing System" in doc
+
+    again = cli("init", "--agents-doc").stdout
+    assert "already contains the arbite instructions block" in again
+    assert (tmp_project / "AGENTS.md").read_text() == doc
+
+
+def test_init_claude_doc_prepends_without_clobbering_the_file(cli, tmp_project):
+    """An existing CLAUDE.md keeps its contents; the block is prepended above them,
+    and the alias spelling `--claud-doc` is accepted too."""
+    original = "# Project notes\n\nKeep me.\n"
+    (tmp_project / "CLAUDE.md").write_text(original)
+    output = cli("init", "--claude-doc").stdout
+    doc = (tmp_project / "CLAUDE.md").read_text()
+    assert "prepended" in output
+    assert doc.startswith("<!-- BEGIN ARBITE INSTRUCTIONS -->")
+    assert doc.endswith(original)
+    assert doc.count("<!-- BEGIN ARBITE INSTRUCTIONS -->") == 1
+
+    assert "already contains" in cli("init", "--claud-doc").stdout
+    assert (tmp_project / "CLAUDE.md").read_text() == doc
+
+
 def test_init_with_the_sqlite_sink_creates_a_database_and_says_so(cli, tmp_project):
     output = cli("init", "--sink", "sqlite").stdout
     assert "sqlite sink ready" in output
@@ -307,6 +346,27 @@ def test_the_shortcuts_are_the_raw_command(cli, tmp_project):
     assert payload["type"] == "bug"
     assert payload["status"] == "raw"
     assert "the thing broke" in payload["body"]
+
+
+def test_a_request_is_a_raw_change_request(cli, tmp_project):
+    """`arbite request` is a first-class raw capture with its own type: a request for a
+    change, not necessarily a bug or a new feature, but a tweak or lateral change. It is
+    ordinary work once classified, so it opens/claims like any other ticket."""
+    cli("init")
+    tid = ticket_id(cli("request", "collapse the toolbar when scrolling").stdout)
+    payload = json.loads(cli("show", tid, "--json").stdout)
+    assert payload["type"] == "request"
+    assert payload["status"] == "raw"
+    assert payload["epic"] == "classification"
+    assert "collapse the toolbar when scrolling" in payload["body"]
+    assert "tweak or lateral change" in payload["body"]
+
+    # The long form is the same ticket, and a request is a valid type for `doctor`.
+    long_tid = ticket_id(cli("raw", "request", "collapse the toolbar when scrolling").stdout)
+    long_payload = json.loads(cli("show", long_tid, "--json").stdout)
+    assert long_payload["type"] == "request"
+    assert "tweak or lateral change" in long_payload["body"]
+    cli("doctor")
 
 
 # --- lifecycle over both sinks --------------------------------------------

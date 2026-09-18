@@ -31,9 +31,17 @@ from __future__ import annotations
 import argparse
 import re
 from datetime import date
+from pathlib import Path
 
 from . import __version__
-from .schema import CLASSIFICATION_EPIC, FIELD_ORDER, STATUSES, TIER_VALUES, TYPES
+from .schema import (
+    CLASSIFICATION_EPIC,
+    FIELD_ORDER,
+    RAW_TYPE_CHOICES,
+    STATUSES,
+    TIER_VALUES,
+    TYPES,
+)
 
 # ---------------------------------------------------------------------------
 # Help text shared with the CLI (single source of truth for both the real
@@ -64,6 +72,91 @@ MESSAGE_HELP = (
     "(joined with spaces if multiple words)"
 )
 
+# ---------------------------------------------------------------------------
+# The instructions block `arbite init --agents-doc` / `--claude-doc` installs
+# into a project's own AGENTS.md / CLAUDE.md.
+# ---------------------------------------------------------------------------
+
+# Markers delimit the block. They are the sole thing `install_instructions` looks
+# for, so a project may move, annotate or extend the block without `arbite init`
+# stacking a second copy on top of it.
+ARBITE_INSTRUCTIONS_BEGIN = "<!-- BEGIN ARBITE INSTRUCTIONS -->"
+ARBITE_INSTRUCTIONS_END = "<!-- END ARBITE INSTRUCTIONS -->"
+
+# The block is stored verbatim rather than read from AGENTS_EXAMPLE.md at runtime:
+# an installed arbite must not depend on the source tree it was built from. Keep it
+# byte-identical to the markdown block in AGENTS_EXAMPLE.md.
+ARBITE_INSTRUCTIONS_BLOCK = """\
+<!-- BEGIN ARBITE INSTRUCTIONS -->
+# Arbite Ticketing System
+
+## Ticketing
+Use arbite ticketing system for all tasks. See /.arbite/AGENTS.md. Create a ticket if required and claim the ticket before starting work.
+
+# Agent Identiy
+
+When claiming a ticket, please use an identity format like: "claude.opus-5.001" where the company.model.instance is your best educated guess unless otherwise specified.
+If orchestrating, let subagents know their identity and instance number.
+
+## Sole command: "Work Next|All <epic>"
+
+If your sole command is "Work Next" or "Work All", you can use the following commands to find the next arbite ticket(s):
+```bash
+arbite list next   # Show next workable ticket
+arbite list --topo --status open [--epic <epic>]
+```
+
+Note: If there are no tickets, see next command "Classify". If "Work All", try to orchestrate tickets if that is in your skill set, otherwise
+work in sequence until finished.
+
+## Sole command "Classify"
+
+If your sole command is "Classify" use the following command to list all tickets that require classification:
+```bash
+arbite list raw
+```
+
+Use your session to classify all tickets, looking deeper into the requirements, adding notes, etc until all raw tickets are classified.
+
+# Ticketing etiquette addendum
+
+In addition to etiquette specified in .arbite/AGENTS.md, please add to notes of ticket when closing a paragraph explaining what the user, QA, or other
+agents will be able to observe via integration testing, if any new effects will be observable.
+
+## Git
+By default and unless otherwise specified, check into main/master after closing a ticket.
+
+Do not modify this file without explicit permission.
+
+## Comment Protocol
+
+Do not fill the codebase with comments containing history, musings, or overly wordy explanations. Comments should be maximally useful and concise. Put long explanations and related context in Arbite tickets, and refer to the relevant ticket from a code comment when needed.
+<!-- END ARBITE INSTRUCTIONS -->"""
+
+
+def install_instructions(path: Path) -> str:
+    """Put the arbite instructions block into the agent doc at `path`.
+
+    Returns what it did, so `arbite init` can report it:
+
+    - 'created'  -- the file did not exist; it is written with the block alone;
+    - 'prepended' -- the file existed without the block; the block is prepended and
+      the existing contents are preserved below it;
+    - 'present'  -- the file already carries the block, so it is left untouched.
+
+    Idempotent by demarkation: re-running `arbite init` must never stack a second
+    copy, whatever else the file contains."""
+    if not path.exists():
+        path.write_text(ARBITE_INSTRUCTIONS_BLOCK + "\n", encoding="utf-8")
+        return "created"
+    existing = path.read_text(encoding="utf-8")
+    if ARBITE_INSTRUCTIONS_BEGIN in existing or ARBITE_INSTRUCTIONS_END in existing:
+        return "present"
+    path.write_text(
+        ARBITE_INSTRUCTIONS_BLOCK + "\n\n" + existing.lstrip("\n"), encoding="utf-8"
+    )
+    return "prepended"
+
 # Per-field descriptions for the frontmatter table, keyed by field name.
 # Interpolating the vocabulary constants keeps the doc honest about what the
 # CLI actually accepts.
@@ -74,8 +167,9 @@ FIELD_NOTES = {
     "unclassified, not workable, never offered by `list next` (see Triage). A file sink "
     "additionally keeps this in sync with the folder the ticket sits in",
     "type": f"{' | '.join(TYPES)} -- 'memo' (from `raw memo`) = update project notes/docs, not "
-    "code; 'wish' (from `raw wish`) = a wishlist item, reclassified as 'feature' and filed, "
-    "never worked",
+    "code; 'request' (from `raw request`) = a request for a change, not necessarily a bug or a "
+    "new feature but a tweak or lateral change -- ordinary work once classified; 'wish' (from "
+    "`raw wish`) = a wishlist item, reclassified as 'feature' and filed, never worked",
     "tier": f"{TIER_VALUES} -- the **agent capability tier** required to work the ticket: how "
     "capable the agent must be, ascending. The harness tells you your tier, or you self-assess "
     "from your model class (the company.model prefix of your agent id, e.g. claude.haiku sits "
@@ -430,6 +524,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("arbite list raw                                         # raw backlog as a todo list")
     add('arbite search --params title,body "LOD pop-in"          # find tickets by text')
     add('arbite raw feature "add per-mesh LOD"                   # quick capture; classify later')
+    add('arbite raw request "collapse the toolbar by default"     # a tweak/lateral change request')
     add('arbite raw wish "fly-through camera preview"            # capture a wish; file it later')
     add("arbite fetch [type]                                     # oldest raw ticket to classify")
     add("arbite move tic-a1b2 /wishlist                          # file a reclassified wish")
@@ -449,8 +544,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("```")
     add("")
     add(
-        "`arbite bug|feature|memo|wish <message>` == `arbite raw <type> <message>`: an identical raw "
-        "ticket from a shorter command. Any command takes `-h`/`--help`."
+        "`arbite bug|feature|request|memo|wish <message>` == `arbite raw <type> <message>`: an "
+        "identical raw ticket from a shorter command. Any command takes `-h`/`--help`."
     )
     add("")
 
@@ -517,15 +612,16 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("## Triage: raw tickets, wishes, filing, scaffolding")
     add("")
     add(
-        f"A **raw** ticket (`arbite raw <memo|feature|bug|wish> <message>`) is a deliberately "
-        f"unclassified quick capture: status `raw`, never returned by `arbite list next`. It sets "
-        f"only `type` plus a placeholder title (`<type> (raw): Requires Classification`), "
-        f"auto-groups the ticket under the `{CLASSIFICATION_EPIC}` epic (find them with "
-        f"`arbite list next --epic {CLASSIFICATION_EPIC}`), and its body lists what triage must "
-        f"fill in -- a real title, `tier`, `domain`, a real `epic`, `priority`, an expanded "
-        f"description -- before it can be claimed or worked; a `memo` is a request to update project "
-        f"notes/docs rather than change code. Raw tickets exist so a thought isn't lost, not as work: "
-        f"classify them before picking them up."
+        f"A **raw** ticket (`arbite raw <{'|'.join(RAW_TYPE_CHOICES)}> <message>`) is a "
+        f"deliberately unclassified quick capture: status `raw`, never returned by `arbite list "
+        f"next`. It sets only `type` plus a placeholder title (`<type> (raw): Requires "
+        f"Classification`), auto-groups the ticket under the `{CLASSIFICATION_EPIC}` epic (find "
+        f"them with `arbite list next --epic {CLASSIFICATION_EPIC}`), and its body lists what "
+        f"triage must fill in -- a real title, `tier`, `domain`, a real `epic`, `priority`, an "
+        f"expanded description -- before it can be claimed or worked; a `memo` is a request to "
+        f"update project notes/docs rather than change code, and a `request` is a request for a "
+        f"change that is not necessarily a bug or a new feature (a tweak or lateral change). Raw "
+        f"tickets exist so a thought isn't lost, not as work: classify them before picking them up."
     )
     add("")
     add(
@@ -548,6 +644,14 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "work: its body (and `fetch`'s `derived_note` for it) says to reclassify it as `feature`, "
         "with correct tags, an expanded description, an analysis of the request and a possible epic, "
         "then file it in the wishlist bucket -- never open or claim it as work."
+    )
+    add("")
+    add(
+        "A **request** raw ticket (`arbite request <message>` == `arbite raw request <message>`) is "
+        "a request for a change that is not necessarily a bug or a new feature -- a tweak or lateral "
+        "change to something that already exists (behaviour, UI, data or docs). Unlike a wish it is "
+        "ordinary work once classified: keep the type as `request`, and open or claim it like any "
+        "other raw ticket."
     )
     add("")
     add(
