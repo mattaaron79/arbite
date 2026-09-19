@@ -545,7 +545,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "capacity is recorded but not yet enforced. `arbite worker check <id> [--ticket T] "
         "[--require-capability CAP] [--local-only] [--max-cost N --max-cost-unit U]` explains "
         "eligibility with stable reason codes and writes nothing; an unknown value fails an "
-        "explicit constraint. Offers, packages and a job board are not available yet."
+        "explicit constraint. Offers are below; packages and a job board are not available yet."
     )
     add("")
 
@@ -569,6 +569,34 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "returns the tickets to open; releasing a quiescent reservation returns its open "
         "members to ad-hoc availability. `reserve show|list [--state] [--owner] [--ticket]` "
         "report members with their current status and active attempt. All take `--json`."
+    )
+    add("")
+
+    add("## Offers and direct assignments")
+    add("")
+    add(
+        "A publisher (for a reserved ticket: the reservation owner, which keeps its "
+        "reservation) makes an open, unassigned ticket available with `arbite offer publish T "
+        "--agent <owner>` (any eligible worker) or `arbite offer assign T --worker W --agent "
+        "<owner>` (only the named worker(s)). Requirements -- `--min-tier`, "
+        "`--require-capability`, `--local-only`, `--max-cost N --max-cost-unit U` -- are "
+        "enforced at acquisition and an unknown worker value fails them; `--prefer-local`, "
+        "`--prefer-low-cost` and `--prefer-worker` are hints only and never decide who wins: "
+        "the first eligible claimant does. Find work with `arbite offer list --worker <you>` "
+        "and accept it with `arbite offer claim OFFER --agent <you>`; plain `claim` and `list "
+        "next --claim` use the same offer. Acceptance starts your attempt and marks the offer "
+        "`accepted` in one step, so two workers never both get it -- a loser sees "
+        "`offer_conflict` (`details.reason` `not_published`) and should choose other work. "
+        "While an offer is published nobody it does not admit may acquire the ticket -- not "
+        "the owner, not with `--force` (`worker_ineligible`, reason `worker_not_allowed` for "
+        "someone else's assignment), and `set status in_progress` / `set assignee` refuse "
+        "with `ticket_offered`. `arbite offer withdraw OFFER --agent <publisher>` stops future "
+        "acceptance; an accepted offer refuses withdrawal (`accepted`) unless `--interrupt "
+        "--reason` interrupts the worker's attempt. The offer follows its ticket: `close` "
+        "completes it, and a release, takeover or unshelve that leaves the worker without the "
+        "ticket cancels it (the owner may "
+        "publish again). Releasing or removing reservation members withdraws their published "
+        "offers. `offer show OFFER [--worker W]` explains eligibility. All take `--json`."
     )
     add("")
 

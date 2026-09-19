@@ -21,24 +21,25 @@ Rules (see `.arbite/planning/multi-provider-job-board.md`):
   reserve-vs-claim resolves one way or the other: a claim that committed first
   makes the reservation refuse (`active_attempt_elsewhere`); a reservation that
   committed first makes the claim refuse (`ticket_reserved`).
-- **Who may acquire a member.** Only the owner, today. B03 offers/assignments
-  are the intended extension point (`acquisition_refusal`).
+- **Who may acquire a member.** The owner, or -- while a member has a published
+  offer (B03) -- exactly the workers that offer admits (`offers.acquisition_grant`
+  consults the offer first and falls back to `acquisition_refusal`).
 - **Release / remove.** Refused while an affected member has an active attempt
   (reason `active_attempts`), unless `interrupt=True` with a reason: each such
   attempt is then ended `interrupted` through the lifecycle (claims released,
   ticket back to open) before the reservation changes. Releasing a quiescent
-  reservation simply returns its open members to ad-hoc availability.
+  reservation withdraws its published offers (same transaction) and returns its
+  open members to ad-hoc availability; `remove` does the same for its members.
 - **Owner-only changes.** Membership changes and release need the owner's id,
   or an explicit administrative `force` with a reason (recorded).
 """
 
 from __future__ import annotations
 
-import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
-from . import schema, workers
+from . import workers
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
     WORKER_ID_PATTERN,
@@ -81,6 +82,8 @@ class ReservationChange:
     removed: List[str]
     interrupted: List[dict]
     excluded: List[dict]
+    #: Published offers withdrawn by this change (B03: release/remove).
+    withdrawn_offers: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +115,8 @@ def reservation_for(store, ticket_id: str) -> Optional[Reservation]:
 
 
 def may_acquire(reservation: Optional[Reservation], worker_id: str) -> bool:
-    """Whether `worker_id` may acquire a member of `reservation` directly.
-
-    Only the owner today; B03 offers/assignments extend this."""
+    """Whether `worker_id` may acquire a member of `reservation` directly
+    (without an offer). Offers are consulted first by `offers.acquisition_grant`."""
     return reservation is None or worker_id == reservation.owner
 
 
@@ -346,6 +348,8 @@ class ReservationService:
                 current = self._load_active(tx, reservation.id, stored.revision)
                 reservation = current.reservation
                 moment = self.now()
+                withdrawn = self._withdraw_offers(tx, wanted, reservation, agent, reason,
+                                                  moment, "removed from")
                 reservation.members = [t for t in reservation.members if t not in wanted]
                 reservation.updated = moment
                 tx.put(reservation, expect_revision=current.revision)
@@ -354,10 +358,11 @@ class ReservationService:
                     tx, "reservation_members_removed", reservation, revision, moment,
                     affected=wanted, reason=reason,
                     extra={"removed": wanted, "interrupted": interrupted,
+                           "withdrawn_offers": withdrawn,
                            "forced": self._forced(reservation, agent, force)},
                 )
         return ReservationChange(StoredReservation(reservation, revision), event, [], wanted,
-                                 interrupted, [])
+                                 interrupted, [], withdrawn)
 
     def release(
         self,
@@ -381,6 +386,8 @@ class ReservationService:
                 current = self._load_active(tx, reservation.id, stored.revision)
                 reservation = current.reservation
                 moment = self.now()
+                withdrawn = self._withdraw_offers(tx, reservation.members, reservation, agent,
+                                                  reason, moment, "released")
                 reservation.state = "released"
                 reservation.released = moment
                 reservation.released_by = agent
@@ -391,13 +398,23 @@ class ReservationService:
                 event = self._event(
                     tx, "reservation_released", reservation, revision, moment,
                     affected=list(reservation.members), reason=reason,
-                    extra={"interrupted": interrupted,
+                    extra={"interrupted": interrupted, "withdrawn_offers": withdrawn,
                            "forced": self._forced(reservation, agent, force)},
                 )
         return ReservationChange(StoredReservation(reservation, revision), event, [],
-                                 list(reservation.members), interrupted, [])
+                                 list(reservation.members), interrupted, [], withdrawn)
 
     # -- internals -------------------------------------------------------
+
+    def _withdraw_offers(self, tx, members, reservation, agent, reason, moment, how) -> List[str]:
+        """Withdraw published offers on `members` inside the reservation write."""
+        from . import offers  # offers imports this module
+
+        why = f"reservation {reservation.id} {how}" + (f": {_clean(reason)}" if _clean(reason) else "")
+        if how == "removed from":
+            why = f"ticket removed from reservation {reservation.id}" + (
+                f": {_clean(reason)}" if _clean(reason) else "")
+        return offers.withdraw_in_transaction(tx, members, actor=agent, reason=why, moment=moment)
 
     def _find(self, tx, reservation_id: str) -> Optional[StoredReservation]:
         record = tx.get("reservation", reservation_id)
@@ -518,6 +535,11 @@ class ReservationService:
         active = {}
         for attempt in tx.find("work_attempt", state="active"):
             active[attempt.ticket_id] = attempt
+        offered = {}
+        for offer in tx.find("offer"):
+            if offer.is_live:
+                for ticket in offer.tickets:
+                    offered.setdefault(ticket, offer)
         conflicts = []
         for ticket_id, ticket in snapshots.items():
             other = held.get(ticket_id)
@@ -540,6 +562,12 @@ class ReservationService:
                 conflicts.append({
                     "ticket_id": ticket_id, "reason": "assigned_elsewhere",
                     "assignee": ticket.assignee, "status": ticket.status,
+                })
+            elif ticket_id in offered and offered[ticket_id].publisher != owner:
+                offer = offered[ticket_id]
+                conflicts.append({
+                    "ticket_id": ticket_id, "reason": "offered_elsewhere",
+                    "offer_id": offer.id, "publisher": offer.publisher, "state": offer.state,
                 })
         if conflicts:
             raise self._unavailable(conflicts)
@@ -580,19 +608,10 @@ class ReservationService:
                          "active": listing},
             )
         for attempt in busy:
-            ticket = self.tickets.get(attempt.ticket_id, unique=True)
-            before = copy.deepcopy(ticket)
-            schema.append_note(
-                ticket, agent,
-                f"Attempt {attempt.id} ({attempt.worker_id}) interrupted by reservation "
-                f"{reservation.id}: {reason}",
-            )
-            ticket.assignee = None
-            ticket.blocked_by = None
-            ticket.status = "open"
-            ticket.updated = schema.now()
-            self.lifecycle.commit_transition(
-                "release", ticket, previous=before, end=attempt, end_state="interrupted",
+            self.lifecycle.interrupt_attempt(
+                attempt, agent=agent,
+                note=f"Attempt {attempt.id} ({attempt.worker_id}) interrupted by reservation "
+                     f"{reservation.id}: {reason}",
                 reason=f"reservation {reservation.id}: {reason}",
             )
         return listing

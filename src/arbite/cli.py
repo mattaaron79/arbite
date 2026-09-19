@@ -42,6 +42,7 @@ from . import (
     filereads,
     graph,
     lifecycle,
+    offers,
     reservations,
     schema,
     workers,
@@ -735,20 +736,39 @@ def _cmd_list_next(args, sink, every):
     )
     candidates = [t for t in candidates if graph.is_workable(t, by_id)]
 
-    # Members of an active reservation are only for their owner (B02): a plain
-    # listing has no worker identity, so it leaves them out; --claim W keeps W's.
-    held = reservations.active_reservations(sink.coordination())
-    reserved = [
+    # Offered (B03) and reserved (B02) tickets are only for the workers their
+    # offer admits / their owner: a plain listing has no worker identity, so it
+    # leaves them out; --claim W keeps the ones W could acquire (acquire()
+    # re-checks under the lock).
+    store = sink.coordination()
+    held = reservations.active_reservations(store)
+    offered = offers.published_offers(store)
+    picker = None
+    if args.claim:
+        picker = workers.declaration_for(store, args.claim, declared_tier=args.tier)
+    excluded = [
         t for t in candidates
-        if t.id in held and not (args.claim and reservations.may_acquire(held[t.id], args.claim))
+        if not offers.may_pick(t.id, args.claim, picker, published=offered, held=held)
     ]
-    if reserved:
-        candidates = [t for t in candidates if t not in reserved]
-        print(
-            f"note: skipped {len(reserved)} workable ticket(s) held by reservations "
-            f"({', '.join(sorted({held[t.id].id for t in reserved}))}); see 'arbite reserve list'",
-            file=sys.stderr,
-        )
+    if excluded:
+        candidates = [t for t in candidates if t not in excluded]
+        by_offer = [t for t in excluded if t.id in offered]
+        by_reservation = [t for t in excluded if t.id not in offered]
+        if by_offer:
+            print(
+                f"note: skipped {len(by_offer)} workable ticket(s) with offers/assignments "
+                f"{'this worker is not eligible for' if args.claim else '(give --claim W)'}"
+                f" ({', '.join(sorted(offered[t.id].offer.id for t in by_offer))}); see "
+                "'arbite offer list'",
+                file=sys.stderr,
+            )
+        if by_reservation:
+            print(
+                f"note: skipped {len(by_reservation)} workable ticket(s) held by reservations "
+                f"({', '.join(sorted({held[t.id].id for t in by_reservation}))}); see "
+                "'arbite reserve list'",
+                file=sys.stderr,
+            )
 
     if not candidates:
         # "Nothing is ready" and "everything is deadlocked" look identical from
@@ -979,8 +999,10 @@ def cmd_claim(args):
             schema.append_note(taken, args.agent, f"Claim taken over from {previous} (--force).")
             taken.updated = schema.now()
             sink.update(taken, expect=expect)
-            result = lifecycle.AcquisitionResult(taken, result.attempt, True, True)
-    print(f"claimed {result.ticket.id} for {args.agent} -> {sink.location(result.ticket.id)}")
+            result = lifecycle.AcquisitionResult(taken, result.attempt, True, True,
+                                                 offer_id=result.offer_id)
+    via = f" (accepted offer {result.offer_id})" if result.offer_id else ""
+    print(f"claimed {result.ticket.id} for {args.agent}{via} -> {sink.location(result.ticket.id)}")
 
 
 def cmd_release(args):
@@ -2019,6 +2041,7 @@ _EXPORT_COORDINATION_COUNT_KEYS = (
     "lifecycle_intents",
     "worker_profiles",
     "reservations",
+    "offers",
     "events",
     "artifacts",
 )
@@ -3237,12 +3260,205 @@ def _run_reserve_command(args, sink) -> None:
             headline += "; interrupted " + ", ".join(
                 f"{i['ticket_id']} ({i['worker_id']})" for i in change.interrupted
             )
+        if change.withdrawn_offers:
+            headline += "; withdrew offer(s) " + ", ".join(change.withdrawn_offers)
         _emit_reservation(args, service, change.stored,
-                          extra={"removed": change.removed, "interrupted": change.interrupted},
+                          extra={"removed": change.removed, "interrupted": change.interrupted,
+                                 "withdrawn_offers": change.withdrawn_offers},
                           headline=headline)
         return
 
     raise TicketError(f"unknown reserve command {command!r}")
+
+
+# --- offers and direct assignments (multi-provider job board, B03) ----------
+
+
+def _offer_service(args, sink) -> "offers.OfferService":
+    _worker_store(sink)
+    agent = getattr(args, "agent", None)
+    return offers.OfferService(_lifecycle(args, sink, agent=agent), actor=agent)
+
+
+def _offer_lines(view: dict) -> list:
+    who = (f"assigned to {', '.join(view['allowed_workers'])}" if view["mode"] == "assigned"
+           else "public")
+    lines = [
+        f"offer {view['id']} [{view['state']}] {who} revision {view['revision']}",
+        f"  publisher: {view['publisher']}"
+        + (f"  reservation: {view['reservation_id']}" if view.get("reservation_id") else ""),
+    ]
+    for target in view.get("ticket_status") or []:
+        assignee = f" @{target['assignee']}" if target.get("assignee") else ""
+        lines.append(f"  ticket {target['ticket_id']} [{target.get('status')}]{assignee} "
+                     f"{target.get('title') or ''}".rstrip())
+    req = view.get("requirements") or {}
+    parts = []
+    if req.get("min_tier"):
+        parts.append(f"tier>={req['min_tier']}")
+    if req.get("capabilities"):
+        parts.append("capabilities " + ",".join(req["capabilities"]))
+    if req.get("local_only"):
+        parts.append("local only")
+    if req.get("max_cost"):
+        parts.append(f"cost<={req['max_cost']['amount']} {req['max_cost']['unit']}")
+    lines.append("  requirements (enforced): " + ("; ".join(parts) or "none beyond the ticket tier"))
+    prefs = view.get("preferences") or {}
+    hints = [k.replace("_", " ") for k in ("prefer_local", "prefer_low_cost") if prefs.get(k)]
+    if prefs.get("prefer_workers"):
+        hints.append("prefer " + ",".join(prefs["prefer_workers"]))
+    if hints:
+        lines.append("  preferences (hints, NOT enforced): " + "; ".join(hints))
+    if view.get("accepted_by"):
+        lines.append(f"  accepted by {view['accepted_by']} at {view['accepted_at']} "
+                     f"(attempt {view['attempt_id']})")
+    if view.get("ended_at"):
+        lines.append(f"  ended {view['ended_at']} by {view.get('ended_by')}: "
+                     f"{view.get('end_reason') or ''}".rstrip())
+    if view.get("note"):
+        lines.append(f"  note: {view['note']}")
+    verdict = view.get("eligibility")
+    if verdict is not None:
+        worker = verdict["worker"]["worker_id"]
+        lines.append(f"  {worker}: {'eligible' if verdict['eligible'] else 'NOT eligible'}")
+        for reason in verdict["reasons"]:
+            lines.append(f"    refused [{reason['code']}]: {reason['message']}")
+    lines.append(f"  ({offers.OFFER_NOTICE})")
+    return lines
+
+
+def _emit_offer(args, service, stored, *, extra=None, headline=None, worker=None) -> None:
+    view = service.view(stored, worker=worker)
+    if getattr(args, "json", False):
+        payload = {"offer": view, "notice": offers.OFFER_NOTICE}
+        payload.update(extra or {})
+        _print_json(coordination.ok_result(payload))
+        return
+    if headline:
+        print(headline)
+    for line in _offer_lines(view):
+        print(line)
+
+
+def _offer_requirements(args) -> dict:
+    if args.max_cost is not None and not args.max_cost_unit:
+        raise TicketError("--max-cost needs --max-cost-unit (costs are never unit-less)")
+    return offers.build_requirements(
+        min_tier=args.min_tier,
+        capabilities=args.require_capability or (),
+        local_only=args.local_only,
+        max_cost=({"amount": args.max_cost, "unit": args.max_cost_unit}
+                  if args.max_cost is not None else None),
+    )
+
+
+def cmd_offer(args):
+    """Offers and direct assignments: let workers pick up (reserved) tickets
+    through the store, accepting atomically with the attempt they start."""
+    sink = _require_sink(args)
+    try:
+        _run_offer_command(args, sink)
+    except CoordinationError as error:
+        _file_error(args, error)
+
+
+def _run_offer_command(args, sink) -> None:
+    command = args.offer_command
+    service = _offer_service(args, sink)
+
+    if command in ("publish", "assign"):
+        change = service.publish(
+            args.ticket,
+            agent=args.agent,
+            mode="assigned" if command == "assign" else "public",
+            allowed_workers=args.worker if command == "assign" else (),
+            requirements=_offer_requirements(args),
+            preferences=offers.build_preferences(
+                prefer_local=args.prefer_local, prefer_low_cost=args.prefer_low_cost,
+                prefer_workers=args.prefer_worker or (),
+            ),
+            note=args.note, force=args.force, reason=args.reason,
+        )
+        offer = change.stored.offer
+        extra = {}
+        if command == "assign":
+            # Informational: eligibility is decided at acquisition, not here.
+            extra["assignee_eligibility"] = [
+                service.view(change.stored, worker=w)["eligibility"] for w in offer.allowed_workers
+            ]
+        what = (f"assigned {offer.tickets[0]} to {', '.join(offer.allowed_workers)}"
+                if command == "assign" else f"published {offer.tickets[0]}")
+        _emit_offer(args, service, change.stored, extra=extra,
+                    headline=f"{what} as offer {offer.id}")
+        if command == "assign" and not args.json:
+            for verdict in extra["assignee_eligibility"]:
+                if not verdict["eligible"]:
+                    print(f"warning: {verdict['worker']['worker_id']} is not currently eligible "
+                          "(see reasons with 'arbite offer show --worker')", file=sys.stderr)
+        return
+
+    if command == "show":
+        _emit_offer(args, service, service.get(args.offer), worker=args.worker)
+        return
+
+    if command == "list":
+        ticket = sink.get(args.ticket, unique=True).id if args.ticket else None
+        rows = service.list(state=args.state, ticket=ticket, reservation=args.reservation,
+                            worker=args.worker, declared_tier=args.tier)
+        if args.json:
+            _print_json(coordination.ok_result({
+                "offers": [service.view(row, worker=args.worker) for row in rows],
+                "count": len(rows),
+                "notice": offers.OFFER_NOTICE,
+            }))
+        elif rows:
+            print(f"{'OFFER':<22} {'STATE':<10} {'MODE':<9} {'TICKET':<10} {'REV':>3}  WHO")
+            for row in rows:
+                o = row.offer
+                who = ", ".join(o.allowed_workers) if o.mode == "assigned" else "any eligible"
+                if o.accepted_by:
+                    who = f"accepted by {o.accepted_by}"
+                print(f"{o.id:<22} {o.state:<10} {o.mode:<9} {o.tickets[0]:<10} "
+                      f"{row.revision:>3}  {who}")
+        else:
+            print("no offers match")
+        if not rows:
+            sys.exit(EXIT_EMPTY)
+        return
+
+    if command == "withdraw":
+        change = service.withdraw(
+            args.offer, agent=args.agent, reason=args.reason, force=args.force,
+            interrupt=args.interrupt, expect_revision=args.expect_revision,
+        )
+        headline = f"withdrew {args.offer}"
+        if change.interrupted:
+            headline = f"cancelled {args.offer}; interrupted " + ", ".join(
+                f"{i['ticket_id']} ({i['worker_id']})" for i in change.interrupted
+            )
+        elif change.stored.offer.state == "cancelled":
+            headline = f"cancelled {args.offer}"
+        _emit_offer(args, service, change.stored, extra={"interrupted": change.interrupted},
+                    headline=headline)
+        return
+
+    if command == "claim":
+        result, stored = service.claim(args.offer, worker_id=args.agent, declared_tier=args.tier)
+        if args.json:
+            payload = {
+                "offer": service.view(stored),
+                "ticket_id": result.ticket.id,
+                "attempt_id": result.attempt.id,
+                "worker_id": args.agent,
+                "notice": offers.OFFER_NOTICE,
+            }
+            _print_json(coordination.ok_result(payload))
+            return
+        print(f"claimed {result.ticket.id} for {args.agent} (accepted offer {args.offer}, "
+              f"attempt {result.attempt.id}) -> {sink.location(result.ticket.id)}")
+        return
+
+    raise TicketError(f"unknown offer command {command!r}")
 
 
 def build_parser():
@@ -4584,8 +4800,9 @@ def build_parser():
         "attempts by other workers and tickets assigned to someone else. Tickets "
         "added to an epic later are not included until 'reserve add'. Remove and "
         "release refuse while an affected member has an active attempt, unless "
-        "--interrupt --reason ends those attempts (ticket back to open). Offers and "
-        "assignments to other workers come later (B03).",
+        "--interrupt --reason ends those attempts (ticket back to open). The owner lets "
+        "other workers pick up members with 'arbite offer publish|assign'; release/remove "
+        "withdraw those offers.",
     )
     reserve_sub = p_reserve.add_subparsers(dest="reserve_command", required=True)
 
@@ -4653,6 +4870,114 @@ def build_parser():
     p_r_release.add_argument("reservation", metavar="RESERVATION")
     reserve_change_flags(p_r_release, interrupt=True)
     reserve_common(p_r_release)
+
+    p_offer = sub.add_parser(
+        "offer",
+        help="publish, assign, list, show, withdraw or claim offers",
+        description="An offer lets workers pick up a ticket directly through the store; "
+        "a reservation owner keeps its reservation while offering members. 'publish' makes "
+        "a public offer (any worker meeting the requirements), 'assign' a direct assignment "
+        "(only the named workers). Requirements (--min-tier, --require-capability, "
+        "--local-only, --max-cost) are enforced at acquisition with unknown worker data "
+        "failing; preferences (--prefer-*) are hints only -- the first eligible claimant "
+        "wins. Workers accept with 'offer claim' (plain 'claim' and 'list next --claim' use "
+        "the same offer): acceptance starts the attempt and advances the offer atomically, "
+        "so two workers cannot both accept. While an offer is published nobody else -- "
+        "the owner included, with or without --force -- may acquire the ticket. Withdrawal "
+        "of an accepted offer is refused unless --interrupt --reason. Releasing the "
+        "reservation withdraws its offers; closing the ticket completes an accepted offer.",
+    )
+    offer_sub = p_offer.add_subparsers(dest="offer_command", required=True)
+
+    def offer_common(parser_):
+        _json_flag(parser_)
+        _sink_flag(parser_)
+        parser_.set_defaults(func=cmd_offer)
+
+    def offer_publish_flags(parser_):
+        parser_.add_argument("ticket", metavar="TICKET", help="the open ticket to offer")
+        parser_.add_argument("--agent", required=True,
+                             help="publisher (the reservation owner for a reserved ticket)")
+        parser_.add_argument("--min-tier", choices=TIERS, default=None,
+                             help="required minimum worker tier (unknown tier fails)")
+        parser_.add_argument("--require-capability", action="append", default=None,
+                             metavar="CAP", help="required capability (repeatable/comma-separated)")
+        parser_.add_argument("--local-only", action="store_true", help="require local execution")
+        parser_.add_argument("--max-cost", type=float, default=None, metavar="N",
+                             help="cost ceiling amount (needs --max-cost-unit)")
+        parser_.add_argument("--max-cost-unit", default=None, metavar="UNIT",
+                             help="unit of --max-cost; never converted")
+        parser_.add_argument("--prefer-local", action="store_true",
+                             help="hint only: prefer local workers (not enforced)")
+        parser_.add_argument("--prefer-low-cost", action="store_true",
+                             help="hint only: prefer low-cost workers (not enforced)")
+        parser_.add_argument("--prefer-worker", action="append", default=None, metavar="W",
+                             help="hint only: preferred worker id (not enforced)")
+        parser_.add_argument("--note", default=None, help="optional note")
+        parser_.add_argument("--force", action="store_true",
+                             help="administrative publish by a non-owner (needs --reason)")
+        parser_.add_argument("--reason", default=None, metavar="TEXT", help="why (recorded)")
+
+    p_o_publish = offer_sub.add_parser(
+        "publish", help="publish a public offer over one ticket",
+    )
+    offer_publish_flags(p_o_publish)
+    offer_common(p_o_publish)
+
+    p_o_assign = offer_sub.add_parser(
+        "assign", help="directly assign one ticket to named worker(s)",
+        description="A direct assignment: only the --worker ids may accept it (plain claim "
+        "included); other requirements still apply.",
+    )
+    offer_publish_flags(p_o_assign)
+    p_o_assign.add_argument("--worker", action="append", required=True, metavar="W",
+                            help="the assigned worker (repeatable)")
+    offer_common(p_o_assign)
+
+    p_o_list = offer_sub.add_parser("list", help="list offers (exit 2 when none)")
+    p_o_list.add_argument("--state", choices=offers.STATE_FILTERS, default="live",
+                          help="published/accepted/withdrawn/completed/cancelled, live "
+                          "(published+accepted, default) or all")
+    p_o_list.add_argument("--ticket", default=None, help="only offers for this ticket")
+    p_o_list.add_argument("--reservation", default=None, help="only offers under this reservation")
+    p_o_list.add_argument("--worker", default=None, metavar="W",
+                          help="only published offers W is eligible to accept now")
+    p_o_list.add_argument("--tier", choices=TIERS, default=None,
+                          help="W's per-call declared tier (may not exceed its profile)")
+    offer_common(p_o_list)
+
+    p_o_show = offer_sub.add_parser("show", help="show one offer")
+    p_o_show.add_argument("offer", metavar="OFFER", help="offer id (off-...)")
+    p_o_show.add_argument("--worker", default=None, metavar="W",
+                          help="also explain whether W is eligible")
+    offer_common(p_o_show)
+
+    p_o_withdraw = offer_sub.add_parser(
+        "withdraw", help="withdraw an unaccepted offer",
+        description="Withdraw a published offer so it can no longer be accepted. An "
+        "accepted offer is refused (reason accepted) unless --interrupt --reason interrupts "
+        "the worker's attempt (ticket back to open; the offer is cancelled).",
+    )
+    p_o_withdraw.add_argument("offer", metavar="OFFER")
+    p_o_withdraw.add_argument("--agent", required=True,
+                              help="the publisher or reservation owner (else --force)")
+    p_o_withdraw.add_argument("--reason", default=None, metavar="TEXT", help="why (recorded)")
+    p_o_withdraw.add_argument("--force", action="store_true",
+                              help="administrative withdrawal by someone else (needs --reason)")
+    p_o_withdraw.add_argument("--interrupt", action="store_true",
+                              help="interrupt the accepting worker's attempt (needs --reason)")
+    p_o_withdraw.add_argument("--expect-revision", type=int, default=None, metavar="N",
+                              help="refuse unless the offer is at this revision")
+    offer_common(p_o_withdraw)
+
+    p_o_claim = offer_sub.add_parser(
+        "claim", help="accept an offer: claim its ticket and start the attempt",
+    )
+    p_o_claim.add_argument("offer", metavar="OFFER")
+    p_o_claim.add_argument("--agent", required=True, help="the accepting worker")
+    p_o_claim.add_argument("--tier", choices=TIERS, default=None,
+                           help="per-call declared tier (may not exceed a registered profile)")
+    offer_common(p_o_claim)
 
     p_changes = sub.add_parser(
         "changes",

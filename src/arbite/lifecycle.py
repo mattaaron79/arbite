@@ -135,7 +135,7 @@ import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from . import coordination, eligibility, errors, graph, reservations, schema, workers
+from . import coordination, eligibility, errors, graph, offers, reservations, schema, workers
 from .application import Actor, CoordinationService, require_active_attempt
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
@@ -251,6 +251,8 @@ class AcquisitionResult:
     attempt: WorkAttempt
     created_attempt: bool
     took_over: bool
+    #: The offer this acquisition accepted (B03), if any.
+    offer_id: Optional[str] = None
 
 
 def require_claimable(
@@ -618,6 +620,23 @@ class TicketLifecycle:
                 ticket_id=ticket_id, reason=reason, transaction=tx
             )
 
+    def interrupt_attempt(self, attempt: WorkAttempt, *, agent: str, note: str, reason: str) -> None:
+        """Explicit administrative interruption of `attempt` (B02/B03): the ticket
+        goes back to open and unassigned through a journaled `release`
+        transition, which ends the attempt `interrupted` and releases its claims.
+        Callers hold `locked()` and have already required a reason."""
+        ticket = self.tickets.get(attempt.ticket_id, unique=True)
+        before = copy.deepcopy(ticket)
+        schema.append_note(ticket, agent, note)
+        ticket.assignee = None
+        ticket.blocked_by = None
+        ticket.status = "open"
+        ticket.updated = schema.now()
+        self.commit_transition(
+            "release", ticket, previous=before, end=attempt, end_state="interrupted",
+            reason=reason,
+        )
+
     def require_deletable(self, ticket: Ticket) -> None:
         """Refuse a destructive delete that would bypass cleanup or lose history.
 
@@ -629,6 +648,15 @@ class TicketLifecycle:
         the ticket row is removed (`arbite close` archives it instead). `--force`
         overrides neither rule; there is no backdoor through force.
         """
+        live = offers.live_offer_for(self.coordination.store, ticket.id)
+        if live is not None:
+            raise errors.TicketOffered(
+                f"ticket {ticket.id} is the target of {live.offer.state} offer "
+                f"{live.offer.id}; withdraw it (arbite offer withdraw) or close the ticket "
+                "instead of deleting it",
+                details={"ticket_id": ticket.id, "offer_id": live.offer.id,
+                         "state": live.offer.state},
+            )
         reservation = reservations.reservation_for(self.coordination.store, ticket.id)
         if reservation is not None:
             raise TicketError(
@@ -730,6 +758,7 @@ class TicketLifecycle:
         takeover: bool = False,
         reason: Optional[str] = None,
         declared_tier: Optional[str] = None,
+        offer_id: Optional[str] = None,
     ) -> AcquisitionResult:
         """Acquire `ticket` for `worker_id`, recording exactly one active attempt.
 
@@ -746,6 +775,12 @@ class TicketLifecycle:
 
         Reservations (B02) are enforced here too: a member of an active
         reservation may be acquired only by its owner (`reservations.may_acquire`).
+
+        Offers (B03): when the ticket has a published offer, only workers passing
+        the offer's restricted requirements may acquire it (owner included), and
+        the acquisition accepts that offer in the same cascade transaction that
+        stores the attempt (`offers.acquisition_grant` / `sync_in_transaction`).
+        `offer_id` (from `arbite offer claim`) must name that published offer.
         """
         # Settle any transition a crash left behind, then re-read from the sink:
         # the caller's copy may be stale, and the compare-and-swap below must
@@ -759,9 +794,12 @@ class TicketLifecycle:
             if attempt.is_active and (active is None or attempt.generation > active.generation):
                 active = attempt
 
-        # A reservation (B02) restricts who may acquire, for every origin:
-        # neither --adopt nor --force lets a non-owner past it.
-        reservations.require_acquirable(self.coordination.store, current.id, worker_id)
+        # A published offer (B03) or else a reservation (B02) restricts who may
+        # acquire, for every origin: neither --adopt nor --force gets past it.
+        grant = offers.acquisition_grant(
+            self.coordination.store, current.id, worker_id,
+            offer_id=offer_id, declared_tier=declared_tier,
+        )
 
         if adopt and takeover:
             raise TicketError(
@@ -912,6 +950,7 @@ class TicketLifecycle:
                 supersede=active,
                 origin=origin,
                 reason=reason,
+                offer_acceptance=offers.acceptance_for(grant, worker_id),
             )
         except Conflict as e:
             raise CoordinationConflict(
@@ -926,6 +965,7 @@ class TicketLifecycle:
             attempt=attempt,
             created_attempt=True,
             took_over=bool((takeover and active is not None) or legacy_takeover),
+            offer_id=grant.offer.id if grant is not None else None,
         )
 
     def worker_declaration(
@@ -1052,6 +1092,7 @@ class TicketLifecycle:
         handoff: Optional[str] = None,
         sweep_ticket_claims: bool = False,
         events: Sequence[Event] = (),
+        offer_acceptance: Optional[dict] = None,
     ) -> LifecycleIntent:
         """Write `ticket` and apply its coordination cascade as one recoverable unit.
 
@@ -1061,7 +1102,9 @@ class TicketLifecycle:
         ends an active attempt in `end_state` (releasing its claims), `supersede`
         interrupts a taken-over attempt, `start` stores a new attempt, `touch`
         records activity, `sweep_ticket_claims` releases any claim still held for
-        the ticket, and `events` are appended with it.
+        the ticket, and `events` are appended with it. `offer_acceptance` (B03)
+        accepts an offer together with `start`; every cascade also advances the
+        ticket's live offers (`offers.sync_in_transaction`).
 
         See the module docstring for the protocol. Raises the ticket store's
         `Conflict` when the ticket changed since `previous` was read (nothing is
@@ -1108,6 +1151,7 @@ class TicketLifecycle:
             handoff=handoff,
             sweep_ticket_claims=bool(sweep_ticket_claims),
             events=[event.to_dict() for event in events],
+            offer_acceptance=dict(offer_acceptance) if offer_acceptance else None,
         )
         problems = intent.validate()
         if problems:
@@ -1363,6 +1407,11 @@ class TicketLifecycle:
         for data in intent.events:
             tx.append_event(Event.from_dict(data))
 
+        # Offers follow the ticket (complete on close, cancel when the accepting
+        # worker lets go) and an acquisition's offer is accepted here, atomically
+        # with the attempt stored above.
+        offers.sync_in_transaction(tx, intent, moment)
+
         intent.state = "completed"
         intent.updated = moment
         tx.put(intent)
@@ -1538,6 +1587,8 @@ class TicketLifecycle:
         field edits; on a member of an active reservation they would bypass the
         reservation, so `in_progress` is refused (use `arbite claim`) and an
         assignee other than the owner (or clearing it) is refused."""
+        offers.edit_refusal(self.coordination.store, ticket,
+                            new_status=new_status, new_assignee=new_assignee)
         reservation = reservations.reservation_for(self.coordination.store, ticket.id)
         if reservation is None:
             return

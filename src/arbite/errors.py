@@ -134,6 +134,13 @@ class ErrorCode:
     #: A reservation operation was refused; `details["reason"]` says why
     #: (`members_unavailable`, `active_attempts`, `not_owner`, `not_active`, ...).
     RESERVATION_CONFLICT = "reservation_conflict"
+    #: An offer operation (publish/assign/withdraw/claim) was refused;
+    #: `details["reason"]` says why (`not_published`, `accepted`, `already_offered`,
+    #: `not_publisher`, `ticket_unavailable`, ...). Nothing was written (B03).
+    OFFER_CONFLICT = "offer_conflict"
+    #: A field edit or delete would bypass a live offer/assignment on the ticket
+    #: (B03). `details` names the offer; acquire it with `arbite offer claim`.
+    TICKET_OFFERED = "ticket_offered"
 
 
 class CoordinationError(ArbiteError):
@@ -347,3 +354,18 @@ class ReservationConflict(CoordinationError):
     written: reservation changes are all-or-nothing."""
 
     error_code = ErrorCode.RESERVATION_CONFLICT
+
+
+class OfferConflict(CoordinationError):
+    """An offer operation was refused as a whole (B03). `details["reason"]` is a
+    stable code; nothing was written. A caller should re-read the offer (`arbite
+    offer show`) and choose other work or a different operation."""
+
+    error_code = ErrorCode.OFFER_CONFLICT
+
+
+class TicketOffered(CoordinationError):
+    """A `set`/`delete` would bypass a live offer or direct assignment (B03).
+    Nothing was written; acquire through the offer or withdraw it first."""
+
+    error_code = ErrorCode.TICKET_OFFERED

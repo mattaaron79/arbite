@@ -34,6 +34,9 @@ Records introduced here (planning key C01, slice 1 of
 - `Reservation` -- a coordinator's hold over an explicit set of ticket ids
   (planning key B02). It restricts who may *acquire* its members; it never
   creates an attempt or moves a ticket. Operations live in `arbite.reservations`.
+- `Offer` -- a public offer or direct assignment over a ticket (planning key
+  B03). Accepting it happens inside ticket acquisition; operations live in
+  `arbite.offers`.
 - `LifecycleIntent` -- the durable journal entry joining a ticket transition to
   its coordination cascade (attempt start/end, claim release, events). The ticket
   store and the coordination store commit separately, so the intent is what lets
@@ -143,7 +146,7 @@ OPERATION_RESULTS = ["ok", "error"]
 
 #: Event categories. `read` is a separate category so a high-volume read stream
 #: does not flood ordinary lifecycle/operation queries.
-EVENT_CATEGORIES = ["lifecycle", "operation", "claim", "read", "worker", "reservation"]
+EVENT_CATEGORIES = ["lifecycle", "operation", "claim", "read", "worker", "reservation", "offer"]
 
 #: Event kinds. Every event is one of these; `operation_recorded` is the generic
 #: carrier for a receipt, and the rest name the transitions later slices add.
@@ -187,6 +190,14 @@ EVENT_KINDS = [
     "reservation_members_added",
     "reservation_members_removed",
     "reservation_released",
+    #: Offers and direct assignments (planning key B03), category `offer`.
+    #: `offer_accepted` commits with the attempt it starts; `offer_completed` /
+    #: `offer_cancelled` commit with the ticket transition that caused them.
+    "offer_published",
+    "offer_withdrawn",
+    "offer_accepted",
+    "offer_completed",
+    "offer_cancelled",
 ]
 
 #: Recovery outcomes for an incomplete operation. `applied` and `reverted` are
@@ -229,6 +240,28 @@ RESERVATION_STATES = ["active", "released"]
 #: How a reservation's membership was resolved at creation: an explicit ticket
 #: list, or a one-time snapshot of an epic (later epic tickets are not included).
 RESERVATION_SOURCES = ["tickets", "epic"]
+
+#: Offer states (planning key B03). `published` is the only state that grants
+#: acquisition; `accepted` is bound to the worker whose attempt it started;
+#: `withdrawn`, `completed` and `cancelled` are terminal history.
+OFFER_STATES = ["published", "accepted", "withdrawn", "completed", "cancelled"]
+
+#: Offer states that still hold the ticket (at most one per ticket).
+OFFER_LIVE_STATES = ["published", "accepted"]
+
+#: `public`: any worker meeting the requirements may accept. `assigned`: only
+#: the named `allowed_workers` may (a direct assignment).
+OFFER_MODES = ["public", "assigned"]
+
+#: What an offer covers. Only single tickets today; B04 adds ordered packages
+#: (`tickets` already holds an ordered list for that reason).
+OFFER_TARGET_KINDS = ["ticket"]
+
+#: Requirement keys an offer may carry (hard constraints, see `eligibility`).
+OFFER_REQUIREMENT_KEYS = ("min_tier", "capabilities", "local_only", "max_cost")
+
+#: Preference keys (hints only, never enforced, never a winner guarantee).
+OFFER_PREFERENCE_KEYS = ("prefer_local", "prefer_low_cost", "prefer_workers")
 
 #: Worker ids are self-declared names (`claude.opus-5.002`), not opaque ids.
 WORKER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$")
@@ -288,6 +321,7 @@ ID_PREFIXES = {
     "lifecycle_intent": "lci",
     "worker_profile": "wkr",
     "reservation": "rsv",
+    "offer": "off",
 }
 
 #: Opaque ids are `<prefix>-<16 hex chars>` (8 random bytes). Short enough to
@@ -1048,6 +1082,10 @@ class LifecycleIntent(_Record):
     handoff: Optional[str] = None
     sweep_ticket_claims: bool = False
     events: List[Dict[str, Any]] = field(default_factory=list)
+    #: B03: `{"offer_id", "worker_id", "expected_revision"}` when this acquisition
+    #: accepts an offer; the cascade advances the offer in the same transaction
+    #: that stores `start_attempt`, so acceptance and attempt commit together.
+    offer_acceptance: Optional[Dict[str, Any]] = None
     state: str = "pending"
     detail: Optional[str] = None
     contract_version: int = CONTRACT_VERSION
@@ -1214,6 +1252,58 @@ class Reservation(_Record):
         return self.state == "active"
 
 
+@dataclass
+class Offer(_Record):
+    """Work a coordinator makes available for pickup (planning key B03).
+
+    `tickets` is the ordered target (exactly one ticket while `target_kind` is
+    `ticket`; B04 packages reuse the list). `mode` is `public` (any worker
+    meeting `requirements`) or `assigned` (only `allowed_workers`: a direct
+    assignment). `requirements` are hard constraints evaluated restricted at
+    acquisition (unknown worker data fails); `preferences` are labelled hints
+    that nothing enforces -- the first eligible claimant wins.
+
+    A worker accepts by acquiring the ticket; the lifecycle cascade that stores
+    the new attempt also moves the offer to `accepted` (`accepted_by`,
+    `attempt_id`), so two workers cannot both accept. The offer then tracks its
+    ticket: `completed` when the ticket closes, `cancelled` when the accepting
+    worker stops holding it. `provenance` records who published it and why.
+    """
+
+    kind = "offer"
+    id_prefix = ID_PREFIXES["offer"]
+
+    id: str
+    tickets: List[str]
+    mode: str
+    publisher: str
+    created: str
+    updated: str
+    target_kind: str = "ticket"
+    reservation_id: Optional[str] = None
+    requirements: Dict[str, Any] = field(default_factory=dict)
+    allowed_workers: List[str] = field(default_factory=list)
+    preferences: Dict[str, Any] = field(default_factory=dict)
+    state: str = "published"
+    note: Optional[str] = None
+    provenance: Dict[str, Any] = field(default_factory=dict)
+    accepted_by: Optional[str] = None
+    accepted_at: Optional[str] = None
+    attempt_id: Optional[str] = None
+    ended_at: Optional[str] = None
+    ended_by: Optional[str] = None
+    end_reason: Optional[str] = None
+    contract_version: int = CONTRACT_VERSION
+
+    @property
+    def is_live(self) -> bool:
+        return self.state in OFFER_LIVE_STATES
+
+    @property
+    def is_published(self) -> bool:
+        return self.state == "published"
+
+
 # Record kind -> class, for `record_from_dict`.
 RECORD_CLASSES = {
     cls.kind: cls
@@ -1231,6 +1321,7 @@ RECORD_CLASSES = {
         RecoveryReport,
         WorkerProfile,
         Reservation,
+        Offer,
     )
 }
 
@@ -1483,6 +1574,13 @@ def _validate_lifecycle_intent(record: LifecycleIntent) -> list:
             problems.append(f"start_attempt: {problem}")
     _check(problems, isinstance(record.events, list) and all(isinstance(e, dict) for e in record.events),
            "events must be a list of event mappings")
+    acceptance = record.offer_acceptance
+    if acceptance is not None:
+        _check(problems, isinstance(acceptance, dict) and id_for_kind(acceptance.get("offer_id"), "offer")
+               and bool(acceptance.get("worker_id")),
+               "offer_acceptance must name an offer id and a worker id")
+        _check(problems, record.start_attempt is not None,
+               "offer_acceptance needs the start_attempt it accepts the offer with")
     return problems
 
 
@@ -1620,6 +1718,83 @@ def _validate_reservation(record: Reservation) -> list:
     return problems
 
 
+@_validator("offer")
+def _validate_offer(record: Offer) -> list:
+    problems = []
+    _check_id(problems, record)
+    tickets = record.tickets
+    if not isinstance(tickets, list):
+        problems.append("tickets must be an ordered list of ticket ids")
+        tickets = []
+    _check(problems, all(isinstance(t, str) and t and t.strip() == t for t in tickets),
+           "tickets must be non-empty ticket id strings")
+    _check(problems, len(set(map(str, tickets))) == len(tickets), "tickets must not repeat")
+    _check(problems, record.target_kind in OFFER_TARGET_KINDS,
+           f"target_kind {record.target_kind!r} is not one of {', '.join(OFFER_TARGET_KINDS)}")
+    if record.target_kind == "ticket":
+        _check(problems, len(tickets) == 1, "a ticket offer names exactly one ticket")
+    _check(problems, record.mode in OFFER_MODES,
+           f"mode {record.mode!r} is not one of {', '.join(OFFER_MODES)}")
+    _check(problems, isinstance(record.publisher, str) and bool(WORKER_ID_PATTERN.match(record.publisher)),
+           f"publisher {record.publisher!r} must match {WORKER_ID_PATTERN.pattern}")
+    if record.reservation_id is not None:
+        _check(problems, id_for_kind(record.reservation_id, "reservation"),
+               f"reservation_id {record.reservation_id!r} is not a reservation id")
+    allowed = record.allowed_workers
+    if not isinstance(allowed, list):
+        problems.append("allowed_workers must be a list of worker ids")
+        allowed = []
+    _check(problems, all(isinstance(w, str) and WORKER_ID_PATTERN.match(w) for w in allowed),
+           "allowed_workers must be valid worker ids")
+    _check(problems, len(set(map(str, allowed))) == len(allowed), "allowed_workers must not repeat")
+    if record.mode == "assigned":
+        _check(problems, bool(allowed), "a direct assignment names at least one allowed worker")
+    elif record.mode == "public":
+        _check(problems, not allowed, "a public offer has no allowed_workers (use mode 'assigned')")
+    requirements = record.requirements
+    if not isinstance(requirements, dict):
+        problems.append("requirements must be a mapping")
+        requirements = {}
+    extra = sorted(set(requirements) - set(OFFER_REQUIREMENT_KEYS))
+    _check(problems, not extra, f"requirements has unexpected keys: {', '.join(extra)}")
+    tier = requirements.get("min_tier")
+    _check(problems, tier is None or tier in TIERS, f"min_tier {tier!r} is not one of {', '.join(TIERS)}")
+    capabilities = requirements.get("capabilities") or []
+    _check(problems, isinstance(capabilities, list)
+           and all(isinstance(cap, str) and CAPABILITY_PATTERN.match(cap) for cap in capabilities),
+           f"capabilities must be labels matching {CAPABILITY_PATTERN.pattern}")
+    _check(problems, isinstance(requirements.get("local_only", False), bool), "local_only must be a boolean")
+    ceiling = requirements.get("max_cost")
+    if ceiling is not None:
+        amount = ceiling.get("amount") if isinstance(ceiling, dict) else None
+        unit = ceiling.get("unit") if isinstance(ceiling, dict) else None
+        _check(problems, isinstance(amount, (int, float)) and not isinstance(amount, bool) and amount >= 0
+               and isinstance(unit, str) and bool(unit.strip()),
+               "max_cost needs a non-negative amount and an explicit unit")
+    preferences = record.preferences
+    if not isinstance(preferences, dict):
+        problems.append("preferences must be a mapping")
+        preferences = {}
+    extra = sorted(set(preferences) - set(OFFER_PREFERENCE_KEYS))
+    _check(problems, not extra, f"preferences has unexpected keys: {', '.join(extra)}")
+    _check(problems, record.state in OFFER_STATES,
+           f"state {record.state!r} is not one of {', '.join(OFFER_STATES)}")
+    _check_utc(problems, record.created, "created")
+    _check_utc(problems, record.updated, "updated")
+    if record.state in ("accepted", "completed"):
+        _check(problems, bool(record.accepted_by) and id_for_kind(record.attempt_id, "work_attempt"),
+               f"an {record.state} offer names the accepting worker and its attempt")
+        _check_utc(problems, record.accepted_at, "accepted_at")
+    if record.state in ("withdrawn", "completed", "cancelled"):
+        _check_utc(problems, record.ended_at, "ended_at")
+    else:
+        _check(problems, record.ended_at is None, f"a {record.state} offer must not have 'ended_at'")
+    if record.note is not None:
+        _check(problems, isinstance(record.note, str) and len(record.note) <= 500,
+               "note must be a string of at most 500 chars")
+    return problems
+
+
 def validate_record(record) -> List[str]:
     """Invariant problems for a single record, or `[]` when it is clean.
 
@@ -1655,7 +1830,8 @@ def validate_collection(records) -> List[str]:
       initially);
     - at most one active claim per (workspace, path);
     - at most one worker profile per worker id;
-    - a ticket is a member of at most one active reservation (no nesting).
+    - a ticket is a member of at most one active reservation (no nesting);
+    - a ticket is the target of at most one live (published/accepted) offer.
 
     Duplicate ids and duplicate event cursors are also reported, because both
     make "which record is current" unanswerable.
@@ -1667,6 +1843,7 @@ def validate_collection(records) -> List[str]:
     active_claims = {}
     profiles = {}
     reserved = {}
+    offered = {}
 
     for record in records:
         record_id = getattr(record, "record_id", None)
@@ -1712,6 +1889,16 @@ def validate_collection(records) -> List[str]:
                 else:
                     reserved[member] = record.id
 
+        if isinstance(record, Offer) and record.is_live:
+            for ticket in record.tickets:
+                if ticket in offered:
+                    problems.append(
+                        f"ticket {ticket} is the target of two live offers ({offered[ticket]} "
+                        f"and {record.id}); one live offer per ticket"
+                    )
+                else:
+                    offered[ticket] = record.id
+
         if isinstance(record, FileClaim) and record.is_active:
             key = (record.workspace_id, record.path)
             if key in active_claims:
@@ -1738,6 +1925,13 @@ __all__ = [
     "WORKER_LOCALITIES",
     "WorkerProfile",
     "Reservation",
+    "Offer",
+    "OFFER_LIVE_STATES",
+    "OFFER_MODES",
+    "OFFER_PREFERENCE_KEYS",
+    "OFFER_REQUIREMENT_KEYS",
+    "OFFER_STATES",
+    "OFFER_TARGET_KINDS",
     "RESERVATION_SOURCES",
     "RESERVATION_STATES",
     "looks_like_secret",

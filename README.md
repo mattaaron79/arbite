@@ -441,8 +441,9 @@ No runner/daemon/watcher/scheduler, no automatic stale detection or takeover, no
 worktrees or merge workflow, no central database, no dashboard or factory, and no
 artifact GC. Of the job-board epic, passive worker profiles (see
 [Worker profiles](#worker-profiles-optional)) and coordinator reservations (see
-[Reservations](#reservations-coordinators)) exist so far; offers, continuity
-packages, a board view and event queries are not implemented yet.
+[Reservations](#reservations-coordinators)) and offers/direct assignments (see
+[Offers](#offers-and-direct-assignments)) exist so far; continuity packages, a
+board view, capacity enforcement and event queries are not implemented yet.
 
 ### Worker profiles (optional)
 
@@ -479,9 +480,8 @@ reservation is ownership of *who may acquire*, not execution: it creates no
 attempt and never sets a ticket `in_progress`. While it is active only the owner
 may acquire a member — `claim`, `list next --claim`, `--adopt`, `--force` and
 `set status in_progress` / `set assignee` refuse everyone else with
-`ticket_reserved`, and a plain `list next` leaves reserved tickets out. Offers and
-direct assignments that let other workers pick up reserved tickets are not
-implemented yet.
+`ticket_reserved`, and a plain `list next` leaves reserved tickets out. The owner
+lets other workers pick up members through [offers](#offers-and-direct-assignments).
 
 Create and `reserve add` are all-or-nothing: one closed, unknown, already-reserved
 (no overlap, so no nesting), otherwise-assigned ticket, or one with another
@@ -492,7 +492,41 @@ need `--agent <owner>` (or `--force --reason`) and accept `--expect-revision`;
 `remove`/`release` refuse while an affected member has an active attempt unless
 `--interrupt --reason` ends it (ticket back to open). Released reservations are
 kept as history (`reserve list --state all`), recorded as `reservation` category
-events, and carried by `export`/`migrate --coordination`.
+events, and carried by `export`/`migrate --coordination`. Releasing (or removing
+members) also withdraws their published offers in the same transaction.
+
+### Offers and direct assignments
+
+`arbite offer publish T --agent <owner>` makes one open, unassigned ticket
+available to any worker meeting its requirements; `arbite offer assign T --worker W
+--agent <owner>` restricts it to the named worker(s). On a reserved ticket only the
+reservation owner (or `--force --reason`) may publish, and the reservation stays in
+place. Requirements (`--min-tier`, `--require-capability`, `--local-only`,
+`--max-cost N --max-cost-unit U`) are evaluated at acquisition in restricted mode —
+an unknown tier/capability/locality/cost fails — while `--prefer-local`,
+`--prefer-low-cost` and `--prefer-worker` are stored and shown as hints only: in
+this passive mode the first eligible claimant wins, and an explicit `assign` is how
+an owner makes a preference stick. There is no auction, pricing catalog or
+scheduler.
+
+Workers pick up offers themselves with `arbite offer claim OFFER --agent <id>`
+(plain `claim` and `list next --claim` go through the same offer); the owner need
+not be online. Acceptance *is* acquisition: the lifecycle cascade that stores the
+new attempt also moves the offer `published → accepted`, under the operation lock
+and the ticket compare-and-swap, so simultaneous acceptance has exactly one winner
+and the loser gets `offer_conflict`. While an offer is published, no one it does
+not admit can acquire the ticket — the owner, `--force` and `--adopt` included
+(`worker_ineligible`) — and `set status in_progress` / `set assignee` / `delete`
+refuse with `ticket_offered`. `offer withdraw` (publisher or reservation owner, else
+`--force --reason`) ends a published offer; withdraw-vs-accept is serialized by the
+same lock, and an accepted offer refuses withdrawal unless `--interrupt --reason`
+interrupts the worker (ticket back to open). An offer follows its ticket: closing it
+completes the accepted offer (or cancels an unaccepted one); a release, takeover or
+`unblock --open` that leaves the accepting worker without the ticket cancels it.
+Offers are `offer` category events, listed with `offer list [--state] [--ticket]
+[--reservation] [--worker W]`, explained with `offer show --worker W`, and carried by
+`export`/`migrate --coordination`. Offers cover single tickets; ordered packages are
+not implemented yet.
 
 ---
 
@@ -552,6 +586,7 @@ The package exposes the console script `arbite`, providing:
 | Evidence | `changes [--attempt A] [--include-reads]` |
 | Worker profiles | `worker register\|show\|list\|update\|disable\|enable\|checkin\|check` |
 | Reservations | `reserve create\|show\|list\|add\|remove\|release` |
+| Offers | `offer publish\|assign\|list\|show\|withdraw\|claim` |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run] [--coordination\|--no-coordination]`, `rebind --to <sink>`, `export [--scope ...] [--out FILE] [--no-artifacts]` |
 | Integrity | `doctor [--fix]` (tickets plus coordination findings) |
 | Destruction | `delete <id> --force` |
@@ -843,6 +878,7 @@ src/arbite/
   workers.py            passive worker profiles (register/update/disable/check-in)
   eligibility.py        worker eligibility vocabulary and pure evaluation
   reservations.py       coordinator reservations over explicit ticket sets
+  offers.py             offers/direct assignments and atomic worker pickup
 tests/
   test_sink_conformance.py  one suite, run against every sink
   test_file_sink.py         file-specific: folders, drift, temp files, archives
@@ -876,7 +912,8 @@ write/edit/remove/rename), work attempts with guarded lifecycle cleanup, durable
 change evidence (`arbite changes`), crash-safe recovery with no daemon, and
 coordination-aware `export`/`rebind`/`migrate --coordination`/`doctor`. The
 job-board epic has begun with passive worker profiles, eligibility checks at
-acquisition and coordinator reservations; its offers and packages are still to come. Both sinks
+acquisition, coordinator reservations, and offers/direct assignments with atomic
+pickup; its packages, board and event queries are still to come. Both sinks
 carry the same semantics, and the file sink never requires SQLite. Deliberately
 absent, and documented as such above: any runner, daemon, watcher or scheduler,
 automatic stale detection or takeover, worktrees, a central database, a dashboard,
