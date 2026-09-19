@@ -57,7 +57,7 @@ A worker id needs no registration: unregistered (ad-hoc) ids claim work exactly 
 
 ## Reservations (coordinators)
 
-A coordinator can hold a set of tickets with `arbite reserve create T1 T2 ... --agent <coordinator>` (or `--epic E`, which snapshots the epic's non-closed tickets once; tickets added to the epic later are not included until `arbite reserve add`). While the reservation is active only its owner may acquire a member: `claim`, `list next --claim`, `--adopt`, `--force` and `set status in_progress` / `set assignee` refuse everyone else with `ticket_reserved`, and plain `list next` leaves reserved tickets out (noted on stderr). If you are refused, pick other work -- do not retry the same ticket. A reservation never starts work: it creates no attempt and leaves the ticket's status alone. Create/add are all-or-nothing (`reservation_conflict`, `details.conflicts[]` per ticket: `closed`, `not_found`, `already_reserved` -- no overlap or nesting -- `active_attempt_elsewhere`, `assigned_elsewhere`). `reserve add|remove|release` need `--agent <owner>` (or `--force --reason` for an administrative change) and accept `--expect-revision N`. `remove`/`release` refuse while an affected member has an active attempt (`active_attempts`) unless `--interrupt --reason` ends those attempts and returns the tickets to open; releasing a quiescent reservation returns its open members to ad-hoc availability. `reserve show|list [--state] [--owner] [--ticket]` report members with their current status and active attempt. All take `--json`.
+A coordinator can hold a set of tickets with `arbite reserve create T1 T2 ... --agent <coordinator>` (or `--epic E`, which snapshots the epic's non-closed tickets once; tickets added to the epic later are not included until `arbite reserve add`). While the reservation is active only its owner may acquire a member: `claim`, `list next --claim`, `--adopt`, `--force` and `set status in_progress` / `set assignee` refuse everyone else with `ticket_reserved`, and plain `list next` leaves reserved tickets out (noted on stderr). If you are refused, pick other work -- do not retry the same ticket. A reservation never starts work: it creates no attempt and leaves the ticket's status alone. Create/add are all-or-nothing (`reservation_conflict`, `details.conflicts[]` per ticket: `closed`, `not_found`, `already_reserved` -- no overlap or nesting -- `active_attempt_elsewhere`, `assigned_elsewhere`). `reserve add|remove|release` need `--agent <owner>` (or `--force --reason` for an administrative change) and accept `--expect-revision N`. `remove`/`release` refuse while an affected member has an active attempt (`active_attempts`) unless `--interrupt --reason` ends those attempts and returns the tickets to open; releasing a quiescent reservation returns its open members to ad-hoc availability. `reserve show|list [--state] [--owner] [--ticket]` report members with their current status and active attempt, and `arbite reserve progress RESERVATION [--owner OWNER] [--state active|released|all]` is the read-only observation view: every member classified `completed`, `blocked`, `active`, `dependency_waiting`, `ready` or `unavailable`, with its current worker, its latest recorded activity and the same readiness verdict `board` and `claim` use. Recorded activity is an observation timestamp, never a liveness guarantee. All take `--json`.
 
 ## Offers and direct assignments
 
@@ -70,6 +70,16 @@ A package is the contract 'A then B by the same worker'. `arbite package create 
 ## Job board and readiness
 
 `arbite board --worker W [--epic E] [--tier T] [--count N] [--json]` explains, for one worker, what is ready now and why everything else is not; it is a query and claims nothing. Every candidate ticket in the status workflow (optionally narrowed to one `--epic`) is reported `ready` or with structured `reasons`, each carrying a stable `code` and the `axis` it belongs to: `status` and `classification` (`ticket_not_open`, `ticket_unclassified`), `dependency` (`dependencies_unmet`), `attempt` (`active_attempt`), `reservation` (`reserved_elsewhere`, or `worker_identity_required` when no worker was named), `offer` (`offer_ineligible`, with the nested eligibility reasons such as `worker_not_allowed`), `continuity` (`package_order`, `package_bound_elsewhere`), `worker` (`worker_ineligible`: tier, capability, locality, cost ceiling) and `capacity` (`capacity_exhausted`). The output also reports the worker's declared capacity, the active attempts counted against it and the free slots, plus `suggestions` -- the compatible ready work in the order `list next` would offer it. Readiness is derived from current state every time, and the same evaluator backs plain `list next` and acquisition, so a board cannot disagree with what `claim` accepts; a board query still cannot promise that a ticket it reports ready is free when you act on it, because `claim`/`list next --claim` re-check every condition under the operation lock. Local/low-cost offer preferences (`--prefer-local`, `--prefer-low-cost`, `--prefer-worker`) are reported as advisory hints and never decide pickup -- the first eligible claimant wins -- so an owner who wants a preference *enforced* uses a hard constraint (`--require-capability`, `--local-only`, `--max-cost`, `--min-tier`, `--allowed-worker`) or a direct `arbite offer assign`. The command exits 2 when nothing is ready for that worker.
+
+## Events and progress (external callers)
+
+`arbite events --after CURSOR --limit N [--category C] [--kind K] [--subject ID] [--json]` reads the durable coordination log once, in cursor order. `--after` takes either `0` (the beginning) or the `next_cursor` token a previous query returned; a token is store-bound (`<cursor_namespace>#<cursor>`), so a bare integer fails `invalid_cursor` and another store's token fails `cursor_foreign_store` -- enriched with an import mapping when that store's events were imported here -- and neither ever restarts silently from zero or reads the wrong store. Filters are applied to the whole ordered stream before `--limit`, and the returned token resumes after the last *matching* event, so a filtered stream neither skips nor re-reads. Every event carries a stable id: a retry or an overlapping page may deliver it again, so a consumer deduplicates by id. Each page reports `has_more`, `next_cursor`, the `cursor_namespace` and the filters used, and the command exits 2 when nothing matched (the token is still printed, so a loop resumes without ambiguity). Categories are `lifecycle`, `operation`, `claim`, `read`, `worker`, `reservation`, `offer` and `package`; file-read observations are the separate `read` category so lifecycle traffic is not buried. It is a one-shot query: there is no watcher, subscription server, polling loop, notification delivery or agent wakeup, so a 'busy' or 'nothing ready' answer is an exit code (2) rather than a model process that has to stay alive, and a caller that exits and returns later resumes from the token it stored. Cursors are store-local, so a token from an export/import bundle is not a valid `--after` value here (the refusal names the destination cursor it mapped to); the file sink reconciles an interrupted commit before reporting its events, so no half-visible event is served.
+
+## Transfers, export and the doctor
+
+Worker profiles, reservations, offers and packages travel with `arbite export` and with `arbite migrate`/`arbite rebind` -- the migration's default `--coordination` moves attempts, claims, receipts, intents, profiles, reservations, offers, packages, events and artifact metadata together and rebinds the workspace. A transfer refuses while job-board work is in flight: `migrate`/`rebind` report `store_not_quiescent` and name the active attempt(s), claim(s), intent(s), operation(s), reservation(s), published offer(s) and live package(s) that block it, write nothing, and offer the way forward -- end the work and reconcile it, or pass an explicit administrative override `--force --reason TEXT`, which is reported on stderr (and as `unquiescent_override` in `rebind --json`) rather than applied silently. Released reservations, finished offers and completed or released packages do not block. The export bundle verifies its own job-board references and overlaps and fingerprints the job-board records, so a lossy transfer is refused instead of being reported as verified.
+
+`arbite doctor` adds report-only job-board checks when the store actually carries coordination state: `coordination_dangling_offer`, `_package` and `_reservation` (a reference to a missing record or ticket), their `_overlapping_` variants (one ticket inside two live reservations, offers or packages), `coordination_package_reservation_mismatch` (a package and its recorded reservation disagreeing about members), `coordination_continuity_binding_invalid` (a live package with no bound worker, or bound to a disabled profile), `coordination_attempt_mismatch` (an active attempt whose ticket is missing, closed or shelved, an attempt disagreeing with the ticket's assignee, or an `in_progress` ticket with no attempt in a store that uses coordination), `coordination_capacity_exceeded` (active attempts above a declared capacity where at least one started *after* the profile changed -- a capacity merely lowered below running work is legal and never reported) and `coordination_namespace_mismatch` (an unreadable event-cursor registry). They are findings only: `--fix` repairs none of them, and `arbite doctor` exits 3 while any remains. Profiles have no delete at all -- `worker disable` stops future acquisition and keeps every attempt and event -- and a reservation, offer or package is closed by state (`released`/`withdrawn`/`completed`), never removed.
 
 ## Typical workflow
 
@@ -98,7 +108,16 @@ arbite unshelve tic-a1b2 --reason "back in scope"       # bring it back to open
 arbite close tic-a1b2                                   # when done
 arbite reopen tic-a1b2                                  # if it turns out not to be done
 arbite sink info                                        # where do tickets live, and in what
-arbite migrate --to sqlite                              # copy every ticket into another sink
+
+arbite worker register claude.opus.001 --tier high --provider anthropic   # optional profile
+arbite board --worker claude.opus.001 --json         # ready now, and why not (exit 2 = nothing)
+arbite reserve create tic-a1b2 tic-c3d4 --agent coord.1    # hold a set; starts nothing
+arbite offer assign tic-a1b2 --worker claude.opus.001 --agent coord.1   # or: offer publish T
+arbite package create tic-c3d4 tic-d4e5 --agent coord.1    # 'A then B by the same worker'
+arbite offer claim off-... --agent claude.haiku.001   # accept an offer; starts your attempt
+arbite reserve progress rsv-... --json                # what the reservation's members do now
+arbite events --after 0 --limit 50 --json             # ordered, cursor-resumable log
+arbite migrate --to sqlite                            # copy every ticket into another sink
 
 arbite file list --json                                 # discover workspace files (no lock)
 arbite file claim src/app.py --ticket tic-a1b2 --attempt att-...   # own the whole file
@@ -156,13 +175,17 @@ A **request** raw ticket (`arbite request <message>` == `arbite raw request <mes
 
 **`arbite move <id> <folder>`** files a ticket outside the status workflow: `/wishlist` puts it in the wishlist bucket, `/planning/ideas` in a nested one, and `/` returns it to its status location. It changes no field, so use the status commands (claim/block/close/...) for anything that should change state -- those un-file the ticket for you.
 
-**Integrity.** `arbite doctor` reports what nothing else enforces, then exits 3 so it can gate CI or an agent's startup. The shared checks cover duplicate ids, invalid field values, dependency cycles, dangling and self dependencies, `in_progress` with no assignee, `blocked` with no reason, and closed-date mismatches. The sink adds its own -- for a file sink, frontmatter/folder drift (the folder wins), tickets left loose in the root, temp files stranded by an interrupted write, and closed tickets archived in the wrong month; for a database sink, an index that has drifted from a ticket body, orphaned index rows, an unexpected schema version and structural corruption. `--fix` repairs only the unambiguous cases and never guesses.
+**Integrity.** `arbite doctor` reports what nothing else enforces, then exits 3 so it can gate CI or an agent's startup. The shared checks cover duplicate ids, invalid field values, dependency cycles, dangling and self dependencies, `in_progress` with no assignee, `blocked` with no reason, and closed-date mismatches. The sink adds its own -- for a file sink, frontmatter/folder drift (the folder wins), tickets left loose in the root, temp files stranded by an interrupted write, and closed tickets archived in the wrong month; for a database sink, an index that has drifted from a ticket body, orphaned index rows, an unexpected schema version and structural corruption. A store that carries coordination state also gets the job-board checks (dangling, overlapping or mismatched reservation/offer/package references, an invalid continuity binding, an attempt disagreeing with its ticket, impossible capacity arithmetic, an unreadable event-cursor registry); they are findings only, and `--fix` repairs none of them. `--fix` repairs only the unambiguous cases and never guesses.
+
+## What is deliberately not here (job board)
+
+The job board coordinates workers that already exist and are started by hand; it never starts one, and every participant invokes the same short-lived CLI. Explicitly out of scope, and not implemented in any dormant form: provider API integration or provider adapters, agent spawning, a daemon, watcher, scheduler, background subscription or notification delivery, agent wakeups, heartbeat expiration or automatic stale-work recovery, an auction or dynamic price lookup, a model price catalog or currency conversion, agent authentication (worker ids and provider/model/runtime labels are attribution, not identity), cross-machine or global capacity arbitration, a central database, a project factory or a dashboard, and artifact garbage collection. Capacity is per worker id inside this one local store and is never claimed as a global pool; no trustworthy occupancy is claimed across independent project stores. Nothing times out and nothing is reassigned because execution stopped: only an explicit `claim --force --reason`, an explicit reservation or offer change, or an explicit `package handoff --reason` moves live work. The records carry the ids a future integration needs (worker id, profile revision, offer/reservation/package/attempt ids, event cursors) without shipping dormant scheduling machinery.
 
 ## Commands
 
 Rendered from the installed version's own parsers, so it always matches the CLI: the usage line and flags of every command (argparse's longer descriptions are omitted -- `arbite <cmd> -h` prints them). Every command accepts `--sink <kind>`, and every status command updates `status`/`updated` together while `block`, `shelve`, `release`, `unblock`, `reopen` and `unshelve` also append an automatic timestamped note.
 
-Command notes: `release` is how you hand back work you stop part-way (out of scope, out of context, or the wrong tier) -- it clears the assignee and any block reason so `list next` offers the ticket again; `unblock` clears `blocked_by` and returns the ticket to `in_progress` (`open` with `--open`), and is preferable to `arbite set status`, which would leave `blocked_by` populated and the ticket claiming to be stalled; `reopen` clears the closed date and any block reason and `unshelve` clears the assignee and any block reason; `set` takes PROPERTY VALUE pairs (any number per call, quote multi-word values, `''` clears a field), is type-aware (`tags`/`depends_on` comma-separated lists, `priority` an integer), cannot set the structural `id`, and re-files the ticket when `status` changes; `depend` adds a dependency (deduplicated), or with one argument clears them all; `search` matches a ticket if any selected field matches; `migrate` copies every ticket from one sink into another (the source is left alone); `delete` destroys a ticket and needs `--force`.
+Command notes: `release` is how you hand back work you stop part-way (out of scope, out of context, or the wrong tier) -- it clears the assignee and any block reason so `list next` offers the ticket again; `unblock` clears `blocked_by` and returns the ticket to `in_progress` (`open` with `--open`), and is preferable to `arbite set status`, which would leave `blocked_by` populated and the ticket claiming to be stalled; `reopen` clears the closed date and any block reason and `unshelve` clears the assignee and any block reason; `set` takes PROPERTY VALUE pairs (any number per call, quote multi-word values, `''` clears a field), is type-aware (`tags`/`depends_on` comma-separated lists, `priority` an integer), cannot set the structural `id`, and re-files the ticket when `status` changes; `depend` adds a dependency (deduplicated), or with one argument clears them all; `search` matches a ticket if any selected field matches; `migrate` copies every ticket from one sink into another (the source is left alone) and, like `rebind`, refuses while job-board work is live unless you pass `--force --reason <why>`; `delete` destroys a ticket and needs `--force`.
 
 `arbite [-h] [--version] [--sink KIND] command ...` -- ticket sink CLI
 
@@ -200,6 +223,7 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `file` -- discover, read, claim, write, edit, remove or rename workspace files
 - `worker` -- register, show, list, update, disable or check passive worker profiles
 - `board` -- explain what one worker can pick up now (a query; claims nothing)
+- `events` -- query the durable event log once (ordered, cursor-resumable, read-only)
 - `reserve` -- create, show, list, change or release coordinator reservations
 - `offer` -- publish, assign, list, show, withdraw or claim offers
 - `package` -- ordered same-worker continuity packages (create/show/list/claim/note/handoff)
@@ -361,7 +385,7 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `--dry-run` -- report what would be deleted and make no change
 - `--json` -- JSON output (see Conventions)
 
-**`arbite migrate`** -- `arbite migrate [-h] --to KIND [--from KIND] [--dry-run] [--overwrite] [--prune] [--coordination] [--no-coordination] [--sink KIND]`
+**`arbite migrate`** -- `arbite migrate [-h] --to KIND [--from KIND] [--dry-run] [--overwrite] [--prune] [--coordination] [--no-coordination] [--force] [--reason TEXT] [--sink KIND]`
 
 - `--to KIND` (required) -- destination sink kind: file, sqlite
 - `--from KIND` -- source sink kind (default: the sink this command would otherwise use -- --sink/ARBITE_SINK/config)
@@ -370,6 +394,8 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `--prune` -- after copying, delete the source tickets -- the destructive half of a migration, for retiring a store once its contents are verified in the other one. Refused if any ticket was skipped, because a stale destination copy would then be the only copy left; combine with --dry-run to see what it would remove. Prunes tickets only: coordination history is never deleted
 - `--coordination` -- also move shared-directory coordination history (attempts, claims, receipts, intents, events, artifacts) and rebind this project to the destination; default: move it iff the source already has coordination state
 - `--no-coordination` -- transfer tickets only, leaving all coordination history in the source store
+- `--force` -- administrative override: transfer even though the source store still has work in flight (active attempts/claims, an active reservation, a published offer, a live package). Requires --reason and reports exactly what was overridden; nothing is dropped and the source keeps its records, but both stores then hold that work in flight
+- `--reason TEXT` -- why a --force migration is being made (required with --force); recorded in the command's output
 
 **`arbite doctor`** -- `arbite doctor [-h] [--fix] [--json] [--sink KIND]`
 
@@ -384,10 +410,12 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `--no-artifacts` -- record artifact metadata but omit the artifact bytes (marked data_omitted)
 - `--json` -- JSON output (see Conventions)
 
-**`arbite rebind`** -- `arbite rebind [-h] [--to KIND] [--dry-run] [--json] [--sink KIND]`
+**`arbite rebind`** -- `arbite rebind [-h] [--to KIND] [--dry-run] [--force] [--reason TEXT] [--json] [--sink KIND]`
 
 - `--to KIND` -- the sink kind to bind this workspace to (required): file, sqlite
 - `--dry-run` -- run every verification and report what would change, writing nothing
+- `--force` -- administrative override: rebind even though the currently bound store still has work in flight (active attempts/claims, an active reservation, a published offer, a live package). Requires --reason and reports exactly what was overridden; the work stays behind in the old store
+- `--reason TEXT` -- why a --force rebind is being made (required with --force); recorded in the command's output
 - `--json` -- JSON output (see Conventions)
 
 **`arbite file`** -- `arbite file [-h] {claim,release,list,search,read,probe,write,edit,remove,rename} ...`
@@ -402,7 +430,16 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `--count N` -- limit how many suggestions are listed
 - `--json` -- JSON output (see Conventions)
 
-**`arbite reserve`** -- `arbite reserve [-h] {create,show,list,add,remove,release} ...`
+**`arbite events`** -- `arbite events [-h] [--after CURSOR] [--limit N] [--category C] [--kind K] [--subject ID] [--json] [--sink KIND]`
+
+- `--after CURSOR` -- resume after this cursor: a `next_cursor` token from a previous query (namespace#cursor) or 0 for the whole stream from the beginning
+- `--limit N` -- maximum events to return (default 200); the page reports has_more and a resumable next_cursor
+- `--category C` -- only these event categories (repeatable or comma-separated): lifecycle, operation, claim, read, worker, reservation, offer, package
+- `--kind K` -- only these event kinds (repeatable or comma-separated), e.g. ticket_claimed, offer_accepted, package_advanced
+- `--subject ID` -- only events naming one of these subjects (ticket, attempt, offer, package or reservation id; repeatable)
+- `--json` -- JSON output (see Conventions)
+
+**`arbite reserve`** -- `arbite reserve [-h] {create,show,list,progress,add,remove,release} ...`
 
 **`arbite offer`** -- `arbite offer [-h] {publish,assign,list,show,withdraw,claim} ...`
 

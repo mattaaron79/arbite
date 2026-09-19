@@ -572,7 +572,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "attempt (`active_attempts`) unless `--interrupt --reason` ends those attempts and "
         "returns the tickets to open; releasing a quiescent reservation returns its open "
         "members to ad-hoc availability. `reserve show|list [--state] [--owner] [--ticket]` "
-        "report members with their current status and active attempt. All take `--json`."
+        "report members with their current status and active attempt, and `arbite reserve "
+        "progress RESERVATION [--owner OWNER] [--state active|released|all]` is the read-only "
+        "observation view: every member classified `completed`, `blocked`, `active`, "
+        "`dependency_waiting`, `ready` or `unavailable`, with its current worker, its latest "
+        "recorded activity and the same readiness verdict `board` and `claim` use. Recorded "
+        "activity is an observation timestamp, never a liveness guarantee. All take `--json`."
     )
     add("")
 
@@ -663,6 +668,78 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     )
     add("")
 
+    # -- Events and progress ------------------------------------------------
+    add("## Events and progress (external callers)")
+    add("")
+    add(
+        "`arbite events --after CURSOR --limit N [--category C] [--kind K] [--subject ID] "
+        "[--json]` reads the durable coordination log once, in cursor order. `--after` takes "
+        "either `0` (the beginning) or the `next_cursor` token a previous query returned; a "
+        "token is store-bound (`<cursor_namespace>#<cursor>`), so a bare integer fails "
+        "`invalid_cursor` and another store's token fails `cursor_foreign_store` -- enriched "
+        "with an import mapping when that store's events were imported here -- and neither "
+        "ever restarts silently from zero or reads the wrong store. Filters are applied to "
+        "the whole ordered stream before `--limit`, and the returned token resumes after the "
+        "last *matching* event, so a filtered stream neither skips nor re-reads. Every event "
+        "carries a stable id: a retry or an overlapping page may deliver it again, so a "
+        "consumer deduplicates by id. Each page reports `has_more`, `next_cursor`, the "
+        "`cursor_namespace` and the filters used, and the command exits 2 when nothing "
+        "matched (the token is still printed, so a loop resumes without ambiguity). "
+        "Categories are `lifecycle`, `operation`, `claim`, `read`, `worker`, `reservation`, "
+        "`offer` and `package`; file-read observations are the separate `read` category so "
+        "lifecycle traffic is not buried. It is a one-shot query: there is no watcher, "
+        "subscription server, polling loop, notification delivery or agent wakeup, so a "
+        "'busy' or 'nothing ready' answer is an exit code (2) rather than a model process "
+        "that has to stay alive, and a caller that exits and returns later resumes from the "
+        "token it stored. Cursors are store-local, so a token from an export/import bundle "
+        "is not a valid `--after` value here (the refusal names the destination cursor it "
+        "mapped to); the file sink reconciles an interrupted commit before reporting its "
+        "events, so no half-visible event is served."
+    )
+    add("")
+
+    # -- Transfers, export and the doctor ---------------------------------
+    add("## Transfers, export and the doctor")
+    add("")
+    add(
+        "Worker profiles, reservations, offers and packages travel with `arbite export` and "
+        "with `arbite migrate`/`arbite rebind` -- the migration's default `--coordination` "
+        "moves attempts, claims, receipts, intents, profiles, reservations, offers, packages, "
+        "events and artifact metadata together and rebinds the workspace. A transfer refuses "
+        "while job-board work is in flight: `migrate`/`rebind` report `store_not_quiescent` "
+        "and name the active attempt(s), claim(s), intent(s), operation(s), reservation(s), "
+        "published offer(s) and live package(s) that block it, write nothing, and offer the "
+        "way forward -- end the work and reconcile it, or pass an explicit administrative "
+        "override `--force --reason TEXT`, which is reported on stderr (and as "
+        "`unquiescent_override` in `rebind --json`) rather than applied silently. Released "
+        "reservations, finished offers and completed or released packages do not block. The "
+        "export bundle verifies its own job-board references and overlaps and fingerprints "
+        "the job-board records, so a lossy transfer is refused instead of being reported as "
+        "verified."
+    )
+    add("")
+    add(
+        "`arbite doctor` adds report-only job-board checks when the store actually carries "
+        "coordination state: `coordination_dangling_offer`, `_package` and `_reservation` "
+        "(a reference to a missing record or ticket), their `_overlapping_` variants (one "
+        "ticket inside two live reservations, offers or packages), "
+        "`coordination_package_reservation_mismatch` (a package and its recorded reservation "
+        "disagreeing about members), `coordination_continuity_binding_invalid` (a live package "
+        "with no bound worker, or bound to a disabled profile), "
+        "`coordination_attempt_mismatch` (an active attempt whose ticket is missing, closed or "
+        "shelved, an attempt disagreeing with the ticket's assignee, or an `in_progress` "
+        "ticket with no attempt in a store that uses coordination), "
+        "`coordination_capacity_exceeded` (active attempts above a declared capacity where at "
+        "least one started *after* the profile changed -- a capacity merely lowered below "
+        "running work is legal and never reported) and `coordination_namespace_mismatch` (an "
+        "unreadable event-cursor registry). They are findings only: `--fix` repairs none of "
+        "them, and `arbite doctor` exits 3 while any remains. Profiles have no delete at all "
+        "-- `worker disable` stops future acquisition and keeps every attempt and event -- and "
+        "a reservation, offer or package is closed by state "
+        "(`released`/`withdrawn`/`completed`), never removed."
+    )
+    add("")
+
     # -- Workflow ----------------------------------------------------------
     add("## Typical workflow")
     add("")
@@ -691,7 +768,16 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("arbite close tic-a1b2                                   # when done")
     add("arbite reopen tic-a1b2                                  # if it turns out not to be done")
     add("arbite sink info                                        # where do tickets live, and in what")
-    add("arbite migrate --to sqlite                              # copy every ticket into another sink")
+    add("")
+    add("arbite worker register claude.opus.001 --tier high --provider anthropic   # optional profile")
+    add("arbite board --worker claude.opus.001 --json         # ready now, and why not (exit 2 = nothing)")
+    add("arbite reserve create tic-a1b2 tic-c3d4 --agent coord.1    # hold a set; starts nothing")
+    add("arbite offer assign tic-a1b2 --worker claude.opus.001 --agent coord.1   # or: offer publish T")
+    add("arbite package create tic-c3d4 tic-d4e5 --agent coord.1    # 'A then B by the same worker'")
+    add("arbite offer claim off-... --agent claude.haiku.001   # accept an offer; starts your attempt")
+    add("arbite reserve progress rsv-... --json                # what the reservation's members do now")
+    add("arbite events --after 0 --limit 50 --json             # ordered, cursor-resumable log")
+    add("arbite migrate --to sqlite                            # copy every ticket into another sink")
     add("")
     add("arbite file list --json                                 # discover workspace files (no lock)")
     add("arbite file claim src/app.py --ticket tic-a1b2 --attempt att-...   # own the whole file")
@@ -880,8 +966,36 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "frontmatter/folder drift (the folder wins), tickets left loose in the root, temp files "
         "stranded by an interrupted write, and closed tickets archived in the wrong "
         "month; for a database sink, an index that has drifted from a ticket body, orphaned index "
-        "rows, an unexpected schema version and structural corruption. `--fix` repairs only the "
-        "unambiguous cases and never guesses."
+        "rows, an unexpected schema version and structural corruption. A store that carries "
+        "coordination state also gets the job-board checks (dangling, overlapping or mismatched "
+        "reservation/offer/package references, an invalid continuity binding, an attempt "
+        "disagreeing with its ticket, impossible capacity arithmetic, an unreadable event-cursor "
+        "registry); they are findings only, and `--fix` repairs none of them. `--fix` repairs "
+        "only the unambiguous cases and never guesses."
+    )
+    add("")
+
+    # -- Deferrals ---------------------------------------------------------
+    add("## What is deliberately not here (job board)")
+    add("")
+    add(
+        "The job board coordinates workers that already exist and are started by hand; it "
+        "never starts one, and every participant invokes the same short-lived CLI. Explicitly "
+        "out of scope, and not implemented in any dormant form: provider API integration or "
+        "provider adapters, agent spawning, a daemon, watcher, scheduler, background "
+        "subscription or notification delivery, agent wakeups, heartbeat expiration or "
+        "automatic stale-work recovery, an auction or dynamic price lookup, a model price "
+        "catalog or currency conversion, agent authentication (worker ids and "
+        "provider/model/runtime labels are attribution, not identity), cross-machine or global "
+        "capacity arbitration, a central database, a project factory or a dashboard, and "
+        "artifact garbage collection. Capacity is per worker id inside this one local store "
+        "and is never claimed as a global pool; no trustworthy occupancy is claimed across "
+        "independent project stores. Nothing times out and nothing is reassigned because "
+        "execution stopped: only an explicit `claim --force --reason`, an explicit reservation "
+        "or offer change, or an explicit `package handoff --reason` moves live work. The "
+        "records carry the ids a future integration needs (worker id, profile revision, "
+        "offer/reservation/package/attempt ids, event cursors) without shipping dormant "
+        "scheduling machinery."
     )
     add("")
 
@@ -908,7 +1022,9 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "cannot set the structural `id`, and re-files the ticket when `status` changes; `depend` adds "
         "a dependency (deduplicated), or with one argument clears them all; `search` matches a ticket "
         "if any selected field matches; `migrate` copies every ticket from one sink into another "
-        "(the source is left alone); `delete` destroys a ticket and needs `--force`."
+        "(the source is left alone) and, like `rebind`, refuses while job-board work is live "
+        "unless you pass `--force --reason <why>`; `delete` destroys a ticket and needs "
+        "`--force`."
     )
     add("")
     add(f"`{_usage(parser)}` -- ticket sink CLI")

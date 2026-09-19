@@ -439,11 +439,16 @@ generation over the current bytes — then read and write.
 
 No runner/daemon/watcher/scheduler, no automatic stale detection or takeover, no
 worktrees or merge workflow, no central database, no dashboard or factory, and no
-artifact GC. Of the job-board epic, passive worker profiles (see
-[Worker profiles](#worker-profiles-optional)) and coordinator reservations (see
-[Reservations](#reservations-coordinators)) and offers/direct assignments (see
-[Offers](#offers-and-direct-assignments)) exist so far; continuity packages, a
-board view, capacity enforcement and event queries are not implemented yet.
+artifact GC. The job-board epic adds no provider integration either: no provider
+adapters or API calls, no agent spawning, no background subscription, notification
+delivery or agent wakeup, no heartbeat expiration, no auction, price catalog or
+currency conversion, no agent authentication, and no cross-machine or global
+capacity arbitration. Capacity is per worker id inside one local store; nothing is
+ever claimed about occupancy across independent project stores. Nothing times out
+and nothing is reassigned because execution stopped -- only an explicit
+`claim --force --reason`, an explicit reservation/offer change, or an explicit
+`package handoff --reason` moves live work. See [Deferred](#deferred) for the full
+list.
 
 ### Worker profiles (optional)
 
@@ -464,8 +469,12 @@ it (`declared_tier_exceeds_profile`), and `--force` does not bypass it. Changing
 the tier is an explicit `worker update --tier`, recorded as a `worker_updated`
 event with before/after values. `disable` stops new acquisitions while keeping the
 profile, its events and every attempt that names the worker; running attempts are
-not revoked. `last_checkin` is declared activity, never verified liveness, and
-declared capacity is recorded but not yet enforced. `worker check` evaluates a
+not revoked. `last_checkin` is declared activity, never verified liveness.
+Declared capacity *is* enforced when work is acquired, and only **active
+attempts** count against it: a reservation or a later package member consumes
+nothing, a `--count N` batch or two simultaneous claims cannot overfill the
+worker (a short batch is the correct result), and a profile change affects future
+acquisition only. `worker check` evaluates a
 worker against a ticket's tier or explicit constraints (`--require-capability`,
 `--local-only`, `--max-cost N --max-cost-unit U`) and lists every unmet or unknown
 constraint with a stable reason code; it writes nothing and does not evaluate
@@ -525,8 +534,225 @@ completes the accepted offer (or cancels an unaccepted one); a release, takeover
 `unblock --open` that leaves the accepting worker without the ticket cancels it.
 Offers are `offer` category events, listed with `offer list [--state] [--ticket]
 [--reservation] [--worker W]`, explained with `offer show --worker W`, and carried by
-`export`/`migrate --coordination`. Offers cover single tickets; ordered packages are
-not implemented yet.
+`export`/`migrate --coordination`. `offer publish --package PKG` and
+`offer assign --package PKG` offer a whole continuity package instead of one
+ticket: acceptance starts only the package's first ready member and binds every
+remaining member to that worker (see [Continuity packages](#continuity-packages)).
+
+### Continuity packages
+
+A **package** is the contract "A then B, by the same worker".
+`arbite package create T1 T2 [...] --agent <coordinator>` bundles two or more open
+tickets in order; package order is a scheduling edge, so only the current member
+(the first one not closed) can be acquired, and only that member is offered by
+`list next` -- and only to the worker the package is bound to. Creation is
+all-or-nothing (`package_conflict`): a member that is closed, assigned, active,
+offered, reserved by someone else or already in another package is refused, and
+package order plus the tickets' own `depends_on` may not form a cycle.
+Dependencies outside the package are reported as external prerequisites.
+
+Accepting the first member -- directly with `arbite claim`, or by accepting
+`arbite offer publish/assign --package PKG` -- binds every remaining member to that
+worker id in the same transaction. Each member is its own attempt; closing one
+releases its file claims, and the next member needs a **fresh read**. *Same
+worker* is a continuity identity, not the same model session: use
+`arbite package note PKG TEXT --agent W` for handoff context and
+`arbite package handoff PKG --reason TEXT (--to W | --release) [--interrupt]
+[--note TEXT]` to rebind or release the remaining members. Completed members stay
+completed, nothing times out, and a blocked member stops the package until it is
+explicitly resolved. `package show|list` report progress, the current member,
+external prerequisites and the next action.
+
+### The board: readiness, capacity and routing
+
+`arbite board --worker W [--epic E] [--tier T] [--count N] [--json]` answers one
+question per candidate ticket: ready now, or not -- and if not, why. It is a query
+that claims nothing, and it exits `2` when nothing is ready, so a caller needs no
+resident loop. Every exclusion carries a stable reason `code` and an `axis`:
+`status`/`classification` (`ticket_not_open`, `ticket_unclassified`),
+`dependency` (`dependencies_unmet`), `attempt` (`active_attempt`), `reservation`
+(`reserved_elsewhere`), `offer` (`offer_ineligible`, with the nested eligibility
+reasons such as `worker_not_allowed`), `continuity` (`package_order`,
+`package_bound_elsewhere`), `worker` (`worker_ineligible`: tier, capability,
+locality, cost ceiling -- an unknown value fails) and `capacity`
+(`capacity_exhausted`). The output also reports the declared capacity, the active
+attempts counted against it and the free slots, plus `suggestions` -- the compatible
+ready work in the order `list next` would hand it out.
+
+One evaluator backs the board, `list next` and acquisition, so a board cannot
+disagree with what `claim` accepts -- but it also cannot promise that a ticket it
+reports ready is still free when you act on it, because acquisition re-checks
+every condition under the operation lock. Advisory `--prefer-*` hints are reported
+and never decide pickup: the first eligible claimant wins, and an owner who wants a
+preference *enforced* uses a hard constraint or an explicit `offer assign`.
+`arbite reserve progress RESERVATION [--owner OWNER] [--state active|released|all]`
+is the coordinator's view of the same state: every member classified `completed`,
+`blocked`, `active`, `dependency_waiting`, `ready` or `unavailable`, with its
+current worker and latest recorded activity. That activity timestamp is an
+observation read from durable records -- arbite never infers that a worker is alive
+or dead, and no heartbeat expires anything.
+
+### Events and progress (external callers)
+
+`arbite events --after CURSOR --limit N [--category C] [--kind K] [--subject ID]
+[--json]` reads the durable coordination log once, in cursor order. `--after` takes
+either `0` or the `next_cursor` token a previous query returned; a token is
+store-bound (`<cursor_namespace>#<cursor>`), so a bare integer fails
+`invalid_cursor` and another store's token fails `cursor_foreign_store` (with an
+import mapping when that store's events were imported here) -- neither silently
+restarts or reads the wrong store. Filters apply to the whole ordered stream before
+`--limit`, and the returned token resumes after the last *matching* event, so a
+filtered stream neither skips nor re-reads. Every event has a stable id -- a retry
+may deliver it again, so consumers deduplicate by id -- and `read` observations are
+their own category, separate from lifecycle traffic. A caller that exits and
+returns later resumes from the token it stored; an empty page is exit `2` with the
+token still printed. This is the whole orchestration loop: **no watcher,
+subscription, notification or wakeup exists**, and a "busy" answer is an exit code,
+not a model process that has to stay alive.
+
+### Transfers, export and the doctor
+
+Profiles, reservations, offers and packages travel with `arbite export` and with
+`arbite migrate`/`arbite rebind` -- the coordination half moves attempts, claims,
+receipts, intents, profiles, reservations, offers, packages, events and artifact
+metadata together and rebinds the workspace. A transfer **refuses while job-board
+work is in flight**, reporting `store_not_quiescent` and naming the active
+attempt(s), claim(s), intent(s), operation(s), reservation(s), published offer(s)
+and live package(s) that block it, writing nothing. End the work and reconcile it,
+or pass an explicit override: `--force --reason TEXT`, reported on stderr (and as
+`unquiescent_override` in `rebind --json`) rather than applied silently. A released
+reservation, a withdrawn or finished offer and a completed or released package do
+not block. The export bundle verifies its own job-board references and overlaps and
+fingerprints the job-board records, so a lossy transfer is refused instead of being
+reported as verified.
+
+`arbite doctor` adds report-only job-board checks whenever the store carries
+coordination state -- dangling and overlapping reservations/offers/packages, a
+package/reservation membership mismatch, an invalid continuity binding, an attempt
+disagreeing with its ticket, impossible capacity arithmetic, an unreadable event
+cursor registry. They are findings only: `--fix` repairs none of them, and `doctor`
+exits `3` while any remains. There is no delete for a profile (`worker disable`
+keeps its history and running attempts) and no delete for a reservation, offer or
+package -- they close by state.
+
+### Owner recipe: the manual two-provider demonstration
+
+This is the epic's acceptance demonstration, run in a throwaway directory with the
+CLI only: no provider adapter, no server, nothing started by arbite. "Alice" uses
+Claude and "Bob" uses GPT; both are plain worker ids with provider *labels*, and a
+coordinator handles the reservation. Capture the ids the commands print and
+substitute them in the next step -- the transcript notes below are from a real run.
+
+```bash
+mkdir /tmp/job-board && cd /tmp/job-board && git init -q .
+arbite init
+
+# 1. Two workers, two providers, two labels. This launches nothing.
+arbite worker register claude.opus.001 --tier high --provider anthropic \
+    --model claude-opus-5 --capability python --locality local --cost-class paid \
+    --capacity 2 --json
+arbite worker register openai.gpt.002 --tier medium --provider openai \
+    --model gpt-5 --capability python --locality remote --cost-class paid \
+    --capacity 2 --json
+
+# 2. Four tickets: one ad-hoc, one to assign, two to package.
+arbite create --title "ad-hoc work"         --type chore --tier medium --domain python --epic board --priority 1
+arbite create --title "direct assignment"   --type chore --tier medium --domain python --epic board --priority 2
+arbite create --title "sequence member one" --type chore --tier medium --domain python --epic board --priority 3
+arbite create --title "sequence member two" --type chore --tier medium --domain python --epic board --priority 4
+
+# 3. What is ready, and what is not (exit 0 with work, 2 with none).
+arbite board --worker claude.opus.001
+
+# 4. The coordinator holds three: one assigned to Alice, two packaged for Bob.
+arbite reserve create <direct> <member-one> <member-two> --agent coord.lead
+arbite offer assign <direct> --worker claude.opus.001 --agent coord.lead
+arbite package create <member-one> <member-two> --agent coord.lead
+arbite offer publish --package <pkg> --agent coord.lead --min-tier medium --require-capability python
+
+# 5. Bob cannot take Alice's assignment, so he accepts the sequence instead:
+#    that starts member one and binds both members to him.
+arbite claim <direct> --agent openai.gpt.002                 # exit 1: directly assigned
+arbite offer claim <offer> --agent openai.gpt.002            # -> claimed <member-one>
+
+# 6. Alice cannot steal Bob's second member -- plain or with --force (exit 1).
+arbite claim <member-two> --agent claude.opus.001
+
+# 7. Bob works member one through the proxy. Attempt ids come from the export.
+arbite export --scope coordination --no-artifacts            # records.work_attempts:
+                                                            # ticket_id <member-one>, state active
+arbite file claim src/step_one.py --ticket <member-one> --attempt <att-one>
+printf 'step = 1\n' | arbite file write src/step_one.py --ticket <member-one> --attempt <att-one> --input -
+arbite file read src/step_one.py --ticket <member-one> --attempt <att-one> --json   # -> read_token
+printf 'step = 1  # openai.gpt.002\n' | arbite file write src/step_one.py --ticket <member-one> \
+    --attempt <att-one> --read-token <token> --input -
+arbite changes <member-one> --json                           # receipts, tagged with the attempt
+
+# 8. Closing a member releases its file claims; the next member is a NEW attempt.
+arbite close <member-one> --agent openai.gpt.002
+arbite package claim <pkg> --agent openai.gpt.002             # member two, its own attempt id
+
+# 9. Alice takes her assignment; the coordinator watches with no resident loop.
+arbite claim <direct> --agent claude.opus.001
+arbite reserve progress <rsv> --json                         # per-member counts + workers
+
+# 10. Events are read once, and a NEW process resumes from the stored token.
+arbite events --after 0 --limit 3 --json                     # -> data.next_cursor
+arbite events --after <next_cursor> --limit 3 --json
+
+# 11. Finish: the store is quiescent, so it transfers, board state and all.
+arbite close <direct> --agent claude.opus.001
+arbite reserve release <rsv> --agent coord.lead
+arbite doctor                                                # exit 0, no problems
+arbite migrate --to sqlite                                   # copies the board, rebinds
+arbite board --worker claude.opus.001 --json                 # reads the destination
+```
+
+What to look for:
+
+- `board --worker claude.opus.001` exits `0` with a `ready` list, the worker's
+  declaration and its free capacity; with nothing ready it exits `2`.
+- `reserve create` prints a reservation id and leaves every member `open` with
+  `attempts created: 0`.
+- `claim <direct> --agent openai.gpt.002` exits `1`: the ticket "is directly
+  assigned to claude.opus.001 (offer off-...)".
+- `claim <member-two> --agent claude.opus.001` exits `1`: the ticket "is member 2
+  of package pkg-...; members are worked in order" -- identical with
+  `--force --reason`.
+- `package show <pkg>` ends `completed -- all 2 members closed (bound
+  openai.gpt.002)`; the two members have **different** attempt ids in
+  `arbite export`, and `arbite changes` shows each member's write receipts under
+  its own attempt.
+- After the first member closes, `file claim src/step_one.py` with *another*
+  attempt succeeds (the claim was released), and the next member's file must be
+  claimed and read again.
+- `reserve progress` prints the counts (`{'completed': 2, 'active': 1, ...}`) and
+  one line per member with its worker; the activity timestamps are observations,
+  not liveness.
+- `events --after 0 --limit 3 --json` returns cursors `1,2,3` plus a
+  `next_cursor`; a **separate process** using that token returns `4,5,6`.
+- `migrate --to sqlite` on the quiescent store copies the board: `worker list`,
+  `reserve list --state all`, `events` and `board` all answer in the destination
+  and `arbite doctor` still exits `0`. While a reservation or an offer is live the
+  same command refuses with `store_not_quiescent` and names the records.
+
+The same flow, with no human at the keyboard, is asserted by
+[`tests/test_job_board_acceptance.py`](tests/test_job_board_acceptance.py:1) on
+both sinks.
+
+### Deferred
+
+Live fleet registration, cross-project discovery, network transport, provider
+adapters and spawning, bidding, dynamic price lookup, agent authentication,
+notification delivery, heartbeat expiration, automatic stale recovery, and
+cross-machine or global capacity arbitration. Worth knowing before relying on it: a
+worker id and its provider/model labels are *attribution, not authentication*;
+profile values are operator assertions, not verified facts; declared capacity is
+never a global pool; `last_checkin` is a self-declaration, never liveness; the
+attempt/claim event records the worker id but not the profile revision used at
+acquisition; `unblock`'s resume path does not re-check reservations (it can only
+resume the ticket's existing assignee); and mutation evidence accumulates with no
+garbage collection.
 
 ---
 
@@ -585,8 +811,11 @@ The package exposes the console script `arbite`, providing:
 | Proxy mutation | `file claim`, `file release`, `file write`, `file edit`, `file remove`, `file rename` |
 | Evidence | `changes [--attempt A] [--include-reads]` |
 | Worker profiles | `worker register\|show\|list\|update\|disable\|enable\|checkin\|check` |
-| Reservations | `reserve create\|show\|list\|add\|remove\|release` |
-| Offers | `offer publish\|assign\|list\|show\|withdraw\|claim` |
+| Reservations | `reserve create\|show\|list\|progress\|add\|remove\|release` |
+| Offers | `offer publish\|assign\|list\|show\|withdraw\|claim` (one ticket or a whole `--package`) |
+| Packages | `package create\|show\|list\|claim\|note\|handoff` |
+| Job board | `board --worker W [--epic E] [--tier T] [--count N]` (a query; claims nothing) |
+| Events | `events --after CURSOR --limit N [--category C] [--kind K] [--subject ID]` |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run] [--coordination\|--no-coordination]`, `rebind --to <sink>`, `export [--scope ...] [--out FILE] [--no-artifacts]` |
 | Integrity | `doctor [--fix]` (tickets plus coordination findings) |
 | Destruction | `delete <id> --force` |
@@ -879,6 +1108,9 @@ src/arbite/
   eligibility.py        worker eligibility vocabulary and pure evaluation
   reservations.py       coordinator reservations over explicit ticket sets
   offers.py             offers/direct assignments and atomic worker pickup
+  readiness.py          the one readiness evaluator (board, list next, acquisition)
+  packages.py           ordered same-worker continuity packages
+  events.py             ordered, cursor-resumable event queries (+ progress views)
 tests/
   test_sink_conformance.py  one suite, run against every sink
   test_file_sink.py         file-specific: folders, drift, temp files, archives
@@ -887,6 +1119,7 @@ tests/
   test_coordination_*.py    attempts/lifecycle, claims, reads, mutations, journal,
                             changes, export, migration, doctor (both sinks)
   test_proxy_acceptance.py  two-process shared-directory acceptance on both sinks
+  test_job_board_acceptance.py  manual two-provider job-board acceptance (both sinks)
   test_graph.py             dependency-graph semantics, pinned
   test_query.py             query vocabulary semantics, pinned
 scripts/
@@ -911,12 +1144,18 @@ The shared-directory coordination layer is implemented on top of that: the
 write/edit/remove/rename), work attempts with guarded lifecycle cleanup, durable
 change evidence (`arbite changes`), crash-safe recovery with no daemon, and
 coordination-aware `export`/`rebind`/`migrate --coordination`/`doctor`. The
-job-board epic has begun with passive worker profiles, eligibility checks at
-acquisition, coordinator reservations, and offers/direct assignments with atomic
-pickup; its packages, board and event queries are still to come. Both sinks
-carry the same semantics, and the file sink never requires SQLite. Deliberately
-absent, and documented as such above: any runner, daemon, watcher or scheduler,
-automatic stale detection or takeover, worktrees, a central database, a dashboard,
-and artifact garbage collection. `CLAUDE.md` remains the canonical record of the
+job board is implemented on top of that, and documented above: passive worker
+profiles with an authoritative tier, enforced per-worker capacity and
+eligibility/media checks; coordinator reservations with explicit, all-or-nothing
+membership; offers and direct assignments with atomic pickup; ordered same-worker
+continuity packages with explicit handoff; one readiness evaluator behind
+`board`, `list next` and acquisition; a read-only reservation progress view; and
+durable, cursor-resumable `arbite events`. Migration/export/doctor preserve and
+verify the job-board records, and `arbite doctor` reports their integrity without
+repairing it. Both sinks carry the same semantics, and the file sink never
+requires SQLite. Deliberately absent, and documented as such above: any runner,
+daemon, watcher or scheduler, provider adapters or spawning, automatic stale
+detection or takeover, heartbeats, worktrees, a central database, a dashboard, and
+artifact garbage collection. `CLAUDE.md` remains the canonical record of the
 original design; open judgement calls and any schema change should be raised there
 before implementation.
