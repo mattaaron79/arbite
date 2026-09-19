@@ -5268,7 +5268,7 @@ def build_parser():
         parser_.add_argument("--capacity", default=None, metavar="N",
                              help="declared concurrent-work capacity (integer >= 1"
                              + ("" if register else ", or 'none' to clear") + "); "
-                             "recorded, not yet enforced")
+                             "enforced at acquisition -- only active attempts count")
         parser_.add_argument("--actor", default=None, metavar="NAME",
                              help="who is making this change (attribution only)")
         _json_flag(parser_)

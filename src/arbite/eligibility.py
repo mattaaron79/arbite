@@ -23,9 +23,10 @@ Rules the vocabulary encodes:
 - **Requirements, not preferences.** Nothing here ranks candidates or treats a
   preference (prefer local/low cost) as a rule; there is no pricing catalog and
   no currency conversion (differing cost units fail with `cost_unit_mismatch`).
-- **Capacity is carried, not counted.** `WorkerDeclaration.capacity` is the
-  declared limit; counting active attempts against it belongs to the
-  acquisition-time capacity check, which is not implemented in this slice.
+- **Capacity is declared here, counted at acquisition.** `WorkerDeclaration.capacity`
+  is the declared limit; `readiness.require_capacity` counts active attempts
+  against it when work is acquired, so pure eligibility never rejects on
+  capacity.
 
 Declared values are attribution, not authentication; see
 `coordination.ATTRIBUTION_NOTICE`.
