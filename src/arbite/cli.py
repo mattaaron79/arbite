@@ -20,6 +20,8 @@ Commands therefore work in terms of ticks and queries, never paths:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import json
 import os
 import sys
@@ -242,11 +244,25 @@ def _expect_from(ticket: Ticket) -> Expect:
 
     Every mutating command writes through this, so if anything changed the ticket
     between the read and the write -- another agent claimed it, someone else
-    closed it -- the write is refused with a Conflict instead of silently
-    discarding that change. Commands that edit prose without changing state
-    (`note`, `set` of a non-status field) still use it; only `move_to_bucket`
-    does not, because filing is not a state change."""
-    return Expect(status=ticket.status, assignee=ticket.assignee)
+    closed it, added a dependency or a note -- the write is refused with a
+    Conflict instead of silently discarding that change. The status/assignee
+    pair names the state being replaced; the store revision catches an edit to
+    any other field. Only `move_to_bucket` does not use it, because filing is
+    not a state change."""
+    return Expect(status=ticket.status, assignee=ticket.assignee, revision=ticket.revision)
+
+
+def _ticket_write_lock(sink):
+    """The coordination operation lock a plain ticket edit holds, when there is one.
+
+    Acquisition validates readiness (the ticket's dependencies, their statuses)
+    under this lock, so an edit that can change readiness -- `depend`, `set`,
+    `note` -- takes it too: the two serialize instead of racing. A sink without
+    the coordination contract has no acquisition to race, and no lock."""
+    store = sink.coordination()
+    if store is None:
+        return contextlib.nullcontext()
+    return store.operation_lock()
 
 
 def _lifecycle(args, sink, agent=None) -> "lifecycle.TicketLifecycle":
@@ -908,21 +924,23 @@ def cmd_claim(args):
     one winner; a losing claim raises before any attempt is recorded."""
     sink = _require_sink(args)
     ctl = _lifecycle(args, sink, agent=args.agent)
-    t = sink.get(args.id, unique=True)
-    previous = t.assignee
-    result = ctl.acquire(
-        t,
-        worker_id=args.agent,
-        adopt=bool(getattr(args, "adopt", False)),
-        takeover=bool(getattr(args, "force", False)),
-        reason=getattr(args, "reason", None),
-    )
-    if result.took_over and previous and previous != args.agent:
-        taken = sink.get(result.ticket.id, unique=True)
-        schema.append_note(taken, args.agent, f"Claim taken over from {previous} (--force).")
-        taken.updated = schema.now()
-        sink.update(taken, expect=_expect_from(taken))
-        result = lifecycle.AcquisitionResult(taken, result.attempt, True, True)
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        previous = t.assignee
+        result = ctl.acquire(
+            t,
+            worker_id=args.agent,
+            adopt=bool(getattr(args, "adopt", False)),
+            takeover=bool(getattr(args, "force", False)),
+            reason=getattr(args, "reason", None),
+        )
+        if result.took_over and previous and previous != args.agent:
+            taken = sink.get(result.ticket.id, unique=True)
+            expect = _expect_from(taken)
+            schema.append_note(taken, args.agent, f"Claim taken over from {previous} (--force).")
+            taken.updated = schema.now()
+            sink.update(taken, expect=expect)
+            result = lifecycle.AcquisitionResult(taken, result.attempt, True, True)
     print(f"claimed {result.ticket.id} for {args.agent} -> {sink.location(result.ticket.id)}")
 
 
@@ -941,32 +959,37 @@ def cmd_release(args):
     there is no attempt to bypass."""
     sink = _require_sink(args)
     ctl = _lifecycle(args, sink, agent=args.agent)
-    t = sink.get(args.id, unique=True)
-    attempt = ctl.active_attempt(t.id)
-    if attempt is not None:
-        ctl.require_ownership(
-            attempt,
-            args.agent,
-            force=getattr(args, "force", False),
-            reason=args.reason,
-            action="release",
-        )
-    if t.status == "open" and t.assignee is None:
-        raise TicketError(f"ticket {t.id} is already open and unassigned")
-    previous = t.assignee
-    expect = _expect_from(t)
-    message = "Released." if not args.reason else f"Released: {args.reason}"
-    schema.append_note(t, args.agent, message)
-    t.assignee = None
-    t.blocked_by = None
-    t.status = "open"
-    t.updated = schema.now()
-    if attempt is not None:
-        state = "interrupted" if _revocation_requested(args, attempt, args.agent) else "released"
-        ctl.end_attempt(attempt, state=state, reason=args.reason or None)
-    sink.update(t, expect=expect)
-    if attempt is None:
-        ctl.record_transition("released", t.id)
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        attempt = ctl.active_attempt(t.id)
+        if attempt is not None:
+            ctl.require_ownership(
+                attempt,
+                args.agent,
+                force=getattr(args, "force", False),
+                reason=args.reason,
+                action="release",
+            )
+        if t.status == "open" and t.assignee is None:
+            raise TicketError(f"ticket {t.id} is already open and unassigned")
+        before = copy.deepcopy(t)
+        previous = t.assignee
+        message = "Released." if not args.reason else f"Released: {args.reason}"
+        schema.append_note(t, args.agent, message)
+        t.assignee = None
+        t.blocked_by = None
+        t.status = "open"
+        t.updated = schema.now()
+        if attempt is not None:
+            state = "interrupted" if _revocation_requested(args, attempt, args.agent) else "released"
+            ctl.commit_transition(
+                "release", t, previous=before, end=attempt, end_state=state,
+                reason=args.reason or None,
+            )
+        else:
+            ctl.commit_transition(
+                "release", t, previous=before, events=[ctl.transition_event("released", t.id)]
+            )
     owner = f" (was {previous})" if previous else ""
     print(f"released {t.id}{owner} -> {sink.location(t.id)}")
 
@@ -982,29 +1005,36 @@ def cmd_block(args):
     sink = _require_sink(args)
     agent = getattr(args, "agent", "system")
     ctl = _lifecycle(args, sink, agent=agent)
-    t = sink.get(args.id, unique=True)
-    attempt = ctl.active_attempt(t.id)
-    if attempt is not None:
-        ctl.require_ownership(
-            attempt,
-            agent,
-            force=getattr(args, "force", False),
-            reason=args.reason,
-            action="block",
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        attempt = ctl.active_attempt(t.id)
+        if attempt is not None:
+            ctl.require_ownership(
+                attempt,
+                agent,
+                force=getattr(args, "force", False),
+                reason=args.reason,
+                action="block",
+            )
+        before = copy.deepcopy(t)
+        t.blocked_by = args.reason
+        t.status = "blocked"
+        t.updated = schema.now()
+        event = ctl.ticket_event(
+            "ticket_blocked",
+            t.id,
+            attempt_id=attempt.id if attempt is not None else None,
+            payload={"ticket_id": t.id, "blocked_by": args.reason, "agent": agent},
         )
-    expect = _expect_from(t)
-    t.blocked_by = args.reason
-    t.status = "blocked"
-    t.updated = schema.now()
-    if attempt is not None:
-        ctl.end_attempt(attempt, state="interrupted", reason=args.reason)
-    sink.update(t, expect=expect)
-    ctl.record_ticket_event(
-        "ticket_blocked",
-        t.id,
-        attempt_id=attempt.id if attempt is not None else None,
-        payload={"ticket_id": t.id, "blocked_by": args.reason, "agent": agent},
-    )
+        ctl.commit_transition(
+            "block",
+            t,
+            previous=before,
+            end=attempt,
+            end_state="interrupted" if attempt is not None else None,
+            reason=args.reason,
+            events=[event],
+        )
     print(f"blocked {t.id} ({args.reason}) -> {sink.location(t.id)}")
 
 
@@ -1022,51 +1052,58 @@ def cmd_unblock(args):
     sink = _require_sink(args)
     agent = getattr(args, "agent", "system")
     ctl = _lifecycle(args, sink, agent=agent)
-    t = sink.get(args.id, unique=True)
-    if t.status != "blocked":
-        raise TicketError(f"ticket {t.id} is not blocked (status: {t.status})")
-    attempt = ctl.active_attempt(t.id)
-    if attempt is not None:
-        ctl.require_ownership(
-            attempt,
-            agent,
-            force=getattr(args, "force", False),
-            reason=args.reason,
-            action="unblock",
-        )
-    reason = t.blocked_by
-    was = f" (was blocked by: {reason})" if reason else ""
-    message = f"Unblocked: {args.reason}" if args.reason else "Unblocked."
-    if reason:
-        message = f"{message.rstrip('.')} (was blocked by: {reason})."
-    expect = _expect_from(t)
-    schema.append_note(t, agent, message)
-    t.blocked_by = None
-    t.updated = schema.now()
-    # Back to whoever was working it if it is still assigned, otherwise open.
-    dest = "in_progress" if (t.assignee and not args.open) else "open"
-    t.status = dest
-    if dest == "open":
-        t.assignee = None
-    if attempt is not None:
-        revoked = _revocation_requested(args, attempt, agent)
-        if dest == "in_progress" and not revoked:
-            ctl.touch(attempt)
-        else:
-            ctl.end_attempt(
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        if t.status != "blocked":
+            raise TicketError(f"ticket {t.id} is not blocked (status: {t.status})")
+        attempt = ctl.active_attempt(t.id)
+        if attempt is not None:
+            ctl.require_ownership(
                 attempt,
-                state="interrupted" if revoked else "released",
-                reason=args.reason or None,
+                agent,
+                force=getattr(args, "force", False),
+                reason=args.reason,
+                action="unblock",
             )
-    sink.update(t, expect=expect)
-    if dest == "in_progress" and attempt is None:
-        # `block` ended the previous attempt, so resuming mints a *fresh*
-        # generation: the old attempt and its file tokens stay dead, and a new
-        # read must be taken under the new attempt before any write.
-        ctl.start_resumed_attempt(t, worker_id=t.assignee, reason=args.reason)
-    ctl.record_ticket_event(
-        "ticket_unblocked", t.id, payload={"ticket_id": t.id, "status": dest, "agent": agent}
-    )
+        reason = t.blocked_by
+        was = f" (was blocked by: {reason})" if reason else ""
+        message = f"Unblocked: {args.reason}" if args.reason else "Unblocked."
+        if reason:
+            message = f"{message.rstrip('.')} (was blocked by: {reason})."
+        before = copy.deepcopy(t)
+        schema.append_note(t, agent, message)
+        t.blocked_by = None
+        t.updated = schema.now()
+        # Back to whoever was working it if it is still assigned, otherwise open.
+        dest = "in_progress" if (t.assignee and not args.open) else "open"
+        t.status = dest
+        if dest == "open":
+            t.assignee = None
+        cascade = {}
+        if attempt is not None:
+            revoked = _revocation_requested(args, attempt, agent)
+            if dest == "in_progress" and not revoked:
+                cascade = {"touch": attempt}
+            else:
+                cascade = {
+                    "end": attempt,
+                    "end_state": "interrupted" if revoked else "released",
+                    "reason": args.reason or None,
+                }
+        elif dest == "in_progress":
+            # `block` ended the previous attempt, so resuming mints a *fresh*
+            # generation: the old attempt and its file tokens stay dead, and a new
+            # read must be taken under the new attempt before any write.
+            handoff = f"resumed after block: {args.reason}" if args.reason else "resumed after block"
+            cascade = {
+                "start": ctl.new_attempt(t.id, worker_id=t.assignee, handoff=handoff),
+                "origin": lifecycle.ORIGIN_RESUMED,
+                "reason": args.reason,
+            }
+        event = ctl.ticket_event(
+            "ticket_unblocked", t.id, payload={"ticket_id": t.id, "status": dest, "agent": agent}
+        )
+        ctl.commit_transition("unblock", t, previous=before, events=[event], **cascade)
     print(f"unblocked {t.id}{was} -> {sink.location(t.id)}")
 
 
@@ -1080,41 +1117,47 @@ def cmd_close(args):
     sink = _require_sink(args)
     agent = getattr(args, "agent", "system")
     ctl = _lifecycle(args, sink, agent=agent)
-    t = sink.get(args.id, unique=True)
-    attempt = ctl.active_attempt(t.id)
-    if attempt is not None:
-        ctl.require_ownership(
-            attempt,
-            agent,
-            force=getattr(args, "force", False),
-            reason=getattr(args, "reason", ""),
-            action="close",
-        )
-    expect = _expect_from(t)
-    t.closed = schema.now()
-    t.updated = t.closed
-    t.status = "closed"
-    if attempt is not None:
-        revoked = _revocation_requested(args, attempt, agent)
-        # end_attempt reconciles incomplete operations (an ambiguous one refuses
-        # the close) and releases the attempt's file claims in the same
-        # transaction that finishes/interrupts it.
-        ctl.end_attempt(
-            attempt,
-            state="interrupted" if revoked else "finished",
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        attempt = ctl.active_attempt(t.id)
+        if attempt is not None:
+            ctl.require_ownership(
+                attempt,
+                agent,
+                force=getattr(args, "force", False),
+                reason=getattr(args, "reason", ""),
+                action="close",
+            )
+        else:
+            # No attempt to end, but a prior interrupted operation must still be
+            # reconciled so close cannot report itself clean over ambiguous bytes.
+            # (With an attempt, commit_transition reconciles before ending it.)
+            ctl.reconcile_operations()
+        before = copy.deepcopy(t)
+        t.closed = schema.now()
+        t.updated = t.closed
+        t.status = "closed"
+        revoked = attempt is not None and _revocation_requested(args, attempt, agent)
+        # One journaled transition: the ticket write, the attempt ending, the
+        # release of its file claims (plus a defensive sweep of any orphan claim a
+        # pre-C09 store holds for the ticket) and the ticket_closed event either
+        # all happen or none do.
+        ctl.commit_transition(
+            "close",
+            t,
+            previous=before,
+            end=attempt,
+            end_state=("interrupted" if revoked else "finished") if attempt is not None else None,
             reason=(getattr(args, "reason", "") or "closed"),
+            sweep_ticket_claims=True,
+            events=[
+                ctl.ticket_event(
+                    "ticket_closed",
+                    t.id,
+                    payload={"ticket_id": t.id, "closed": t.closed, "agent": agent},
+                )
+            ],
         )
-    else:
-        # No attempt to end, but a prior interrupted operation must still be
-        # reconciled so close cannot report itself clean over ambiguous bytes.
-        ctl.reconcile_operations()
-    # Defensive sweep: end_attempt already released the attempt's claims; this
-    # also releases any orphan claim a pre-C09 store may hold for the ticket.
-    ctl.release_ticket_claims(t.id, reason=getattr(args, "reason", "") or "closed")
-    sink.update(t, expect=expect)
-    ctl.record_ticket_event(
-        "ticket_closed", t.id, payload={"ticket_id": t.id, "closed": t.closed, "agent": agent}
-    )
     print(f"closed {t.id} -> {sink.location(t.id)}")
 
 
@@ -1130,36 +1173,38 @@ def cmd_reopen(args):
     sink = _require_sink(args)
     agent = getattr(args, "agent", "system")
     ctl = _lifecycle(args, sink, agent=agent)
-    t = sink.get(args.id, unique=True)
-    if t.status == "open":
-        raise TicketError(f"ticket {t.id} is already open")
-    attempt = ctl.active_attempt(t.id)
-    if attempt is not None:
-        ctl.require_ownership(
-            attempt,
-            agent,
-            force=getattr(args, "force", False),
-            reason=getattr(args, "reason", ""),
-            action="reopen",
-        )
-    expect = _expect_from(t)
-    t.closed = None
-    t.blocked_by = None
-    t.status = "open"
-    t.updated = schema.now()
-    schema.append_note(t, agent, "Reopened.")
-    if attempt is not None:
-        revoked = _revocation_requested(args, attempt, agent)
-        ctl.end_attempt(
-            attempt,
-            state="interrupted" if revoked else "released",
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        if t.status == "open":
+            raise TicketError(f"ticket {t.id} is already open")
+        attempt = ctl.active_attempt(t.id)
+        if attempt is not None:
+            ctl.require_ownership(
+                attempt,
+                agent,
+                force=getattr(args, "force", False),
+                reason=getattr(args, "reason", ""),
+                action="reopen",
+            )
+        before = copy.deepcopy(t)
+        t.closed = None
+        t.blocked_by = None
+        t.status = "open"
+        t.updated = schema.now()
+        schema.append_note(t, agent, "Reopened.")
+        revoked = attempt is not None and _revocation_requested(args, attempt, agent)
+        ctl.commit_transition(
+            "reopen",
+            t,
+            previous=before,
+            end=attempt,
+            end_state=("interrupted" if revoked else "released") if attempt is not None else None,
             reason=(getattr(args, "reason", "") or "reopened"),
+            events=[
+                ctl.ticket_event("ticket_reopened", t.id, payload={"ticket_id": t.id, "agent": agent})
+            ],
         )
-    sink.update(t, expect=expect)
-    ctl.record_ticket_event(
-        "ticket_reopened", t.id, payload={"ticket_id": t.id, "agent": agent}
-    )
-    affected = ctl.invalidate_dependents(t, sink.query(TicketQuery(buckets=("*",))))
+        affected = ctl.invalidate_dependents(t, sink.query(TicketQuery(buckets=("*",))))
     if affected:
         print(
             f"note: {len(affected)} live ticket(s) depend on {t.id} and are no longer "
@@ -1178,32 +1223,34 @@ def cmd_shelve(args):
     sink = _require_sink(args)
     agent = getattr(args, "agent", "system")
     ctl = _lifecycle(args, sink, agent=agent)
-    t = sink.get(args.id, unique=True)
-    attempt = ctl.active_attempt(t.id)
-    if attempt is not None:
-        ctl.require_ownership(
-            attempt,
-            agent,
-            force=getattr(args, "force", False),
-            reason=args.reason,
-            action="shelve",
-        )
-    expect = _expect_from(t)
-    t.status = "shelved"
-    t.updated = schema.now()
-    message = "Shelved." if not args.reason else f"Shelved: {args.reason}"
-    schema.append_note(t, "system", message)
-    if attempt is not None:
-        revoked = _revocation_requested(args, attempt, agent)
-        ctl.end_attempt(
-            attempt,
-            state="interrupted" if revoked else "released",
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        attempt = ctl.active_attempt(t.id)
+        if attempt is not None:
+            ctl.require_ownership(
+                attempt,
+                agent,
+                force=getattr(args, "force", False),
+                reason=args.reason,
+                action="shelve",
+            )
+        before = copy.deepcopy(t)
+        t.status = "shelved"
+        t.updated = schema.now()
+        message = "Shelved." if not args.reason else f"Shelved: {args.reason}"
+        schema.append_note(t, "system", message)
+        revoked = attempt is not None and _revocation_requested(args, attempt, agent)
+        ctl.commit_transition(
+            "shelve",
+            t,
+            previous=before,
+            end=attempt,
+            end_state=("interrupted" if revoked else "released") if attempt is not None else None,
             reason=args.reason or None,
+            events=[
+                ctl.ticket_event("ticket_shelved", t.id, payload={"ticket_id": t.id, "agent": agent})
+            ],
         )
-    sink.update(t, expect=expect)
-    ctl.record_ticket_event(
-        "ticket_shelved", t.id, payload={"ticket_id": t.id, "agent": agent}
-    )
     print(f"shelved {t.id} -> {sink.location(t.id)}")
 
 
@@ -1219,47 +1266,52 @@ def cmd_unshelve(args):
     sink = _require_sink(args)
     agent = getattr(args, "agent", "system")
     ctl = _lifecycle(args, sink, agent=agent)
-    t = sink.get(args.id, unique=True)
-    if t.status != "shelved":
-        raise TicketError(f"ticket {t.id} is not shelved (status: {t.status})")
-    attempt = ctl.active_attempt(t.id)
-    if attempt is not None:
-        ctl.require_ownership(
-            attempt,
-            agent,
-            force=getattr(args, "force", False),
-            reason=args.reason,
-            action="unshelve",
-        )
-    expect = _expect_from(t)
-    t.updated = schema.now()
-    message = "Unshelved." if not args.reason else f"Unshelved: {args.reason}"
-    schema.append_note(t, "system", message)
-    t.assignee = None
-    t.blocked_by = None
-    t.status = "open"
-    if attempt is not None:
-        revoked = _revocation_requested(args, attempt, agent)
-        ctl.end_attempt(
-            attempt,
-            state="interrupted" if revoked else "released",
+    with ctl.locked():
+        t = sink.get(args.id, unique=True)
+        if t.status != "shelved":
+            raise TicketError(f"ticket {t.id} is not shelved (status: {t.status})")
+        attempt = ctl.active_attempt(t.id)
+        if attempt is not None:
+            ctl.require_ownership(
+                attempt,
+                agent,
+                force=getattr(args, "force", False),
+                reason=args.reason,
+                action="unshelve",
+            )
+        before = copy.deepcopy(t)
+        t.updated = schema.now()
+        message = "Unshelved." if not args.reason else f"Unshelved: {args.reason}"
+        schema.append_note(t, "system", message)
+        t.assignee = None
+        t.blocked_by = None
+        t.status = "open"
+        revoked = attempt is not None and _revocation_requested(args, attempt, agent)
+        ctl.commit_transition(
+            "unshelve",
+            t,
+            previous=before,
+            end=attempt,
+            end_state=("interrupted" if revoked else "released") if attempt is not None else None,
             reason=args.reason or None,
+            events=[
+                ctl.ticket_event(
+                    "ticket_unshelved", t.id, payload={"ticket_id": t.id, "agent": agent}
+                )
+            ],
         )
-    sink.update(t, expect=expect)
-    ctl.record_ticket_event(
-        "ticket_unshelved", t.id, payload={"ticket_id": t.id, "agent": agent}
-    )
     print(f"unshelved {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_note(args):
     sink = _require_sink(args)
-    t = sink.get(args.id, unique=True)
-    message = " ".join(args.message)
-    expect = _expect_from(t)
-    schema.append_note(t, args.agent, message)
-    t.updated = schema.now()
-    sink.update(t, expect=expect)
+    with _ticket_write_lock(sink):
+        t = sink.get(args.id, unique=True)
+        message = " ".join(args.message)
+        expect = _expect_from(t)
+        schema.append_note(t, args.agent, message)
+        t.updated = schema.now()
+        sink.update(t, expect=expect)
     print(f"added note to {t.id} by {args.agent}")
 
 
@@ -1316,8 +1368,17 @@ def cmd_deps(args):
 def cmd_depend(args):
     """Set or clear a ticket's depends_on. With two arguments, <tic_a> is made to
     depend on <tic_b> (added to its depends_on, deduplicated). With a single
-    argument, all of <tic_a>'s dependencies are cleared."""
+    argument, all of <tic_a>'s dependencies are cleared.
+
+    Held under the same operation lock acquisition validates readiness under, so
+    a dependency added while a claim is in flight either lands first (and the
+    claim is refused) or after (and the claim stands) -- never erased."""
     sink = _require_sink(args)
+    with _ticket_write_lock(sink):
+        _depend_locked(args, sink)
+
+
+def _depend_locked(args, sink):
     t = sink.get(args.id, unique=True)
     expect = _expect_from(t)
     if args.dep is None:
@@ -1383,6 +1444,11 @@ def cmd_set(args):
     closed."""
     sink = _require_sink(args)
     ctl = _lifecycle(args, sink)
+    with ctl.locked():
+        _set_locked(args, sink, ctl)
+
+
+def _set_locked(args, sink, ctl):
     t = sink.get(args.id, unique=True)
     assignments = args.assignments
     if len(assignments) % 2 != 0:
@@ -1536,15 +1602,17 @@ def cmd_delete(args):
     # with an active attempt/claim is refused so cleanup is not bypassed, and one
     # with retained change history is refused rather than silently cascaded away.
     ctl = _lifecycle(args, sink, agent=getattr(args, "agent", None))
-    ctl.require_deletable(t)
     note = f"Deleted by {args.agent}" + (f": {args.reason}" if args.reason else ".")
     location = sink.location(t.id)
-    if not args.dry_run:
-        expect = _expect_from(t)
-        schema.append_note(t, args.agent, note)
-        t.updated = schema.now()
-        sink.update(t, expect=expect)
-        sink.remove(t.id)
+    with ctl.locked():
+        t = sink.get(t.id, unique=True)
+        ctl.require_deletable(t)
+        if not args.dry_run:
+            expect = _expect_from(t)
+            schema.append_note(t, args.agent, note)
+            t.updated = schema.now()
+            sink.update(t, expect=expect)
+            sink.remove(t.id)
     if args.json:
         payload = t.to_dict(location)
         payload.update({"deleted": not args.dry_run, "note": note})
@@ -1769,6 +1837,7 @@ _COORDINATION_WORK_KINDS = (
     "operation_receipt",
     "operation_intent",
     "recovery_report",
+    "lifecycle_intent",
 )
 
 
@@ -1906,6 +1975,7 @@ _EXPORT_COORDINATION_COUNT_KEYS = (
     "operation_receipts",
     "operation_intents",
     "recovery_reports",
+    "lifecycle_intents",
     "events",
     "artifacts",
 )
@@ -2425,6 +2495,7 @@ def cmd_file_read(args):
             lines=getattr(args, "lines", None),
             actor=Actor(attempt.worker_id),
             fail_if_busy=args.fail_if_busy,
+            version_only=bool(getattr(args, "version_only", False)),
         )
     except CoordinationError as error:
         _file_error(args, error)
@@ -2446,6 +2517,10 @@ def cmd_file_read(args):
             f"({receipt.non_writable_reason}); claim and re-read before writing",
             file=sys.stderr,
         )
+    if receipt.version_only:
+        print(f"{receipt.path}: {receipt.whole_file_digest} ({receipt.size} bytes, {receipt.encoding})")
+        print(f"read_token: {receipt.read_token}")
+        return
     end = "" if receipt.text.endswith("\n") else "\n"
     print(receipt.text, end=end)
 
@@ -3722,7 +3797,10 @@ def build_parser():
         "has claimed still returns the bytes, but with an explicit busy owner and a "
         "NON-writable receipt; --fail-if-busy refuses instead so no tokens are spent "
         "on bytes that cannot be written. A write requires a FRESH read after claiming, "
-        "by this same attempt: the returned read_token is that evidence.",
+        "by this same attempt: the returned read_token is that evidence, and it is "
+        "consumed by the mutation it authorizes. --version-only records the whole-file "
+        "version without serving content; it works for binary files, whose token a "
+        "whole-file replacement presents.",
     )
     p_file_read.add_argument("path", metavar="PATH", help="workspace-relative file to read")
     p_file_read.add_argument(
@@ -3743,6 +3821,12 @@ def build_parser():
         action="store_true",
         help="refuse with file_busy (naming the holder) instead of serving bytes from a "
         "file claimed by another attempt",
+    )
+    p_file_read.add_argument(
+        "--version-only",
+        action="store_true",
+        help="record the whole-file version and return a read token without serving "
+        "content (works for binary files; cannot be combined with --lines)",
     )
     _json_flag(p_file_read)
     _sink_flag(p_file_read)

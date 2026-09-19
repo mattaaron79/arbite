@@ -10,7 +10,10 @@ This is the read half of the shared-directory file proxy. It sits above
   mints a write-authorizing observation.
 - `read` -- serve a whole file or a requested line range, with the whole-file
   digest recorded even for a ranged read. A read does **not** take an exclusive
-  lock and does **not** acquire ownership.
+  lock and does **not** acquire ownership. `version_only=True` records the
+  whole-file version *without* serving content: it works for any regular file,
+  including the binary and UTF-16/32 files the text surface refuses, so an
+  existing binary file has a read token to be replaced under.
 - `probe` -- observe an absent creation destination so a later create is known to
   be safe. A probe is inspection only: it acquires nothing and records no
   observation.
@@ -31,7 +34,8 @@ The planning contract, made executable here:
   `application.require_write_authorization`, which re-checks all of this.
 - **Ranged reads identify the whole file.** `digest` covers the entire file even
   when `--lines` returned a window; the receipt states `content_complete: false`
-  so a partial view is never presented as the whole file.
+  so a partial view is never presented as the whole file. A version-only receipt
+  is likewise `content_complete: false` with `version_only: true` and no text.
 - **Absence is explicit.** A probe of an absent path reports `version: ABSENT`
   and `safe_to_create`, and names the claim a create will need. Nothing is
   created, claimed or owned by a probe.
@@ -332,6 +336,7 @@ class ReadReceipt:
     busy: bool
     busy_owner: Optional[dict]
     observed_at: str
+    version_only: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -341,6 +346,7 @@ class ReadReceipt:
             "actor": self.actor,
             "operation_id": self.operation_id,
             "read_token": self.read_token,
+            "version_only": self.version_only,
             "whole_file_digest": self.whole_file_digest,
             "size": self.size,
             "encoding": self.encoding,
@@ -776,6 +782,7 @@ class FileReadService:
         lines: Optional[Tuple[int, int]] = None,
         actor: Optional[Actor] = None,
         fail_if_busy: bool = False,
+        version_only: bool = False,
     ) -> ReadReceipt:
         """Serve `path` (or a line range of it) with an explicit write receipt.
 
@@ -783,7 +790,18 @@ class FileReadService:
         held by another attempt is still served, but the receipt is non-writable
         and names the holder; with `fail_if_busy` that becomes a `file_busy`
         refusal before any bytes are returned.
+
+        `version_only=True` records the observation (whole-file digest, claim
+        generation and mutation sequence, write authorization) but serves no
+        content, so it works for binary and non-UTF-8 files the text surface
+        refuses. It is the read token a whole-file replacement of such a file
+        presents. It cannot be combined with `lines`.
         """
+        if version_only and lines is not None:
+            raise UnsupportedCoordination(
+                "a version-only read serves no content, so it takes no line range",
+                details={"path": str(path), "reason": "version_only_with_lines"},
+            )
         target = path_policy.resolve_target(
             self.root, path, mode=path_policy.MODE_READ, case_insensitive=self._case
         )
@@ -805,10 +823,17 @@ class FileReadService:
 
         data = _read_bytes(target.absolute)
         digest = digest_of_bytes(data)
-        text, encoding, newline = _decode(data)
         size = len(data)
+        if version_only:
+            # No content is served, so any encoding (and any size) is fine: the
+            # receipt is the whole-file version, which is all a replacement needs.
+            encoding = _classify(data)
+            text = ""
+            newline = _newline_shape(data) if encoding in ("utf-8", "utf-8-sig") else NEWLINE_NONE
+        else:
+            text, encoding, newline = _decode(data)
 
-        if lines is None and size > MAX_READ_BYTES:
+        if not version_only and lines is None and size > MAX_READ_BYTES:
             raise UnsupportedCoordination(
                 f"{target.relative!r} is {size} bytes, above the whole-file read limit "
                 f"of {MAX_READ_BYTES}; request a line range with --lines START:END",
@@ -821,7 +846,10 @@ class FileReadService:
                 },
             )
 
-        content, returned_range, clamped, empty, lines_total = _extract_range(text, lines)
+        if version_only:
+            content, returned_range, clamped, empty, lines_total = "", None, False, False, 0
+        else:
+            content, returned_range, clamped, empty, lines_total = _extract_range(text, lines)
 
         now = self.service.now()
         authorizing = bool(
@@ -852,6 +880,7 @@ class FileReadService:
             actor=actor,
             authorize=authorizing,
             observed_claim_generation=holder.generation if holder is not None else None,
+            version_only=version_only,
         )
 
         return ReadReceipt(
@@ -866,7 +895,7 @@ class FileReadService:
             encoding=encoding,
             newline=newline,
             text=content,
-            content_complete=lines is None,
+            content_complete=lines is None and not version_only,
             lines_total=lines_total,
             line_range_requested=tuple(lines) if lines is not None else None,
             line_range_returned=returned_range,
@@ -880,6 +909,7 @@ class FileReadService:
             busy=busy,
             busy_owner=_busy_owner_dict(holder) if busy else None,
             observed_at=observation.observed_at,
+            version_only=version_only,
         )
 
     def read_observation(self, token: str) -> ReadObservation:

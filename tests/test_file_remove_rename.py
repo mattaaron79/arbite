@@ -353,13 +353,16 @@ def test_remove_keeps_binary_bytes_verbatim(sink, arbite_dir):
         sink, arbite_dir, files=(("src/bin.dat", "\x00placeholder\n"),)
     )
     (root / "src" / "bin.dat").write_bytes(payload)
-    # A binary file has no obtainable read token (the read surface refuses it), so
-    # the claim's recorded digest is the authorization; no token is passed.
+    # The text surface cannot serve a binary file, but a version-only read gives
+    # it the token a removal needs; holding the claim alone is not enough.
     claims.claim(attempt, ["src/bin.dat"])
     with pytest.raises(UnsupportedCoordination):
         reads.read(attempt, "src/bin.dat")
+    with pytest.raises(StaleRead):
+        mutations.remove(attempt, "src/bin.dat")
+    token = reads.read(attempt, "src/bin.dat", version_only=True).read_token
 
-    result = mutations.remove(attempt, "src/bin.dat")
+    result = mutations.remove(attempt, "src/bin.dat", read_token=token)
 
     assert result.applied
     assert not (root / "src" / "bin.dat").exists()
@@ -369,13 +372,15 @@ def test_remove_keeps_binary_bytes_verbatim(sink, arbite_dir):
 
 def test_remove_binary_without_ownership_is_still_refused(sink, arbite_dir):
     payload = b"\x00\x01\xff\xfebinary"
-    mutations, _reads, _claims, attempt, root, _service = _project(
+    mutations, reads, _claims, attempt, root, _service = _project(
         sink, arbite_dir, files=(("src/bin.dat", "\x00placeholder\n"),)
     )
     (root / "src" / "bin.dat").write_bytes(payload)
+    # A version-only read without the claim is evidence, not permission.
+    token = reads.read(attempt, "src/bin.dat", version_only=True).read_token
 
     with pytest.raises(ClaimConflict):
-        mutations.remove(attempt, "src/bin.dat")
+        mutations.remove(attempt, "src/bin.dat", read_token=token)
 
     assert (root / "src" / "bin.dat").read_bytes() == payload
 

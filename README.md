@@ -320,7 +320,10 @@ never requires SQLite.
   and version-checked inside an operation lock. Replacing an existing file
   requires a *fresh* read token recorded by the same attempt after it claimed the
   path; a stale, pre-claim, foreign or already-consumed token changes no bytes and
-  returns `stale_read`. `rename` owns both paths, and a destination held by
+  returns `stale_read`. A token is consumed by the mutation it authorizes, even
+  one that writes identical bytes. A binary file, which cannot be read as text,
+  gets its token from `arbite file read PATH --version-only`, which records the
+  whole-file version without serving content. `rename` owns both paths, and a destination held by
   another attempt leaves neither path touched. v1 has no recursive deletion and
   no metadata editing.
 - **Evidence.** `arbite changes T [--attempt A] [--include-reads] [--json]` keeps

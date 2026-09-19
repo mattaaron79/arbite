@@ -37,7 +37,12 @@ AUTO-FIX (`fixed=True`, only when the answer is unambiguous):
 - leftover write-ahead journals -> `store.replay_journals()` (file sink only);
 - a missing *derived* per-operation event index -> `store.rebuild_event_operation_index`;
 - an *unversioned* legacy record envelope that validates -> re-stored through the
-  store's public API as a normal `RECORD_ENVELOPE_VERSION` envelope.
+  store's public API as a normal `RECORD_ENVELOPE_VERSION` envelope;
+- a pending lifecycle intent (a transition a crash interrupted between its ticket
+  write and its coordination cascade) -> settled exactly as the next lifecycle
+  command would settle it: rolled forward when the ticket shows the recorded
+  target state, abandoned when it does not. Needs the ticket sink, so a doctor
+  given a bare store only reports it.
 
 REPORT ONLY (never repaired here): drifted pending intents (the bytes match neither
 side), missing/corrupt artifacts, revision drift, event cursor conflicts, orphan
@@ -238,6 +243,7 @@ def _build_context(sink, store, *, fix, tickets, pending_before, allow_binding_r
     receipt_ids = {r.id for r in by_kind.get("operation_receipt", [])}
 
     return {
+        "sink": sink,
         "store": store,
         "fix": fix,
         "tickets": tickets,
@@ -998,6 +1004,97 @@ def _check_stale_operation_index(ctx):
     return problems
 
 
+def _lifecycle_for(ctx, workspace_id):
+    """A `TicketLifecycle` able to settle intents for `workspace_id`, or None.
+
+    Built from the *stored* workspace record (which carries its authoritative
+    binding) rather than through `coordination_service_for`, so a doctor never
+    re-binds or re-registers anything while it is repairing."""
+    from .application import Actor, CoordinationService
+    from .lifecycle import TicketLifecycle
+
+    sink = ctx["sink"]
+    if not callable(getattr(sink, "read", None)):
+        return None
+    for record in ctx["by_kind"].get("workspace", []):
+        if record.id == workspace_id and record.store_binding is not None:
+            service = CoordinationService(record, ctx["store"], actor=Actor("arbite.doctor"))
+            return TicketLifecycle(service, sink)
+    return None
+
+
+def _check_pending_lifecycle_intents(ctx):
+    """A lifecycle transition a crash left between its ticket write and cascade.
+
+    While pending, the ticket and its attempt may disagree (a closed ticket whose
+    attempt still reads as active), and the attempt is refused every claim and
+    mutation until the transition is settled."""
+    problems = []
+    store = ctx["store"]
+    sink = ctx["sink"]
+    for intent in ctx["by_kind"].get("lifecycle_intent", []):
+        if not getattr(intent, "is_pending", False):
+            continue
+        base = (
+            f"lifecycle_intent {intent.id!r} ('{intent.transition}' of ticket "
+            f"{intent.ticket_id}) is pending"
+        )
+        ticket = None
+        if callable(getattr(sink, "read", None)):
+            try:
+                ticket = sink.read(intent.ticket_id)
+            except Exception:
+                ticket = None
+        if ticket is None:
+            outcome = "the ticket cannot be read, so it would be abandoned"
+        elif (
+            ticket.revision != intent.expected_revision
+            and ticket.status == intent.target_status
+            and ticket.assignee == intent.target_assignee
+        ):
+            outcome = "the ticket write landed, so its coordination cascade would be completed"
+        else:
+            outcome = "the ticket write never landed, so it would be abandoned"
+        lifecycle = _lifecycle_for(ctx, intent.workspace_id) if ctx["fix"] else None
+        if lifecycle is None:
+            suffix = " (re-run with --fix)" if not ctx["fix"] else " (no ticket sink to settle it)"
+            problems.append(
+                Problem(
+                    "pending_lifecycle_intent",
+                    f"{base}; {outcome}{suffix}",
+                    ticket_id=intent.ticket_id,
+                    fixed=False,
+                )
+            )
+            continue
+        try:
+            with store.operation_lock():
+                with store.transaction(write=False) as tx:
+                    current = tx.get("lifecycle_intent", intent.id)
+                state = current.state if current is not None else "missing"
+                if current is not None and current.is_pending:
+                    state = lifecycle._settle(current)
+        except Exception as error:
+            problems.append(
+                Problem(
+                    "pending_lifecycle_intent",
+                    f"{base}; settling it failed: {error}",
+                    ticket_id=intent.ticket_id,
+                    fixed=False,
+                )
+            )
+        else:
+            problems.append(
+                Problem(
+                    "pending_lifecycle_intent",
+                    f"{base}; {outcome} -- it is now {state!r}",
+                    ticket_id=intent.ticket_id,
+                    fixed=True,
+                )
+            )
+    return problems
+
+
 _CHECKS = (
     ("orphan claims", _check_orphan_claims),
     ("invalid generations", _check_invalid_generations),
@@ -1011,6 +1108,7 @@ _CHECKS = (
     ("unreadable records", _check_unreadable_records),
     ("pending operations", _check_pending_operations),
     ("stale operation indexes", _check_stale_operation_index),
+    ("pending lifecycle intents", _check_pending_lifecycle_intents),
 )
 
 

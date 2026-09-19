@@ -25,15 +25,17 @@ The three acquisition origins
 One active attempt per ticket
 -----------------------------
 
-The invariant is enforced twice, deliberately:
+The invariant is enforced three times, deliberately:
 
 1. **Readiness** (`require_claimable`) refuses a ticket that is not `open`, not
    classified, has unmet dependencies, or already has an active attempt. It names
    the blocking reason in the message so an agent can act on it without guessing.
 2. **The ticket compare-and-swap** (`TicketSink.update(..., expect=Expect(status=,
-   assignee=))`) is what makes exactly one of two concurrent claims of one ticket
-   win. The loser's `Conflict` is raised before any coordination write, so no
-   attempt row survives for it.
+   assignee=, revision=))`) is what makes exactly one of two concurrent claims of
+   one ticket win, and -- through the revision -- what stops a claim from
+   overwriting a concurrent edit to any other field. The loser's `Conflict`
+   abandons its journal entry before any attempt is written, so no attempt row
+   survives for it.
 3. **The coordination transaction** re-checks "no active attempt for this ticket"
    *inside* the transaction that stores the attempt, which is what makes adoption
    (where the ticket state does not change, so a CAS cannot detect a race) safe.
@@ -46,31 +48,48 @@ supersede are ownership (a legacy `in_progress` ticket with no attempt record,
 which is recovered rather than silently reassigned) and a live attempt (explicit
 administrative takeover, which interrupts it and starts a new generation).
 
-Why the ticket CAS and the coordination write are two steps, not one
---------------------------------------------------------------------
+The lifecycle journal: two stores, one recoverable transition
+-------------------------------------------------------------
 
-The obvious implementation nests the ticket CAS inside the coordination
-transaction. That is impossible for the shipped SQLite sink: the coordination
-transaction holds ``BEGIN IMMEDIATE`` on the same database file the ticket store
-uses, so a nested ticket write on a second connection fails with "database is
-locked". Rather than branch on sink kind -- which would break the "both sinks
-behave equivalently" rule -- acquisition runs the ticket CAS first and the
-coordination write second, and compensates by reverting the ticket if the
-coordination write fails. This is documented, not hidden:
+A transition changes two stores that cannot commit together. Nesting the ticket
+write inside the coordination transaction is impossible for the shipped SQLite
+sink (the coordination transaction holds ``BEGIN IMMEDIATE`` on the database the
+ticket store also writes), and branching on sink kind would break the "both sinks
+behave equivalently" rule. So every transition -- acquisition, release, block,
+unblock, close, reopen, shelve, unshelve -- goes through `commit_transition`,
+which makes the gap recoverable instead of pretending it is not there:
 
-- a **lost** claim (the CAS refused) leaves no attempt record at all;
-- a **coordination-storage failure** after a successful CAS reverts the ticket and
-  propagates the error;
-- the two stores are **not** updated atomically, so a crash between them can leave
-  a ticket `in_progress` with no attempt -- exactly the legacy state ``--adopt``
-  exists to resolve. (C04's explicit binding work is where true cross-store
-  atomicity would be designed; this ticket does not pretend to have it.)
+1. **Validate under the operation lock.** Every transition holds the coarse
+   operation lock (as does every file mutation and every dependency edit), reads
+   the ticket, its dependencies and its attempts fresh, and refuses anything not
+   allowed *before* writing.
+2. **Journal.** A `LifecycleIntent` naming the whole transition -- the ticket
+   revision it expects, the status/assignee it will write, the attempt it ends or
+   starts, the claims it releases and the events it records -- is committed to the
+   coordination store.
+3. **Ticket write (the commit point).** A compare-and-swap on the ticket's
+   status, assignee *and revision*, so a concurrent edit to any field -- a new
+   dependency, a note -- refuses the transition instead of being overwritten. A
+   refusal abandons the intent; nothing else has changed.
+4. **Coordination cascade.** One transaction applies everything the intent names
+   and marks it `completed`. If it fails, the ticket write is reverted (again by
+   revision) and the intent `abandoned`: a failed close leaves an in_progress
+   ticket with its attempt and claims intact, never a half-closed one.
+
+A crash leaves the intent `pending`. The next lifecycle operation -- or
+``arbite doctor --fix`` -- settles it: when the ticket shows the target state the
+cascade is rolled forward, otherwise the transition is abandoned. Until then the
+attempt cannot claim or mutate (`application.require_current_attempt` refuses
+it), so no operation can run in the window where the ticket and its attempt
+disagree. Nothing runs on a timer: settling is part of the next operation.
 
 Dependency-edit and reopen races (documented serial outcome)
 -----------------------------------------------------------
 
-Readiness is checked against the ticket set as it is read. A dependency change
-and a claim therefore serialize in one of two honest ways: *a claim that commits
+Readiness is checked against the ticket set as it is read, under the operation
+lock that dependency edits (`depend`, `set`, `reopen`) also take, and the claim's
+ticket write is a revision compare-and-swap. A dependency change and a claim
+therefore serialize in one of two honest ways: *a claim that commits
 before the dependency change keeps its attempt* (work is not silently undone),
 while *a claim that starts after it sees the new state and is refused by
 readiness*. Reopening a completed ticket that other live tickets depend on
@@ -110,9 +129,11 @@ the transaction that ends the attempt, retaining each released claim as history.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import functools
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from . import coordination, graph, schema
 from .application import Actor, CoordinationService, require_active_attempt
@@ -120,6 +141,7 @@ from .coordination import (
     EVENT_PAYLOAD_VERSION,
     Event,
     FileClaim,
+    LifecycleIntent,
     WorkAttempt,
     new_record_id,
     utc_now,
@@ -127,9 +149,12 @@ from .coordination import (
 from .errors import (
     Conflict,
     CoordinationConflict,
+    CoordinationNotFound,
     DriftDetected,
+    InvalidRecord,
     RecoveryRequired,
     TicketError,
+    TicketNotFound,
     UnsupportedCoordination,
 )
 from .fileclaims import FileClaimService
@@ -147,6 +172,24 @@ ORIGIN_TAKEOVER = "takeover"
 #: A fresh attempt on an already-owned ticket whose previous attempt was ended
 #: (used by `unblock` when a blocked ticket resumes). Never a revocation.
 ORIGIN_RESUMED = "resumed"
+
+#: Crash-simulation boundaries for `commit_transition` (tests only). A fault at
+#: one of these raises `LifecycleFault`, which -- unlike an ordinary failure -- is
+#: never compensated, so it leaves exactly the state a process death would.
+#: The intent is durable; the ticket has not been written.
+FAULT_AFTER_INTENT = "after_intent"
+#: The ticket write landed; the coordination cascade has not run.
+FAULT_AFTER_TICKET_WRITE = "after_ticket_write"
+FAULT_PHASES = (FAULT_AFTER_INTENT, FAULT_AFTER_TICKET_WRITE)
+
+
+class LifecycleFault(Exception):
+    """A simulated crash at one lifecycle boundary (see `FAULT_PHASES`)."""
+
+    def __init__(self, phase: str):
+        super().__init__(f"lifecycle fault injected at {phase}")
+        self.phase = phase
+
 
 #: Attempt state a transition ends an attempt in -> the event kind it emits.
 _END_EVENT_KINDS = {
@@ -381,10 +424,18 @@ class TicketLifecycle:
     between calls, and never waits for or reclaims another worker's attempt.
     """
 
-    def __init__(self, coordination_service: CoordinationService, tickets, *, clock=None) -> None:
+    def __init__(
+        self,
+        coordination_service: CoordinationService,
+        tickets,
+        *,
+        clock=None,
+        fault_injector=None,
+    ) -> None:
         self.coordination = coordination_service
         self.tickets = tickets
         self._clock = clock or utc_now
+        self._fault_injector = fault_injector
         #: Lazily-built `MutationEngine`, used only for reconciliation. Built on
         #: first use so a lifecycle object with no file operations never pays for
         #: (or requires) the artifact store.
@@ -394,6 +445,27 @@ class TicketLifecycle:
 
     def now(self) -> str:
         return self._clock()
+
+    def _fault(self, phase: str) -> None:
+        """Simulate a crash at `phase` when a test installed an injector."""
+        if self._fault_injector is not None:
+            self._fault_injector(phase)
+
+    # -- serialization -----------------------------------------------------
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Hold the operation lock for a whole read-validate-write transition.
+
+        A command wraps its entire body in this, so the ticket and attempt state it
+        validates against cannot change before its own write: every transition,
+        every file mutation and every dependency edit takes the same lock. On entry
+        any transition a crash left unsettled is settled first, so the command
+        never validates against a half-applied one. Re-entrant within a process.
+        """
+        with self.coordination.store.operation_lock():
+            self.reconcile_lifecycle()
+            yield self
 
     # -- attempt queries ---------------------------------------------------
 
@@ -589,44 +661,20 @@ class TicketLifecycle:
             "-- use 'arbite close' to archive it instead"
         )
 
-    @_serialized
-    def start_resumed_attempt(
-        self, ticket: Ticket, *, worker_id: str, reason: Optional[str] = None
-    ) -> AcquisitionResult:
-        """Mint a fresh attempt for a ticket whose previous attempt was ended.
-
-        Used by `unblock` when a blocked ticket returns to `in_progress` for its
-        declared owner: `block` ended the previous attempt, and resuming work must
-        be a *new* generation -- the old attempt and its tokens stay dead. This is
-        deliberately not a `--force` takeover (nobody is being revoked); it simply
-        starts the next generation on a ticket that is already owned.
-        """
-        active = self.active_attempt(ticket.id)
-        if active is not None:
-            raise CoordinationConflict(
-                f"ticket {ticket.id} already has an active attempt {active.id} "
-                f"(worker {active.worker_id}); resume is only for a ticket with no "
-                "active attempt",
-                details={"ticket_id": ticket.id, "attempt_id": active.id},
-            )
+    def new_attempt(
+        self, ticket_id: str, *, worker_id: str, handoff: Optional[str] = None
+    ) -> WorkAttempt:
+        """A fresh, not-yet-stored attempt at the ticket's next generation."""
         now = self.now()
-        attempt = WorkAttempt(
+        return WorkAttempt(
             id=new_record_id("work_attempt"),
-            ticket_id=ticket.id,
+            ticket_id=ticket_id,
             worker_id=worker_id,
             workspace_id=self.coordination.workspace.id,
-            generation=self.next_generation(ticket.id),
+            generation=self.next_generation(ticket_id),
             started=now,
             last_activity=now,
-            handoff=(
-                f"resumed after block: {reason}" if reason else "resumed after block"
-            ),
-        )
-        self._record_acquisition(
-            ticket, attempt, old=None, origin=ORIGIN_RESUMED, reason=reason
-        )
-        return AcquisitionResult(
-            ticket=ticket, attempt=attempt, created_attempt=True, took_over=False
+            handoff=handoff,
         )
 
     def require_no_pending_operations(self, attempt: WorkAttempt, *, transaction=None) -> None:
@@ -677,13 +725,16 @@ class TicketLifecycle:
     ) -> AcquisitionResult:
         """Acquire `ticket` for `worker_id`, recording exactly one active attempt.
 
-        See the module docstring for the ordering rationale (ticket CAS first,
-        coordination transaction second, with compensation) and for the three
-        origins. Readiness is enforced *here*, not by the caller's candidate
-        filter, so no acquisition path can bypass it.
+        See the module docstring for the journaled ordering (intent, then a
+        revision compare-and-swap on the ticket, then the coordination cascade,
+        with compensation) and for the three origins. Readiness is enforced
+        *here*, under the operation lock, not by the caller's candidate filter, so
+        no acquisition path can bypass it.
         """
-        # Re-read from the sink: the caller's copy may be stale, and the CAS below
-        # must describe the state it is replacing.
+        # Settle any transition a crash left behind, then re-read from the sink:
+        # the caller's copy may be stale, and the compare-and-swap below must
+        # describe exactly the state (revision included) it is replacing.
+        self.reconcile_lifecycle()
         current = self.tickets.get(ticket.id, unique=True)
         by_id = {t.id: t for t in self.tickets.query(TicketQuery(buckets=("*",)))}
         attempts = self.attempts_for(current.id)
@@ -715,7 +766,6 @@ class TicketLifecycle:
                 f"is '{current.status}' (claim it normally with 'arbite claim')"
             )
 
-        state_changes = True
         legacy_takeover = False
         if adopt:
             origin = ORIGIN_ADOPTED
@@ -724,7 +774,6 @@ class TicketLifecycle:
             # declared owner in the attempt's handoff); for the common case of the
             # same worker resuming, this is a no-op.
             expect = Expect(status="in_progress", assignee=current.assignee)
-            state_changes = False
         elif active is not None:
             # A live attempt exists, so this is an ownership question even without
             # --force: refuse (or take over explicitly) before looking at anything
@@ -819,13 +868,7 @@ class TicketLifecycle:
             ),
         )
 
-        # --- step 1: the authoritative ticket compare-and-swap ---------------
-        previous = {
-            "status": current.status,
-            "assignee": current.assignee,
-            "blocked_by": current.blocked_by,
-            "closed": current.closed,
-        }
+        previous = copy.deepcopy(current)
         if adopt:
             current.assignee = worker_id
         else:
@@ -833,28 +876,27 @@ class TicketLifecycle:
             current.assignee = worker_id
             current.blocked_by = None
         current.updated = schema.now()
+        # Status/assignee name the state being replaced; the revision makes the
+        # swap refuse *any* intervening edit -- a dependency added between the
+        # readiness check and this write must never be silently overwritten.
+        expect = Expect(status=expect.status, assignee=expect.assignee, revision=previous.revision)
         try:
-            self.tickets.update(current, expect=expect)
+            self.commit_transition(
+                "claim",
+                current,
+                previous=previous,
+                expect=expect,
+                start=attempt,
+                supersede=active,
+                origin=origin,
+                reason=reason,
+            )
         except Conflict as e:
             raise CoordinationConflict(
                 f"refused to acquire {current.id}: the ticket changed while being "
                 f"acquired ({e})",
                 details={"ticket_id": current.id, "reason": str(e)},
             ) from e
-
-        # --- step 2: the coordination transaction ----------------------------
-        try:
-            self._record_acquisition(
-                current,
-                attempt,
-                old=active,
-                origin=origin,
-                reason=reason,
-            )
-        except BaseException:
-            if state_changes:
-                self._revert_ticket(current, previous, worker_id)
-            raise
 
         stored = self.tickets.get(current.id, unique=True)
         return AcquisitionResult(
@@ -863,127 +905,6 @@ class TicketLifecycle:
             created_attempt=True,
             took_over=bool((takeover and active is not None) or legacy_takeover),
         )
-
-    def _record_acquisition(
-        self,
-        ticket: Ticket,
-        attempt: WorkAttempt,
-        *,
-        old: Optional[WorkAttempt],
-        origin: str,
-        reason: Optional[str],
-    ) -> None:
-        """Store the attempt and its events in one guarded transaction.
-
-        The in-transaction re-check is the atomic "one active attempt per ticket"
-        guard: it is what makes concurrent *adoption* (which cannot be caught by a
-        ticket CAS, because adoption does not change ticket state) safe.
-        """
-        with self.coordination.guarded("claim", attempt=attempt, ticket_id=ticket.id) as op:
-            tx = op.transaction
-            active_now = [
-                candidate
-                for candidate in tx.find("work_attempt", ticket_id=ticket.id)
-                if candidate.is_active
-            ]
-            unexpected = [
-                candidate
-                for candidate in active_now
-                if old is None or candidate.id != old.id
-            ]
-            if unexpected:
-                raise CoordinationConflict(
-                    f"ticket {ticket.id} gained an active attempt {unexpected[0].id} "
-                    "while being acquired; nothing was recorded for this attempt",
-                    details={
-                        "ticket_id": ticket.id,
-                        "active_attempt_id": unexpected[0].id,
-                        "caller_attempt_id": attempt.id,
-                    },
-                )
-
-            if old is not None:
-                # Release the superseded attempt's claims in this same
-                # transaction, so the interrupt and the claim release commit
-                # together and no stale token survives the takeover.
-                self.release_file_claims(
-                    attempt=old,
-                    reason=reason or "superseded by an administrative takeover",
-                    transaction=tx,
-                )
-                self.require_no_pending_operations(old, transaction=tx)
-                old.interrupt(
-                    timestamp=self.now(),
-                    reason=reason or "superseded by an administrative takeover",
-                )
-                tx.put(old)
-                tx.append_event(
-                    _event(
-                        "attempt_interrupted",
-                        ticket_id=ticket.id,
-                        attempt_id=old.id,
-                        timestamp=old.ended,
-                        payload={
-                            "ticket_id": ticket.id,
-                            "worker_id": old.worker_id,
-                            "generation": old.generation,
-                            "reason": old.outcome,
-                            "superseded_by": attempt.id,
-                        },
-                    )
-                )
-
-            tx.put(attempt)
-            tx.append_event(
-                _event(
-                    "attempt_started",
-                    ticket_id=ticket.id,
-                    attempt_id=attempt.id,
-                    timestamp=attempt.started,
-                    payload={
-                        "ticket_id": ticket.id,
-                        "worker_id": attempt.worker_id,
-                        "origin": origin,
-                        "generation": attempt.generation,
-                        "handoff": attempt.handoff,
-                    },
-                )
-            )
-            tx.append_event(
-                _event(
-                    "ticket_claimed",
-                    ticket_id=ticket.id,
-                    attempt_id=attempt.id,
-                    timestamp=attempt.started,
-                    payload={
-                        "ticket_id": ticket.id,
-                        "worker_id": attempt.worker_id,
-                        "origin": origin,
-                        "generation": attempt.generation,
-                    },
-                )
-            )
-
-    def _revert_ticket(self, ticket: Ticket, previous: Dict, worker_id: str) -> None:
-        """Best-effort compensation for a failed coordination write after the CAS.
-
-        The ticket was moved but no attempt was recorded, so put it back to the
-        state it was read in. A failure here is reported by the original exception
-        (which is re-raised by the caller); the ticket is then a legacy state that
-        `--adopt`/`--force` can still resolve, so nothing is silently lost.
-        """
-        try:
-            restored = self.tickets.get(ticket.id, unique=True)
-            restored.status = previous["status"]
-            restored.assignee = previous["assignee"]
-            restored.blocked_by = previous["blocked_by"]
-            restored.closed = previous["closed"]
-            restored.updated = schema.now()
-            self.tickets.update(
-                restored, expect=Expect(status="in_progress", assignee=worker_id)
-            )
-        except Exception:  # pragma: no cover - compensation is best-effort
-            pass
 
     def _handoff_for(
         self,
@@ -1002,7 +923,7 @@ class TicketLifecycle:
 
     # -- ticket transition events -----------------------------------------
 
-    def record_ticket_event(
+    def ticket_event(
         self,
         kind: str,
         ticket_id: str,
@@ -1011,11 +932,11 @@ class TicketLifecycle:
         payload: Optional[Dict] = None,
         timestamp: Optional[str] = None,
     ) -> Event:
-        """Append one ticket-transition event in its own transaction.
+        """A validated ticket-transition event, not yet stored.
 
-        Used for transitions that happen with no active attempt (a legacy ticket),
-        so the event log still records what moved the ticket. A rejected event kind
-        raises rather than writing an unreadable row.
+        Pass it to `commit_transition(events=[...])` so it commits with the
+        transition's coordination cascade. A rejected kind raises rather than
+        producing an unreadable row.
         """
         event = _event(
             kind,
@@ -1030,11 +951,9 @@ class TicketLifecycle:
                 f"cannot record event {kind!r}: {'; '.join(problems)}",
                 details={"kind": kind, "ticket_id": ticket_id, "problems": list(problems)},
             )
-        with self.coordination.store.transaction() as tx:
-            tx.append_event(event)
         return event
 
-    def record_transition(
+    def transition_event(
         self,
         name: str,
         ticket_id: str,
@@ -1043,17 +962,16 @@ class TicketLifecycle:
         payload: Optional[Dict] = None,
         timestamp: Optional[str] = None,
     ) -> Event:
-        """Record a ticket transition that has no dedicated event kind.
+        """An event for a transition that has no dedicated event kind, not yet stored.
 
         The planning rule allows reusing `operation_recorded` (category
         `operation`) for a transition that would otherwise have no event kind, with
-        a payload describing it. Used for legacy transitions -- e.g. `release` on
-        a ticket with no active attempt -- so the event log still says what moved
-        the ticket rather than silently omitting it.
+        a payload describing it -- e.g. `release` on a ticket with no active
+        attempt -- so the event log still says what moved the ticket.
         """
         merged = {"ticket_id": ticket_id, "transition": name}
         merged.update(payload or {})
-        event = _event(
+        return _event(
             "operation_recorded",
             ticket_id=ticket_id,
             attempt_id=attempt_id,
@@ -1061,9 +979,385 @@ class TicketLifecycle:
             category="operation",
             timestamp=timestamp,
         )
+
+    def record_ticket_event(self, kind: str, ticket_id: str, **kwargs) -> Event:
+        """Append one ticket-transition event in its own transaction."""
+        event = self.ticket_event(kind, ticket_id, **kwargs)
         with self.coordination.store.transaction() as tx:
             tx.append_event(event)
         return event
+
+    def record_transition(self, name: str, ticket_id: str, **kwargs) -> Event:
+        """Append one `transition_event` in its own transaction."""
+        event = self.transition_event(name, ticket_id, **kwargs)
+        with self.coordination.store.transaction() as tx:
+            tx.append_event(event)
+        return event
+
+    # -- the lifecycle journal ---------------------------------------------
+
+    @_serialized
+    def commit_transition(
+        self,
+        name: str,
+        ticket: Ticket,
+        *,
+        previous: Ticket,
+        expect: Optional[Expect] = None,
+        end: Optional[WorkAttempt] = None,
+        end_state: Optional[str] = None,
+        touch: Optional[WorkAttempt] = None,
+        start: Optional[WorkAttempt] = None,
+        supersede: Optional[WorkAttempt] = None,
+        origin: Optional[str] = None,
+        reason: Optional[str] = None,
+        handoff: Optional[str] = None,
+        sweep_ticket_claims: bool = False,
+        events: Sequence[Event] = (),
+    ) -> LifecycleIntent:
+        """Write `ticket` and apply its coordination cascade as one recoverable unit.
+
+        `previous` is the ticket exactly as it was read (it supplies the revision
+        the write must replace, and is what a compensation restores); `ticket` is
+        the changed copy. The cascade is described by the keyword arguments: `end`
+        ends an active attempt in `end_state` (releasing its claims), `supersede`
+        interrupts a taken-over attempt, `start` stores a new attempt, `touch`
+        records activity, `sweep_ticket_claims` releases any claim still held for
+        the ticket, and `events` are appended with it.
+
+        See the module docstring for the protocol. Raises the ticket store's
+        `Conflict` when the ticket changed since `previous` was read (nothing is
+        changed), and re-raises a cascade failure after reverting the ticket.
+        """
+        if end is not None:
+            if end_state not in _END_EVENT_KINDS:
+                raise TicketError(
+                    f"unknown attempt end state {end_state!r} "
+                    f"(valid: {', '.join(sorted(_END_EVENT_KINDS))})"
+                )
+            self._stored_active(end)
+            # An ambiguous interrupted operation refuses the transition (a close
+            # cannot look clean over bytes that may already have changed); an
+            # unambiguous one is finalized first, exactly as a mutation would.
+            self.reconcile_operations()
+            self.require_no_pending_operations(end)
+        if expect is None:
+            expect = Expect(
+                status=previous.status,
+                assignee=previous.assignee,
+                revision=previous.revision,
+            )
+
+        moment = self.now()
+        intent = LifecycleIntent(
+            id=new_record_id("lifecycle_intent"),
+            workspace_id=self.coordination.workspace.id,
+            ticket_id=ticket.id,
+            transition=name,
+            actor=self.coordination.actor.id,
+            created=moment,
+            updated=moment,
+            expected_revision=previous.revision,
+            target_status=ticket.status,
+            target_assignee=ticket.assignee,
+            end_attempt_id=end.id if end is not None else None,
+            end_state=end_state if end is not None else None,
+            touch_attempt_id=touch.id if touch is not None else None,
+            supersedes_attempt_id=supersede.id if supersede is not None else None,
+            start_attempt=start,
+            origin=origin,
+            reason=reason,
+            handoff=handoff,
+            sweep_ticket_claims=bool(sweep_ticket_claims),
+            events=[event.to_dict() for event in events],
+        )
+        problems = intent.validate()
+        if problems:
+            raise InvalidRecord(
+                f"invalid lifecycle intent: {'; '.join(problems)}",
+                details={"problems": list(problems)},
+            )
+        with self.coordination.store.transaction() as tx:
+            tx.put(intent)
+        self._fault(FAULT_AFTER_INTENT)
+
+        # -- the commit point: the ticket compare-and-swap ------------------
+        try:
+            self.tickets.update(ticket, expect=expect)
+        except Conflict as error:
+            self._settle_intent(intent, "abandoned", f"ticket write refused: {error}")
+            raise
+        except LifecycleFault:
+            raise
+        except Exception:
+            # The ticket store failed; whether the write landed is decided the
+            # way reconciliation decides it, so the journal never stays pending
+            # merely because the error path ran.
+            try:
+                if self._settle(intent) == "completed":
+                    return intent
+            except Exception:  # pragma: no cover - leave it pending for later
+                pass
+            raise
+        self._fault(FAULT_AFTER_TICKET_WRITE)
+
+        # -- the coordination cascade -------------------------------------
+        try:
+            self._apply_intent(intent)
+        except LifecycleFault:
+            raise
+        except Exception as error:
+            if self._compensate(ticket, previous):
+                self._settle_intent(
+                    intent,
+                    "abandoned",
+                    f"coordination cascade failed and the ticket write was reverted: {error}",
+                )
+            raise
+        return intent
+
+    @_serialized
+    def reconcile_lifecycle(self) -> List[LifecycleIntent]:
+        """Settle every lifecycle transition a crash left pending; return them.
+
+        For each pending intent the ticket is read: if it shows the recorded
+        target status/assignee at a revision past the one the intent expected,
+        the ticket write landed and the coordination cascade is rolled forward;
+        otherwise the write never happened and the transition is abandoned. Runs
+        at the start of every lifecycle transition (see `locked`) and from
+        ``arbite doctor --fix`` -- never on a timer.
+        """
+        with self.coordination.store.transaction(write=False) as tx:
+            pending = [
+                intent
+                for intent in tx.find(
+                    "lifecycle_intent", workspace_id=self.coordination.workspace.id
+                )
+                if intent.is_pending
+            ]
+        settled: List[LifecycleIntent] = []
+        for intent in sorted(pending, key=lambda i: (i.created, i.id)):
+            self._settle(intent)
+            settled.append(intent)
+        return settled
+
+    def _settle(self, intent: LifecycleIntent) -> str:
+        """Roll one pending intent forward or abandon it; return the new state."""
+        try:
+            ticket = self.tickets.read(intent.ticket_id)
+        except TicketNotFound:
+            ticket = None
+        landed = (
+            ticket is not None
+            and ticket.revision != intent.expected_revision
+            and ticket.status == intent.target_status
+            and ticket.assignee == intent.target_assignee
+        )
+        if landed:
+            intent.detail = "completed by reconciliation after an interrupted transition"
+            self._apply_intent(intent)
+            return "completed"
+        detail = (
+            "the ticket no longer exists"
+            if ticket is None
+            else "the ticket write never landed (ticket is "
+            f"{ticket.status}/{ticket.assignee or 'unassigned'} at revision {ticket.revision})"
+        )
+        self._settle_intent(intent, "abandoned", detail)
+        return "abandoned"
+
+    def _settle_intent(self, intent: LifecycleIntent, state: str, detail: str) -> None:
+        with self.coordination.store.transaction() as tx:
+            intent.state = state
+            intent.detail = detail
+            intent.updated = self.now()
+            tx.put(intent)
+
+    def _stored_active(self, attempt: WorkAttempt) -> WorkAttempt:
+        """The stored version of `attempt`, which must still be active."""
+        with self.coordination.store.transaction(write=False) as tx:
+            stored = tx.get("work_attempt", attempt.id)
+        if stored is None:
+            raise CoordinationNotFound(
+                f"no attempt {attempt.id!r} is recorded in this store",
+                details={"attempt_id": attempt.id, "ticket_id": attempt.ticket_id},
+            )
+        return require_active_attempt(stored)
+
+    def _compensate(self, ticket: Ticket, previous: Ticket) -> bool:
+        """Revert a landed ticket write to `previous`; True when it was reverted.
+
+        Guarded by the revision the write produced, so the revert can never
+        overwrite a change made after it. A failure leaves the intent pending, and
+        reconciliation then rolls the transition forward instead."""
+        restored = copy.deepcopy(previous)
+        try:
+            self.tickets.update(
+                restored,
+                expect=Expect(
+                    status=ticket.status, assignee=ticket.assignee, revision=ticket.revision
+                ),
+            )
+        except Exception:
+            return False
+        return True
+
+    def _apply_intent(self, intent: LifecycleIntent) -> None:
+        """Apply the coordination half of `intent` in one transaction.
+
+        Everything is derived from the intent and from records re-read inside the
+        transaction, so the normal path and a roll-forward after a crash are the
+        same code. The transaction commits the attempt changes, the released
+        claims, the events and the intent's `completed` state together.
+        """
+        anchor = intent.start_attempt
+        kind = "claim"
+        if anchor is None:
+            kind = "lifecycle"
+            for attempt_id in (intent.end_attempt_id, intent.touch_attempt_id):
+                if attempt_id is None:
+                    continue
+                with self.coordination.store.transaction(write=False) as tx:
+                    found = tx.get("work_attempt", attempt_id)
+                if found is not None and found.is_active:
+                    anchor = found
+                    break
+        if anchor is not None:
+            context = self.coordination.guarded(kind, attempt=anchor, ticket_id=intent.ticket_id)
+        else:
+            context = _PlainTransaction(self.coordination.store.transaction())
+        with context as op:
+            self._cascade(op.transaction, intent)
+        return None
+
+    def _cascade(self, tx, intent: LifecycleIntent) -> None:
+        moment = self.now()
+        reason = intent.reason
+        if intent.start_attempt is not None:
+            # The atomic "one active attempt per ticket" guard, checked before the
+            # superseded attempt is interrupted in this same transaction.
+            unexpected = [
+                candidate
+                for candidate in tx.find("work_attempt", ticket_id=intent.ticket_id)
+                if candidate.is_active and candidate.id != intent.supersedes_attempt_id
+            ]
+            if unexpected:
+                raise CoordinationConflict(
+                    f"ticket {intent.ticket_id} gained an active attempt "
+                    f"{unexpected[0].id} while being acquired; nothing was recorded for "
+                    "this attempt",
+                    details={
+                        "ticket_id": intent.ticket_id,
+                        "active_attempt_id": unexpected[0].id,
+                        "caller_attempt_id": intent.start_attempt.id,
+                    },
+                )
+
+        if intent.supersedes_attempt_id is not None:
+            old = tx.get("work_attempt", intent.supersedes_attempt_id)
+            if old is not None and old.is_active:
+                why = reason or "superseded by an administrative takeover"
+                # Release the superseded attempt's claims in this same
+                # transaction, so the interrupt and the claim release commit
+                # together and no stale token survives the takeover.
+                self.release_file_claims(attempt=old, reason=why, transaction=tx)
+                self.require_no_pending_operations(old, transaction=tx)
+                old.interrupt(timestamp=moment, reason=why)
+                tx.put(old)
+                tx.append_event(
+                    _event(
+                        "attempt_interrupted",
+                        ticket_id=intent.ticket_id,
+                        attempt_id=old.id,
+                        timestamp=old.ended,
+                        payload={
+                            "ticket_id": intent.ticket_id,
+                            "worker_id": old.worker_id,
+                            "generation": old.generation,
+                            "reason": old.outcome,
+                            "superseded_by": (
+                                intent.start_attempt.id if intent.start_attempt else None
+                            ),
+                        },
+                    )
+                )
+
+        if intent.end_attempt_id is not None:
+            attempt = tx.get("work_attempt", intent.end_attempt_id)
+            if attempt is not None and attempt.is_active:
+                self._end_in(tx, attempt, intent.end_state, reason, intent.handoff, moment)
+
+        if intent.touch_attempt_id is not None:
+            attempt = tx.get("work_attempt", intent.touch_attempt_id)
+            if attempt is not None and attempt.is_active:
+                attempt.touch(timestamp=moment)
+                tx.put(attempt)
+
+        if intent.start_attempt is not None:
+            attempt = intent.start_attempt
+            tx.put(attempt)
+            for event_kind in ("attempt_started", "ticket_claimed"):
+                payload = {
+                    "ticket_id": intent.ticket_id,
+                    "worker_id": attempt.worker_id,
+                    "origin": intent.origin,
+                    "generation": attempt.generation,
+                }
+                if event_kind == "attempt_started":
+                    payload["handoff"] = attempt.handoff
+                tx.append_event(
+                    _event(
+                        event_kind,
+                        ticket_id=intent.ticket_id,
+                        attempt_id=attempt.id,
+                        timestamp=attempt.started,
+                        payload=payload,
+                    )
+                )
+
+        if intent.sweep_ticket_claims:
+            # Defensive: a claim a pre-C09 store left behind for this ticket must
+            # not keep exclusive ownership of a path once the ticket is closed.
+            self.release_file_claims(
+                ticket_id=intent.ticket_id, reason=reason or intent.transition, transaction=tx
+            )
+
+        for data in intent.events:
+            tx.append_event(Event.from_dict(data))
+
+        intent.state = "completed"
+        intent.updated = moment
+        tx.put(intent)
+
+    def _end_in(self, tx, attempt: WorkAttempt, state: str, reason, handoff, moment) -> None:
+        """End `attempt` in `state` inside `tx`, releasing its claims first."""
+        # Releasing the claims in the transaction that ends the attempt is what
+        # makes "no observer can mutate under an old token once the attempt has
+        # ended" hold.
+        self.release_file_claims(attempt=attempt, reason=reason or state, transaction=tx)
+        self.require_no_pending_operations(attempt, transaction=tx)
+        if state == "released":
+            attempt.release(timestamp=moment, handoff=handoff, outcome=reason or "released")
+        elif state == "finished":
+            attempt.finish(timestamp=moment, outcome=reason or "finished", handoff=handoff)
+        else:
+            attempt.interrupt(timestamp=moment, reason=reason or "interrupted")
+        tx.put(attempt)
+        tx.append_event(
+            _event(
+                _END_EVENT_KINDS[state],
+                ticket_id=attempt.ticket_id,
+                attempt_id=attempt.id,
+                timestamp=attempt.ended,
+                payload={
+                    "ticket_id": attempt.ticket_id,
+                    "worker_id": attempt.worker_id,
+                    "generation": attempt.generation,
+                    "outcome": attempt.outcome,
+                    "reason": reason,
+                },
+            )
+        )
 
     # -- transitions -------------------------------------------------------
 
@@ -1078,14 +1372,11 @@ class TicketLifecycle:
     ) -> WorkAttempt:
         """End an active attempt in `state` and record the matching event.
 
-        `state` is one of `released`/`finished`/`interrupted`; the attempt is
-        mutated to its terminal state inside a guarded transaction, so the record
-        and the event commit together. A terminal attempt can never be re-ended
-        (the model refuses), which is how an old token stays dead.
-
-        Callers end the attempt **before** moving the ticket: if the ticket write
-        then loses a race, the attempt is already terminal and the retry takes the
-        legacy path, rather than the ticket moving while the attempt stays active.
+        The coordination half of a transition on its own, with no ticket write --
+        the commands use `commit_transition`, which journals both halves. Acts on
+        the attempt *as stored*: an attempt another command already ended is
+        refused however current the caller's object looks. On success the
+        caller's object is updated to the terminal state as well.
         """
         require_active_attempt(attempt)
         if state not in _END_EVENT_KINDS:
@@ -1097,60 +1388,34 @@ class TicketLifecycle:
         # ambiguous one raises `DriftDetected`, so a close cannot look clean over
         # bytes that may already have changed.
         self.reconcile_operations()
+        stored = self._stored_active(attempt)
         with self.coordination.guarded(
-            "lifecycle", attempt=attempt, ticket_id=attempt.ticket_id
+            "lifecycle", attempt=stored, ticket_id=stored.ticket_id
         ) as op:
-            tx = op.transaction
-            # Release the attempt's file claims in this same transaction, so the
-            # attempt becoming terminal and the claims dying commit together: no
-            # observer can mutate under an old token once the attempt has ended.
-            self.release_file_claims(
-                attempt=attempt,
-                reason=reason or state,
-                transaction=tx,
-            )
-            self.require_no_pending_operations(attempt, transaction=tx)
-            moment = self.now()
-            if state == "released":
-                attempt.release(timestamp=moment, handoff=handoff, outcome=reason or "released")
-            elif state == "finished":
-                attempt.finish(
-                    timestamp=moment, outcome=reason or "finished", handoff=handoff
-                )
-            else:
-                attempt.interrupt(timestamp=moment, reason=reason or "interrupted")
-            tx.put(attempt)
-            tx.append_event(
-                _event(
-                    _END_EVENT_KINDS[state],
-                    ticket_id=attempt.ticket_id,
-                    attempt_id=attempt.id,
-                    timestamp=attempt.ended,
-                    payload={
-                        "ticket_id": attempt.ticket_id,
-                        "worker_id": attempt.worker_id,
-                        "generation": attempt.generation,
-                        "outcome": attempt.outcome,
-                        "reason": reason,
-                    },
-                )
-            )
+            current = op.transaction.get("work_attempt", stored.id)
+            require_active_attempt(current)
+            self._end_in(op.transaction, current, state, reason, handoff, self.now())
+        _copy_attempt(current, into=attempt)
         return attempt
 
     @_serialized
     def touch(self, attempt: WorkAttempt, when: Optional[str] = None) -> WorkAttempt:
         """Record activity on an active attempt without ending it.
 
-        Used for non-terminal transitions (a field edit, a status change that does
-        not end the work): the attempt stays active, and `last_activity` is stored
-        for a *future* stale-work policy to read. Nothing here interprets it.
+        Used for non-terminal edits (a field change on a claimed ticket): the
+        attempt stays active, and `last_activity` is stored for a *future*
+        stale-work policy to read. Nothing here interprets it.
         """
         require_active_attempt(attempt)
+        stored = self._stored_active(attempt)
         with self.coordination.guarded(
-            "lifecycle", attempt=attempt, ticket_id=attempt.ticket_id
+            "lifecycle", attempt=stored, ticket_id=stored.ticket_id
         ) as op:
-            attempt.touch(timestamp=when or self.now())
-            op.transaction.put(attempt)
+            current = op.transaction.get("work_attempt", stored.id)
+            require_active_attempt(current)
+            current.touch(timestamp=when or self.now())
+            op.transaction.put(current)
+        _copy_attempt(current, into=attempt)
         return attempt
 
     # -- reopen / dependency invalidation ----------------------------------
@@ -1222,12 +1487,41 @@ class TicketLifecycle:
             )
 
 
+class _PlainTransaction:
+    """Adapts a bare store transaction to the `guarded()` context shape.
+
+    Used by a transition with no active attempt to anchor an operation receipt to
+    (a legacy ticket), so `_apply_intent` has one code path either way."""
+
+    def __init__(self, transaction):
+        self.transaction = transaction
+
+    def __enter__(self):
+        self.transaction.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self.transaction.__exit__(exc_type, exc, tb)
+
+
+def _copy_attempt(source: WorkAttempt, *, into: WorkAttempt) -> None:
+    """Make the caller's attempt object reflect the stored outcome."""
+    if into is source:
+        return
+    for name in ("state", "ended", "outcome", "handoff", "last_activity"):
+        setattr(into, name, getattr(source, name))
+
+
 #: Documented name for the file-claim cleanup hook, now the real C09 cleanup
 #: (it releases an attempt's claims into the transaction that ends the attempt).
 release_file_claims_hook = _release_file_claims_hook
 
 __all__ = [
     "AcquisitionResult",
+    "FAULT_AFTER_INTENT",
+    "FAULT_AFTER_TICKET_WRITE",
+    "FAULT_PHASES",
+    "LifecycleFault",
     "ORIGIN_ADOPTED",
     "ORIGIN_CLAIMED",
     "ORIGIN_RESUMED",

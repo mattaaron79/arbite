@@ -39,7 +39,11 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from . import paths as path_policy
-from .application import CoordinationService, require_active_attempt
+from .application import (
+    CoordinationService,
+    require_active_attempt,
+    require_current_attempt,
+)
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
     Event,
@@ -145,6 +149,10 @@ class FileClaimService:
         Raises `FileBusy` (nothing claimed) when any path is held by another
         attempt; raises `UnsupportedCoordination` for an alias/escape/special file
         before a transaction is even opened.
+
+        The attempt is re-read inside the transaction: a caller's `attempt` object
+        may predate a close/release/takeover, and a terminal (or not yet settled)
+        attempt must not mint new claims however recently it was loaded.
         """
         require_active_attempt(attempt)
         ticket_id = ticket_id or attempt.ticket_id
@@ -157,7 +165,10 @@ class FileClaimService:
             targets.setdefault(resolved.relative, resolved)
         ordered = [targets[key] for key in sorted(targets)]
 
-        with self.service.guarded(
+        # The operation lock (taken before the store transaction, the same order
+        # every lifecycle transition and mutation uses) makes a claim wait out an
+        # in-flight transition instead of observing it half-done.
+        with self.service.store.operation_lock(), self.service.guarded(
             "claim",
             attempt=attempt,
             ticket_id=ticket_id,
@@ -165,6 +176,7 @@ class FileClaimService:
             operation_id=operation_id,
         ) as operation:
             transaction = operation.transaction
+            require_current_attempt(transaction, attempt)
             acquired: List[FileClaim] = []
             reentrant: List[FileClaim] = []
             for target in ordered:

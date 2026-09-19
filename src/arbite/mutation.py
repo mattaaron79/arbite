@@ -9,8 +9,11 @@ The protocol, in order, for every mutation
 ------------------------------------------
 
 1. **Guards.** An active attempt, a held claim, the claim generation and the
-   expected whole-file digest are all verified *inside* the operation lock. A
-   mismatch changes nothing (`stale_read`).
+   expected whole-file digest are all verified *inside* the operation lock,
+   against the attempt and claim *as stored*: the objects a caller passes in were
+   loaded before the lock and may already be dead (a close, release or takeover
+   ended them), so they are handles and expectations, never proof. A mismatch
+   changes nothing (`stale_read`, `attempt_inactive`, `claim_conflict`).
 2. **Capacity.** The before- and after-bytes are checked against the explicit
    artifact size limit. Over the limit is `artifact_capacity` *before* any
    filesystem change.
@@ -24,8 +27,9 @@ The protocol, in order, for every mutation
    destination plus source removal for rename).
 6. **Finalize.** The `OperationReceipt` and its `operation_recorded` event are
    written together, and the intent is marked `finalized`. The live claim's
-   `observed_version` is advanced, which invalidates any read token taken before
-   the change.
+   `observed_version` and `mutation_seq` are advanced, which consumes every read
+   token taken before the change -- including the one that authorized it, even
+   when the new bytes are identical to the old.
 
 If the process dies (or the sink fails) between 5 and 6, the intent survives as
 `pending` and the **next relevant operation reconciles it**: it observes the
@@ -65,6 +69,7 @@ from . import application, coordination
 from .application import (
     require_active_attempt,
     require_claim_holder,
+    require_current_attempt,
     require_expected_digest,
 )
 from .artifacts import DEFAULT_MAX_ARTIFACT_BYTES, DEFAULT_MEDIA_TYPE, check_capacity
@@ -87,6 +92,7 @@ from .errors import (
     InvalidRecord,
     RecoveryRequired,
     SinkError,
+    StaleRead,
     UnsupportedCoordination,
 )
 from .paths import MODE_CLAIM, resolve_target
@@ -341,11 +347,13 @@ class MutationEngine:
         return receipt
 
     def _advance_claims(self, tx, intent: OperationIntent) -> None:
-        """Move each live claim's `observed_version` to the recorded after-version.
+        """Move each live claim to the recorded after-version and consume tokens.
 
-        This is what invalidates a read token taken before the change: a later
-        `require_write_authorization` finds the observation's digest no longer
-        matches the claim's `observed_version` and refuses it."""
+        `observed_version` follows the bytes, and `mutation_seq` counts the
+        mutation. The sequence is what makes a read token single-use: a later
+        `require_write_authorization` refuses any observation recorded at an
+        earlier sequence, so neither an identical-bytes write nor content that
+        returns to an earlier version can revive a token that was already used."""
         for path, after in intent.after.items():
             history = tx.find("file_claim", workspace_id=self.workspace.id, path=path)
             mine = [
@@ -357,6 +365,7 @@ class MutationEngine:
                 continue
             claim = max(mine, key=lambda c: c.generation)
             claim.observed_version = after
+            claim.mutation_seq = (claim.mutation_seq or 0) + 1
             tx.put(claim)
 
     def _close_intent(self, intent: OperationIntent, state: str) -> None:
@@ -451,12 +460,18 @@ class MutationEngine:
         if kind == "rename":
             source, dest = intent.paths[0], intent.paths[1]
             before_s = intent.before[source]
+            # The destination's *recorded* before-version: ABSENT for a plain
+            # rename, the replaced file's digest when renaming over one.
+            before_d = intent.before.get(dest, ABSENT)
             after_d = intent.after[dest]
             seen_s, seen_d = observed[source], observed[dest]
+            # Checked first: when the moved bytes equal the replaced destination's,
+            # "nothing happened yet" and "destination committed" look identical,
+            # and the reading that removes nothing is the one that cannot be wrong.
+            if seen_s == before_s and seen_d == before_d:
+                return "reverted", "source and destination still match their recorded before versions"
             if seen_s == ABSENT and seen_d == after_d:
                 return "applied", "source removed and destination holds the recorded version"
-            if seen_s == before_s and seen_d == ABSENT:
-                return "reverted", "source is intact and the destination is still absent"
             if seen_s == before_s and seen_d == after_d:
                 return (
                     "applied",
@@ -466,7 +481,7 @@ class MutationEngine:
             return (
                 "drifted",
                 f"rename state is source={seen_s}, destination={seen_d}; neither the "
-                f"before ({before_s}/{ABSENT}) nor the after ({ABSENT}/{after_d})",
+                f"before ({before_s}/{before_d}) nor the after ({ABSENT}/{after_d})",
             )
         return "unknown", f"no recovery state machine for operation kind {kind!r}"
 
@@ -597,13 +612,41 @@ class MutationEngine:
             recovered=False,
         )
 
-    def _require_claim(self, attempt, path: str, claim):
-        if claim is None:
-            claim = self.claims.claim_for(path)
-        require_active_attempt(attempt)
-        return require_claim_holder(
-            claim, attempt=attempt, workspace_id=self.workspace.id, path=path
+    def _current_attempt(self, attempt):
+        """The stored, still-active attempt (see `application.require_current_attempt`).
+
+        Called inside the operation lock, which every lifecycle transition also
+        takes, so the answer cannot change before this operation finishes."""
+        with self.store.transaction(write=False) as tx:
+            return require_current_attempt(tx, attempt)
+
+    def _require_claim(self, attempt, path: str, claim=None):
+        """The live claim on `path`, which `attempt` must hold.
+
+        Always read from the store inside the operation lock. A `claim` the caller
+        passes is only an expectation: if it is no longer the live claim (released,
+        or superseded by a newer generation), the operation is refused rather than
+        authorized by a token the store has already revoked."""
+        held = require_claim_holder(
+            self.claims.claim_for(path),
+            attempt=attempt,
+            workspace_id=self.workspace.id,
+            path=path,
         )
+        if claim is not None and (claim.id != held.id or claim.generation != held.generation):
+            raise StaleRead(
+                f"the claim presented for {path!r} (generation {claim.generation}) is "
+                f"not the live claim (generation {held.generation}); re-read the file "
+                "under the current claim",
+                details={
+                    "path": path,
+                    "presented_claim": claim.id,
+                    "presented_generation": claim.generation,
+                    "current_claim": held.id,
+                    "current_generation": held.generation,
+                },
+            )
+        return held
 
     def _store_evidence(self, pieces, *, media_type: str):
         """Store each ``(bytes, role)`` pair content-addressed; return descriptors."""
@@ -718,6 +761,7 @@ class MutationEngine:
             if replay is not None:
                 return replay
 
+            attempt = self._current_attempt(attempt)
             target = self._resolve(path, mode=MODE_CLAIM)
             canonical = target.relative
             held = self._require_claim(attempt, canonical, claim)
@@ -818,6 +862,7 @@ class MutationEngine:
             if replay is not None:
                 return replay
 
+            attempt = self._current_attempt(attempt)
             target = self._resolve(path, mode=MODE_CLAIM)
             canonical = target.relative
             held = self._require_claim(attempt, canonical, claim)
@@ -909,6 +954,7 @@ class MutationEngine:
             if replay is not None:
                 return replay
 
+            attempt = self._current_attempt(attempt)
             source_target = self._resolve(source, mode=MODE_CLAIM)
             dest_target = self._resolve(destination, mode=MODE_CLAIM)
             source_key, dest_key = source_target.relative, dest_target.relative

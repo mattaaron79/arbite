@@ -121,6 +121,58 @@ def require_active_attempt(attempt: Optional[WorkAttempt]) -> WorkAttempt:
     return attempt
 
 
+def pending_lifecycle_intents(transaction, ticket_id: str) -> list:
+    """The ticket's lifecycle intents that have not settled yet, oldest first.
+
+    A pending intent means a lifecycle transition's ticket write and its
+    coordination cascade may disagree (a crash landed between them), so the
+    attempt's state cannot be trusted until the next lifecycle operation -- or
+    `arbite doctor --fix` -- settles it."""
+    found = [
+        intent
+        for intent in transaction.find("lifecycle_intent", ticket_id=ticket_id)
+        if intent.is_pending
+    ]
+    return sorted(found, key=lambda intent: (intent.created, intent.id))
+
+
+def require_current_attempt(transaction, attempt: Optional[WorkAttempt]) -> WorkAttempt:
+    """The *stored* version of `attempt`, which must still be active and settled.
+
+    The caller's `attempt` object is only a handle: it was loaded before this
+    operation began, and a close, release or takeover may have ended the attempt
+    since. This reloads it inside the caller's transaction (or operation lock) and
+    refuses a terminal attempt, and it refuses while the ticket has an unsettled
+    lifecycle transition, because then the ticket may already be closed while the
+    attempt still reads as active. Returns the stored attempt, which is what every
+    later check in the operation must use."""
+    if attempt is None:
+        raise CoordinationNotFound("no work attempt given for this operation")
+    stored = transaction.get("work_attempt", attempt.id)
+    if stored is None:
+        raise CoordinationNotFound(
+            f"no attempt {attempt.id!r} is recorded in this store",
+            details={"attempt_id": attempt.id, "ticket_id": attempt.ticket_id},
+        )
+    require_active_attempt(stored)
+    pending = pending_lifecycle_intents(transaction, stored.ticket_id)
+    if pending:
+        first = pending[0]
+        raise RecoveryRequired(
+            f"ticket {stored.ticket_id} has an unfinished '{first.transition}' "
+            f"transition (lifecycle intent {first.id}); run any lifecycle command on "
+            "the ticket, or 'arbite doctor --fix', to settle it before using attempt "
+            f"{stored.id}",
+            details={
+                "attempt_id": stored.id,
+                "ticket_id": stored.ticket_id,
+                "lifecycle_intent_id": first.id,
+                "transition": first.transition,
+            },
+        )
+    return stored
+
+
 def require_claim_holder(
     claim: Optional[FileClaim],
     *,
@@ -259,6 +311,25 @@ def require_write_authorization(
             f"observation for {claim.path!r} holds digest {observation.digest!r}, "
             f"but {wanted!r} is current; re-read the file",
             details={"path": claim.path, "observed": observation.digest, "expected": wanted},
+        )
+    # Single use, independent of content: every applied mutation advances the
+    # claim's `mutation_seq`, so a token read before it is consumed even when the
+    # bytes are identical or have returned to the version the token observed.
+    # (An observation recorded before sequences existed counts as 0.)
+    observed_seq = observation.claim_mutation_seq or 0
+    current_seq = claim.mutation_seq or 0
+    if observed_seq != current_seq:
+        raise StaleRead(
+            f"read token {observation.id} for {claim.path!r} was already consumed: "
+            f"{current_seq - observed_seq} mutation(s) have been applied under this "
+            "claim since it was read; re-read the file",
+            details={
+                "path": claim.path,
+                "read_token": observation.id,
+                "observation_mutation_seq": observed_seq,
+                "claim_mutation_seq": current_seq,
+                "reason": "token_consumed",
+            },
         )
     observation.authorize()
     return observation
@@ -480,6 +551,7 @@ class CoordinationService:
         actor: Optional[Actor] = None,
         authorize: bool = True,
         observed_claim_generation: Optional[int] = None,
+        version_only: bool = False,
     ) -> ReadObservation:
         """Record that bytes were served to `attempt`.
 
@@ -498,11 +570,18 @@ class CoordinationService:
         `observed_claim_generation` records the generation of a claim that is
         *not* the caller's (a foreign/busy holder read): the read observed that
         generation, so C06 records it even though passing `claim` itself would --
-        correctly -- be refused by `require_claim_holder`."""
+        correctly -- be refused by `require_claim_holder`.
+
+        The claim's `mutation_seq` is recorded with the observation (from the
+        claim object the caller loaded *before* reading the bytes), which is what
+        lets the next mutation under the claim consume this token.
+        `version_only` records a read that observed the whole-file version but
+        served no content."""
         canonical = canonical_relative_path(path)
         actor = actor or self.actor
         authorizing = False
         generation = None
+        mutation_seq = None
         if claim is not None:
             require_active_attempt(attempt)
             require_claim_holder(
@@ -510,6 +589,7 @@ class CoordinationService:
             )
             authorizing = bool(authorize)
             generation = claim.generation
+            mutation_seq = claim.mutation_seq or 0
         else:
             generation = observed_claim_generation
         observation = ReadObservation(
@@ -523,6 +603,8 @@ class CoordinationService:
             claim_generation=generation,
             line_range=tuple(line_range) if line_range is not None else None,
             write_authorizing=authorizing,
+            claim_mutation_seq=mutation_seq,
+            version_only=bool(version_only),
         )
         problems = observation.validate()
         if problems:
@@ -548,6 +630,7 @@ class CoordinationService:
                         "claim_generation": generation,
                         "line_range": list(observation.line_range) if observation.line_range else None,
                         "write_authorizing": authorizing,
+                        "version_only": bool(version_only),
                     },
                     payload_version=EVENT_PAYLOAD_VERSION,
                 )

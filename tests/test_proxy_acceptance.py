@@ -29,7 +29,8 @@ Covered here (the C12 acceptance criteria):
 Unresolved platform limits (documented, not papered over): arbite v1 refuses
 symlink components and special files rather than following them; there is no
 recursive deletion and no metadata (chmod/chown) editing; binary files can be
-written whole but not read through the versioned read surface; the local lock is
+written whole but their content is not served by the versioned read surface (a
+version-only read gives them a read token); the local lock is
 process-safe but a hostile local filesystem race is out of scope; and there is no
 artifact garbage collection, so evidence grows with use. These are stated in
 README.md and in the generated agent guide.

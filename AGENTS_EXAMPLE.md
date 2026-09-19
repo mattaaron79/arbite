@@ -18,7 +18,7 @@ arbite file claim PATH --ticket T --attempt A        # own the whole file
 arbite file read  PATH --ticket T --attempt A --json # RE-READ; a pre-claim read does not authorize a write
 arbite file write|edit|remove|rename ... --read-token R
 ```
-Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a stale or consumed token is refused with `stale_read` and no bytes change.
+Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a token is single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. A binary file takes `arbite file read PATH ... --version-only`, which returns a token without serving content.
 Every `arbite file` command needs your active `--attempt` id; get it from `arbite export --scope coordination --no-artifacts` (the `work_attempts` entry with your ticket_id and `state: active`).
 There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: arbite records proxy mutations only, so a generated file written into the source tree is unattributed drift. Mutation evidence and artifacts accumulate and are never garbage-collected. Arbite enforces its own operations and reports observed drift, but it cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
 

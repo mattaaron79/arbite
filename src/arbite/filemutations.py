@@ -40,13 +40,21 @@ The contract, made executable here:
   file's newline shape, so a CRLF file keeps its CRLF bytes everywhere the edit
   did not touch and inserted text follows the same convention.
 - **Binary whole-file writes are byte payloads.** The shell reads bytes and the
-  engine stores digests; no textual diff is produced or required. Permissions are
-  the engine's existing policy: a replaced file keeps its supported mode.
+  engine stores digests; no textual diff is produced or required. Replacing an
+  *existing* binary file needs a read token like any other replacement: the text
+  surface cannot serve its bytes, so the token is a version-only read
+  (`FileReadService.read(..., version_only=True)`, `arbite file read PATH
+  --version-only`), which records the whole-file version under the claim.
+  Permissions are the engine's existing policy: a replaced file keeps its
+  supported mode.
 - **Removal and rename are the same journal, not shell operations (C08).** A
   removal needs the same fresh read token a replacement write needs and stores the
   deleted bytes before unlinking; a rename needs the source token, claims BOTH the
   source and the destination (all-or-nothing), and requires the destination to be
-  ABSENT or to be named by its explicit version. An existing destination's bytes
+  ABSENT or to be named by its explicit version. A binary source (which the text
+  surface cannot serve) takes a version-only read token, exactly as a binary
+  replacement does: holding the claim never authorizes a change by itself. An
+  existing destination's bytes
   are stored as evidence before it is replaced, both paths land in the receipt, and
   an interruption between the two paths is completed by C05's recovery.
 - **A directory is never a mutation target.** `remove` reports
@@ -450,21 +458,6 @@ class FileMutationService:
 
         return authorize
 
-    @classmethod
-    def _readable_as_text(cls, absolute: str) -> bool:
-        """Whether the versioned read surface can serve this file at all.
-
-        A text file always needs a fresh read token, because one can be obtained.
-        A binary/UTF-16 file cannot be read through the proxy in v1 (C06 refuses
-        it), so no read token could ever exist for it: its claim's recorded digest
-        is the only authorization available. Either way the engine still requires
-        the observed bytes to match the held claim's version."""
-        try:
-            filereads._decode(cls._read_bytes(absolute))
-        except (UnsupportedCoordination, OSError):
-            return False
-        return True
-
     @staticmethod
     def _normalize_edits(edits) -> List[Edit]:
         if isinstance(edits, (str, bytes, bytearray, dict)):
@@ -615,8 +608,8 @@ class FileMutationService:
         elif target.exists:
             raise StaleRead(
                 f"a write to the existing file {target.relative!r} requires a "
-                "read token; read the file through arbite after claiming it, then "
-                "write with that token",
+                "read token; read the file through arbite after claiming it (a "
+                "binary file takes a version-only read), then write with that token",
                 details={"path": target.relative, "reason": REASON_MISSING_READ_TOKEN},
             )
         elif created:
@@ -714,9 +707,9 @@ class FileMutationService:
 
         Like a replacement write, a removal needs a fresh `read_token` recorded by
         this attempt after it claimed the file, and the file must still match that
-        observation (checked inside the engine's operation lock). A file the read
-        surface cannot serve (binary/UTF-16) has no obtainable token, so its held
-        claim's recorded digest is the authorization instead. A directory is refused
+        observation (checked inside the engine's operation lock). A file the text
+        read surface cannot serve (binary/UTF-16) takes a version-only read token.
+        The token is consumed by the removal. A directory is refused
         with the documented `recursive_delete_unsupported` reason: v1 never deletes
         recursively. The deleted bytes are stored content-addressed before the
         unlink, so the receipt can reproduce them."""
@@ -726,21 +719,15 @@ class FileMutationService:
                 f"cannot remove {target.relative!r}: the file does not exist",
                 details={"path": target.relative},
             )
-        authorize = None
         if read_token is None:
-            if self._readable_as_text(target.absolute):
-                raise StaleRead(
-                    f"a removal of {target.relative!r} requires a read token; read "
-                    "the file through arbite after claiming it, then remove with "
-                    "that token",
-                    details={
-                        "path": target.relative,
-                        "reason": REASON_MISSING_READ_TOKEN,
-                    },
-                )
-        else:
-            observation = self.reads.read_observation(read_token)
-            authorize = self._authorize_observation(attempt, observation)
+            raise StaleRead(
+                f"a removal of {target.relative!r} requires a read token; read the "
+                "file through arbite after claiming it (a binary file takes a "
+                "version-only read), then remove with that token",
+                details={"path": target.relative, "reason": REASON_MISSING_READ_TOKEN},
+            )
+        observation = self.reads.read_observation(read_token)
+        authorize = self._authorize_observation(attempt, observation)
         return self.engine.remove(
             attempt,
             target.relative,
@@ -835,22 +822,18 @@ class FileMutationService:
                     "reason": REASON_DESTINATION_EXISTS,
                 },
             )
-        authorize = None
         if read_token is None:
-            # A source the read surface cannot serve (binary/UTF-16) has no
-            # obtainable token; the held claim's recorded digest authorizes it.
-            if self._readable_as_text(source_target.absolute):
-                raise StaleRead(
-                    f"a rename of {source_target.relative!r} requires a read token "
-                    "for the source; read it through arbite after claiming it",
-                    details={
-                        "path": source_target.relative,
-                        "reason": REASON_MISSING_READ_TOKEN,
-                    },
-                )
-        else:
-            observation = self.reads.read_observation(read_token)
-            authorize = self._authorize_observation(attempt, observation)
+            raise StaleRead(
+                f"a rename of {source_target.relative!r} requires a read token for "
+                "the source; read it through arbite after claiming it (a binary "
+                "file takes a version-only read)",
+                details={
+                    "path": source_target.relative,
+                    "reason": REASON_MISSING_READ_TOKEN,
+                },
+            )
+        observation = self.reads.read_observation(read_token)
+        authorize = self._authorize_observation(attempt, observation)
 
         # All-or-nothing: if the destination is held by another attempt this is a
         # `file_busy` refusal and neither path is touched. Re-claiming the source is

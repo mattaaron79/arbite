@@ -26,6 +26,10 @@ Records introduced here (planning key C01, slice 1 of
   `category` so read-observation traffic can be kept out of ordinary queries.
 - `RecoveryReport` -- what an incomplete operation found on inspection, so a
   failed write is reconciled honestly instead of guessed at.
+- `LifecycleIntent` -- the durable journal entry joining a ticket transition to
+  its coordination cascade (attempt start/end, claim release, events). The ticket
+  store and the coordination store commit separately, so the intent is what lets
+  the next operation finish or abandon a transition a crash interrupted.
 
 ## Compatibility restrictions (documented, enforced by the application layer)
 
@@ -181,6 +185,15 @@ INTENT_STATES = ["pending", "applied", "finalized", "reverted", "drifted"]
 #: Intent states that still need reconciling by the next relevant operation.
 INTENT_ACTIVE_STATES = ["pending", "applied"]
 
+#: States of a `LifecycleIntent`. `pending` is written before the ticket write and
+#: is the only state reconciliation acts on; `completed` means the coordination
+#: cascade committed; `abandoned` means the ticket write never landed (or was
+#: compensated), so nothing of the transition remains to apply.
+LIFECYCLE_INTENT_STATES = ["pending", "completed", "abandoned"]
+
+#: How a `LifecycleIntent` ends the attempt it names (mirrors `WorkAttempt`).
+LIFECYCLE_END_STATES = ["released", "finished", "interrupted"]
+
 #: Record kind -> opaque id prefix. The prefix is part of the id so a task can
 #: tell a claim id from an attempt id at a glance without a store lookup.
 ID_PREFIXES = {
@@ -194,6 +207,7 @@ ID_PREFIXES = {
     "artifact": "art",
     "event": "evt",
     "recovery_report": "rcv",
+    "lifecycle_intent": "lci",
 }
 
 #: Opaque ids are `<prefix>-<16 hex chars>` (8 random bytes). Short enough to
@@ -684,7 +698,11 @@ class FileClaim(_Record):
 
     `generation` is the claim generation a mutation must present and
     `observed_version` is the whole-file digest observed when the claim was
-    taken (or `ABSENT` when the file did not exist). Releasing keeps the record
+    taken (or `ABSENT` when the file did not exist), advanced by every mutation.
+    `mutation_seq` counts the mutations applied under this claim; a read records
+    the value it saw, so a read token is consumed by the next mutation even when
+    that mutation leaves the bytes (and therefore the digest) unchanged, or when
+    later mutations return the file to an earlier version. Releasing keeps the record
     as history: `release()` sets state/timestamp and the claim is never
     reactivated -- reacquiring the path mints a new claim with a new id and
     generation, so an old token can never authorize a write.
@@ -703,6 +721,7 @@ class FileClaim(_Record):
     observed_version: str
     state: str = "active"
     released: Optional[str] = None
+    mutation_seq: int = 0
     contract_version: int = CONTRACT_VERSION
 
     @property
@@ -727,6 +746,12 @@ class ReadObservation(_Record):
     (or served to a different attempt) does not authorize a mutation. The
     application layer sets it True only for a read taken by the same active
     attempt that holds the claim, after the claim was acquired.
+
+    `claim_mutation_seq` is the holder claim's `mutation_seq` when the read was
+    taken; a token only authorizes while it still equals the claim's current
+    value, which is what makes a token single-use. `version_only` marks a read
+    that recorded the whole-file version without serving content (the receipt a
+    binary file, which the text surface cannot serve, is replaced under).
     """
 
     kind = "read_observation"
@@ -742,6 +767,8 @@ class ReadObservation(_Record):
     claim_generation: Optional[int] = None
     line_range: Optional[Tuple[int, int]] = None
     write_authorizing: bool = False
+    claim_mutation_seq: Optional[int] = None
+    version_only: bool = False
     contract_version: int = CONTRACT_VERSION
 
     @property
@@ -896,6 +923,65 @@ class OperationIntent(_Record):
 
 
 @dataclass
+class LifecycleIntent(_Record):
+    """The durable journal entry for one ticket lifecycle transition.
+
+    A transition changes two stores that cannot commit together: the ticket sink
+    (status/assignee) and the coordination store (the attempt, its file claims and
+    the transition's events). The intent is written to the coordination store
+    *before* the ticket write, and names everything the coordination half will do:
+
+    - `expected_revision` and `target_status`/`target_assignee` identify the ticket
+      write, so reconciliation can tell whether it landed;
+    - `end_attempt_id`/`end_state` (plus `reason`/`handoff`) end an attempt,
+      releasing its claims; `supersedes_attempt_id` interrupts a taken-over one;
+    - `start_attempt` is the new attempt an acquisition records;
+    - `events` are the transition's own events, with ids fixed up front.
+
+    The ticket write is the commit point. After it, the coordination half is
+    applied in one transaction and the intent is marked `completed`; if that fails
+    the ticket is reverted and the intent `abandoned`. A crash leaves the intent
+    `pending`, and the next lifecycle operation (or `doctor --fix`) finishes it
+    when the ticket shows the target state, or abandons it when it does not.
+    """
+
+    kind = "lifecycle_intent"
+    id_prefix = ID_PREFIXES["lifecycle_intent"]
+
+    id: str
+    workspace_id: str
+    ticket_id: str
+    transition: str
+    actor: str
+    created: str
+    updated: str
+    expected_revision: Optional[int] = None
+    target_status: Optional[str] = None
+    target_assignee: Optional[str] = None
+    end_attempt_id: Optional[str] = None
+    end_state: Optional[str] = None
+    touch_attempt_id: Optional[str] = None
+    supersedes_attempt_id: Optional[str] = None
+    start_attempt: Optional[WorkAttempt] = None
+    origin: Optional[str] = None
+    reason: Optional[str] = None
+    handoff: Optional[str] = None
+    sweep_ticket_claims: bool = False
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    state: str = "pending"
+    detail: Optional[str] = None
+    contract_version: int = CONTRACT_VERSION
+
+    @classmethod
+    def _nested(cls):
+        return (("start_attempt", WorkAttempt),)
+
+    @property
+    def is_pending(self) -> bool:
+        return self.state == "pending"
+
+
+@dataclass
 class Event(_Record):
     """One append-only entry in the per-store event stream.
 
@@ -983,6 +1069,7 @@ RECORD_CLASSES = {
         Artifact,
         OperationReceipt,
         OperationIntent,
+        LifecycleIntent,
         Event,
         RecoveryReport,
     )
@@ -1116,6 +1203,9 @@ def _validate_file_claim(record: FileClaim) -> list:
         _check(problems, record.released is None, "an active claim must not have a 'released' time")
     else:
         _check_utc(problems, record.released, "released")
+    _check(problems, isinstance(record.mutation_seq, int) and not isinstance(record.mutation_seq, bool)
+           and record.mutation_seq >= 0,
+           f"mutation_seq must be an integer >= 0, got {record.mutation_seq!r}")
     return problems
 
 
@@ -1130,6 +1220,10 @@ def _validate_read_observation(record: ReadObservation) -> list:
     _check_utc(problems, record.observed_at, "observed_at")
     if record.claim_generation is not None:
         _check_generation(problems, record.claim_generation, "claim_generation")
+    if record.claim_mutation_seq is not None:
+        _check(problems, isinstance(record.claim_mutation_seq, int)
+               and not isinstance(record.claim_mutation_seq, bool) and record.claim_mutation_seq >= 0,
+               f"claim_mutation_seq must be an integer >= 0, got {record.claim_mutation_seq!r}")
     if record.line_range is not None:
         ok = (
             isinstance(record.line_range, (list, tuple))
@@ -1205,6 +1299,31 @@ def _validate_operation_intent(record: OperationIntent) -> list:
         _check_generation(problems, record.claim_generation, "claim_generation")
     _check(problems, set(record.paths) == set(record.before) == set(record.after),
            "paths, before and after must name exactly the same paths")
+    return problems
+
+
+@_validator("lifecycle_intent")
+def _validate_lifecycle_intent(record: LifecycleIntent) -> list:
+    problems = []
+    _check_id(problems, record)
+    for label in ("workspace_id", "ticket_id", "transition", "actor"):
+        _check(problems, bool(getattr(record, label)), f"{label} must not be empty")
+    _check(problems, record.state in LIFECYCLE_INTENT_STATES,
+           f"state {record.state!r} is not one of {', '.join(LIFECYCLE_INTENT_STATES)}")
+    _check_utc(problems, record.created, "created")
+    _check_utc(problems, record.updated, "updated")
+    if record.expected_revision is not None:
+        _check(problems, isinstance(record.expected_revision, int)
+               and not isinstance(record.expected_revision, bool) and record.expected_revision >= 1,
+               f"expected_revision must be an integer >= 1 or null, got {record.expected_revision!r}")
+    if record.end_attempt_id is not None:
+        _check(problems, record.end_state in LIFECYCLE_END_STATES,
+               f"end_state {record.end_state!r} is not one of {', '.join(LIFECYCLE_END_STATES)}")
+    if record.start_attempt is not None:
+        for problem in validate_record(record.start_attempt):
+            problems.append(f"start_attempt: {problem}")
+    _check(problems, isinstance(record.events, list) and all(isinstance(e, dict) for e in record.events),
+           "events must be a list of event mappings")
     return problems
 
 
@@ -1338,6 +1457,9 @@ __all__ = [
     "CLAIM_STATES",
     "INTENT_ACTIVE_STATES",
     "INTENT_STATES",
+    "LIFECYCLE_END_STATES",
+    "LIFECYCLE_INTENT_STATES",
+    "LifecycleIntent",
     "CONTRACT_VERSION",
     "EVENT_CATEGORIES",
     "EVENT_KINDS",

@@ -31,8 +31,11 @@ purely. Its keys are exactly:
 - ``workspace_id`` -- the requested/selected workspace id, or `None`.
 - ``bound_at`` -- the matching `StoreBinding.bound_at` for the selected
   workspace, or `None`.
-- ``records`` -- a mapping of these eight **exact** group keys, always present
-  (possibly empty), each a list of ``record.to_dict()``:
+- ``records`` -- a mapping of these nine **exact** group keys, always present
+  in a bundle this version writes (possibly empty), each a list of
+  ``record.to_dict()``. ``lifecycle_intents`` was added after the first bundles
+  were written, so a bundle *without* it still verifies and imports (as if it
+  were empty):
 
   ========================  ==========================
   group key                 record kind
@@ -45,6 +48,7 @@ purely. Its keys are exactly:
   ``operation_receipts``    operation_receipt
   ``operation_intents``     operation_intent
   ``recovery_reports``      recovery_report
+  ``lifecycle_intents``     lifecycle_intent
   ========================  ==========================
 
   ``artifact`` records are *not* a record group: their content lives in
@@ -146,7 +150,12 @@ RECORD_GROUPS = (
     "operation_receipts",
     "operation_intents",
     "recovery_reports",
+    "lifecycle_intents",
 )
+
+#: Record groups added after the first bundles were written: a bundle that lacks
+#: one still verifies, and imports as though the group were empty.
+OPTIONAL_RECORD_GROUPS = ("lifecycle_intents",)
 
 #: Record kind -> bundle group. The mapping is total over coordination records
 #: except `artifact`, whose content is carried in `artifacts` instead.
@@ -159,6 +168,7 @@ GROUP_FOR_KIND = {
     "operation_receipt": "operation_receipts",
     "operation_intent": "operation_intents",
     "recovery_report": "recovery_reports",
+    "lifecycle_intent": "lifecycle_intents",
 }
 
 #: Every top-level key a well-formed bundle must have.
@@ -352,6 +362,10 @@ def export_coordination(sink, *, workspace_id: Optional[str] = None,
             "recovery_reports": [
                 r for r in raw["recovery_report"]
                 if workspace_id is None or r.workspace_id == workspace_id
+            ],
+            "lifecycle_intents": [
+                i for i in raw["lifecycle_intent"]
+                if workspace_id is None or i.workspace_id == workspace_id
             ],
         }
 
@@ -571,7 +585,8 @@ def _structural_problems(bundle) -> list:
     else:
         for group in RECORD_GROUPS:
             if group not in records:
-                problems.append(_invalid(f"records.{group} is missing"))
+                if group not in OPTIONAL_RECORD_GROUPS:
+                    problems.append(_invalid(f"records.{group} is missing"))
             elif not isinstance(records[group], list):
                 problems.append(_invalid(
                     f"records.{group} must be a list, got "
@@ -1102,7 +1117,8 @@ def quiescence_blockers(store, workspace_id) -> dict:
     An uninitialised store is trivially quiescent and the check creates nothing.
 
     Active work is read in one read transaction (active `work_attempt`,
-    `file_claim`, and `operation_intent` in `INTENT_ACTIVE_STATES`), and leftover
+    `file_claim`, `operation_intent` in `INTENT_ACTIVE_STATES` and pending
+    `lifecycle_intent`, both reported as `pending_intent_ids`), and leftover
     file-sink journals come from ``store.recover_pending``: a report whose state
     is not clean (`pending`, `unknown`, `drifted`) blocks.
     """
@@ -1132,6 +1148,13 @@ def quiescence_blockers(store, workspace_id) -> dict:
         intents = [
             i for i in tx.find("operation_intent")
             if i.state in coordination.INTENT_ACTIVE_STATES
+            and (workspace_id is None or i.workspace_id == workspace_id)
+        ]
+        # A lifecycle transition a crash left unsettled is in-flight work too:
+        # its ticket and its attempt may disagree until it is settled.
+        intents += [
+            i for i in tx.find("lifecycle_intent")
+            if i.is_pending
             and (workspace_id is None or i.workspace_id == workspace_id)
         ]
 
@@ -1359,6 +1382,7 @@ def migrate_coordination(source_sink, target_sink, *, workspace_id: Optional[str
 __all__ = [
     "EXPORT_VERSION",
     "RECORD_GROUPS",
+    "OPTIONAL_RECORD_GROUPS",
     "GROUP_FOR_KIND",
     "BUNDLE_KEYS",
     "export_coordination",

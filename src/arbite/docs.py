@@ -107,7 +107,7 @@ arbite file claim PATH --ticket T --attempt A        # own the whole file
 arbite file read  PATH --ticket T --attempt A --json # RE-READ; a pre-claim read does not authorize a write
 arbite file write|edit|remove|rename ... --read-token R
 ```
-Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a stale or consumed token is refused with `stale_read` and no bytes change.
+Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a token is single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. A binary file takes `arbite file read PATH ... --version-only`, which returns a token without serving content.
 Every `arbite file` command needs your active `--attempt` id; get it from `arbite export --scope coordination --no-artifacts` (the `work_attempts` entry with your ticket_id and `state: active`).
 There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: arbite records proxy mutations only, so a generated file written into the source tree is unattributed drift. Mutation evidence and artifacts accumulate and are never garbage-collected. Arbite enforces its own operations and reports observed drift, but it cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
 
@@ -578,8 +578,11 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "read, `arbite file claim PATH... --ticket T --attempt A` to own a whole file, then read "
         "again -- bytes read *before* you held the claim do not authorize a write -- and mutate "
         "with `arbite file write|edit|remove|rename`. Re-read after every claim, takeover and "
-        "ticket boundary, and before each mutation: a stale or already-consumed token is refused "
-        "with `stale_read` and no bytes change. Reading a file another attempt holds still returns "
+        "ticket boundary, and before each mutation: a token is consumed by the mutation it "
+        "authorizes (even one that writes identical bytes), and a stale or already-consumed token "
+        "is refused with `stale_read` and no bytes change. A binary file cannot be served as text; "
+        "`arbite file read PATH ... --version-only` records its version and returns the token a "
+        "replacement needs. Reading a file another attempt holds still returns "
         "the bytes, but with a `busy` owner and a non-writable receipt (`--fail-if-busy` refuses "
         "instead); claiming refused work returns structured `file_busy` naming the holder, and "
         "arbite never waits for or steals a claim. Shell is still fine for tests and builds."
