@@ -44,6 +44,7 @@ from . import (
     lifecycle,
     offers,
     packages,
+    readiness,
     reservations,
     schema,
     workers,
@@ -58,6 +59,7 @@ from .errors import (
     CoordinationError,
     CoordinationNotFound,
     TicketError,
+    WorkerIneligible,
     UnsupportedCoordination,
 )
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
@@ -714,17 +716,20 @@ def _print_topo(by_id, selected_ids, sink, as_json=False, count=None):
 def _cmd_list_next(args, sink, every):
     """Print the next open ticket(s) that are actually workable -- every ticket
     they depend on is closed -- most urgent (lowest priority number) first.
-    Readiness is decided against the complete ticket set, so an unmet
-    dependency holds a ticket back whatever tier/domain/epic its blocker sits
-    at; --tier/--domain/--epic then narrow the workable candidates, and
-    anything that isn't `open` is never considered. If nothing workable matches
-    the filters, that's an answer: nothing at that tier/domain/epic is ready
-    yet, and the exit code is 2.
 
-    With --claim, the single most urgent candidate is claimed in the same
-    command. That closes the race in the obvious two-step version (`list next`
-    then `claim`): between those two commands another agent can claim the
-    ticket you were just handed, and both agents then work it."""
+    Readiness is decided against the complete ticket set *and* the store-level
+    state (active attempts, reservations, published offers, live packages) by
+    the one evaluator in `arbite.readiness`, so this selection cannot disagree
+    with what acquisition will accept; --tier/--domain/--epic narrow the
+    workable candidates, and anything that isn't `open` is never considered. If
+    nothing workable matches the filters, that's an answer: nothing at that
+    tier/domain/epic is ready yet, and the exit code is 2.
+
+    With --claim, candidates are claimed in order in the same command, which
+    closes the race in the obvious two-step version (`list next` then `claim`).
+    A registered profile's declared capacity caps the batch: acquiring stops at
+    the free slots and a short (or empty) batch is a correct result. Every
+    acquisition re-checks readiness and capacity under the operation lock."""
     by_id = {t.id: t for t in every}
     candidates = sink.query(
         TicketQuery(
@@ -737,56 +742,58 @@ def _cmd_list_next(args, sink, every):
     )
     candidates = [t for t in candidates if graph.is_workable(t, by_id)]
 
-    # Offered (B03) and reserved (B02) tickets are only for the workers their
-    # offer admits / their owner: a plain listing has no worker identity, so it
-    # leaves them out; --claim W keeps the ones W could acquire (acquire()
-    # re-checks under the lock).
+    # Worker identity (when claiming) and one read of every store-level fact
+    # readiness needs, so `arbite board`, this selection and acquire() agree.
     store = sink.coordination()
-    held = reservations.active_reservations(store)
-    offered = offers.published_offers(store)
-    picker = None
+    declaration = None
     if args.claim:
-        picker = workers.declaration_for(store, args.claim, declared_tier=args.tier)
+        declaration = workers.declaration_for(store, args.claim, declared_tier=args.tier)
+        if not declaration.enabled:
+            eligibility.evaluate(
+                eligibility.Requirements(restricted=False), declaration
+            ).require()
+    state = readiness.load(store, every)
+    verdict = {
+        ticket.id: result for ticket, result in readiness.evaluate_all(
+            candidates, state, worker_id=args.claim, declaration=declaration
+        )
+    }
+
     # Continuity packages (B04): only a package's current member surfaces, and
     # a bound package's only for its bound worker.
-    packaged = packages.live_packages(store)
-    status_of = lambda tid: by_id[tid].status if tid in by_id else None  # noqa: E731
-    by_package = [
-        t for t in candidates if not packages.may_pick(t.id, args.claim, packaged, status_of)
-    ]
+    by_package = [t for t in candidates if verdict[t.id].has_axis("continuity")]
     if by_package:
-        candidates = [t for t in candidates if t not in by_package]
         print(
             f"note: skipped {len(by_package)} workable ticket(s) in continuity packages "
-            f"({', '.join(sorted({packaged[t.id].package.id for t in by_package}))}): later "
+            f"({', '.join(sorted({state.packages[t.id].package.id for t in by_package}))}): later "
             "members wait for earlier ones and bound members belong to their worker; see "
             "'arbite package list'",
             file=sys.stderr,
         )
-    excluded = [
-        t for t in candidates
-        if not offers.may_pick(t.id, args.claim, picker, published=offered, held=held)
-        and not (t.id in packaged and packaged[t.id].package.state == "bound")
-    ]
-    if excluded:
-        candidates = [t for t in candidates if t not in excluded]
-        by_offer = [t for t in excluded if t.id in offered]
-        by_reservation = [t for t in excluded if t.id not in offered]
-        if by_offer:
-            print(
-                f"note: skipped {len(by_offer)} workable ticket(s) with offers/assignments "
-                f"{'this worker is not eligible for' if args.claim else '(give --claim W)'}"
-                f" ({', '.join(sorted(offered[t.id].offer.id for t in by_offer))}); see "
-                "'arbite offer list'",
-                file=sys.stderr,
-            )
-        if by_reservation:
-            print(
-                f"note: skipped {len(by_reservation)} workable ticket(s) held by reservations "
-                f"({', '.join(sorted({held[t.id].id for t in by_reservation}))}); see "
-                "'arbite reserve list'",
-                file=sys.stderr,
-            )
+    # Offered (B03) and reserved (B02) tickets are only for the workers their
+    # offer admits / their owner: a plain listing has no worker identity, so it
+    # leaves them out; --claim W keeps the ones W could acquire (acquire()
+    # re-checks under the lock).
+    by_offer = [t for t in candidates if verdict[t.id].has_axis("offer")]
+    by_reservation = [t for t in candidates if verdict[t.id].has_axis("reservation")]
+    if by_offer:
+        print(
+            f"note: skipped {len(by_offer)} workable ticket(s) with offers/assignments "
+            f"{'this worker is not eligible for' if args.claim else '(give --claim W)'}"
+            f" ({', '.join(sorted(state.published_offers[t.id].offer.id for t in by_offer))}); see "
+            "'arbite offer list'",
+            file=sys.stderr,
+        )
+    if by_reservation:
+        print(
+            f"note: skipped {len(by_reservation)} workable ticket(s) held by reservations "
+            f"({', '.join(sorted({state.reservations[t.id].id for t in by_reservation}))}); see "
+            "'arbite reserve list'",
+            file=sys.stderr,
+        )
+    excluded_ids = {t.id for t in by_package + by_offer + by_reservation}
+    if excluded_ids:
+        candidates = [t for t in candidates if t.id not in excluded_ids]
 
     if not candidates:
         # "Nothing is ready" and "everything is deadlocked" look identical from
@@ -814,35 +821,62 @@ def _cmd_list_next(args, sink, every):
     # the authority. If another agent wins the race for one, move on to the next
     # rather than failing the whole dispatch: each claim is individually atomic,
     # so a partial batch is a correct result, not a broken one.
-    ctl = _lifecycle(args, sink, agent=args.claim)
     # A registered worker is selected through its profile: --tier may narrow the
     # search but never exceed the configured tier (refused outright), and tickets
-    # the profile cannot take are skipped. acquire() re-checks both.
-    declaration = ctl.worker_declaration(args.claim, declared_tier=args.tier)
-    if not declaration.enabled:
-        eligibility.evaluate(eligibility.Requirements(restricted=False), declaration).require()
-    requirements_for = eligibility.requirements_for_ticket
-    eligible = [
-        t for t in candidates
-        if eligibility.evaluate(requirements_for(t), declaration).eligible
-    ]
-    if len(eligible) < len(candidates):
+    # the profile cannot take are skipped. acquire() re-checks that, and enforces
+    # the declared capacity (B05) under the operation lock.
+    by_worker = [t for t in candidates if verdict[t.id].has_axis("worker")]
+    if by_worker:
         print(
-            f"note: skipped {len(candidates) - len(eligible)} workable ticket(s) above "
+            f"note: skipped {len(by_worker)} workable ticket(s) above "
             f"{args.claim}'s configured tier ({declaration.tier})",
             file=sys.stderr,
         )
-    candidates = eligible
+        dropped = {t.id for t in by_worker}
+        candidates = [t for t in candidates if t.id not in dropped]
+
+    ctl = _lifecycle(args, sink, agent=args.claim)
+    capacity = readiness.capacity_for(state, args.claim, declaration)
+    if capacity.exhausted:
+        sys.stdout.flush()
+        print(
+            f"note: {args.claim} has reached its declared capacity of "
+            f"{capacity.declared} concurrent attempt(s) ({capacity.active} active); "
+            "nothing claimed",
+            file=sys.stderr,
+        )
+        _emit_tickets([], args.json, sink)
+        return
+    # A batch never tries more than the free slots (acquire() re-checks under the
+    # lock); the caller's --count is kept so a short batch can report what was
+    # asked for and why it stopped.
+    free_slots = capacity.remaining
     if not candidates:
         _emit_tickets([], args.json, sink)
         return
     claimed = []
     errors = []
+    capacity_blocked = None
+    capacity_stop = False
     for candidate in candidates:
         if len(claimed) == wanted:
             break
+        if free_slots is not None and len(claimed) >= free_slots:
+            capacity_stop = True
+            break
         try:
             result = ctl.acquire(candidate, worker_id=args.claim, declared_tier=args.tier)
+        except WorkerIneligible as e:
+            if any(reason.get("code") == "capacity_exhausted"
+                   for reason in (e.details or {}).get("reasons", [])):
+                # Capacity is worker-wide, so no later candidate can succeed
+                # either: stop instead of burning the rest of the batch.
+                capacity_blocked = e
+                break
+            # Lost the race for this one (or it stopped being ready). The next
+            # candidate is untouched, so the loop simply moves on to it.
+            errors.append(str(e))
+            continue
         except ArbiteError as e:
             # Lost the race for this one (or it stopped being ready). The next
             # candidate is untouched, so the loop simply moves on to it.
@@ -851,6 +885,8 @@ def _cmd_list_next(args, sink, every):
         claimed.append(result.ticket)
 
     if not claimed:
+        if capacity_blocked is not None:
+            raise capacity_blocked
         raise TicketError(
             "every workable ticket was claimed by another agent first: " + "; ".join(errors)
         )
@@ -867,9 +903,20 @@ def _cmd_list_next(args, sink, every):
             print(f"claimed {t.id} for {args.claim} -> {sink.location(t.id)}", file=sys.stderr)
     if len(claimed) < wanted:
         # Say so explicitly, and say why: a dispatcher that asked for 3 and got
-        # 2 needs to know whether the queue ran dry or it lost races, because
-        # those call for different responses (wait vs. retry immediately).
-        if errors:
+        # 2 needs to know whether the queue ran dry, it lost races, or the worker
+        # hit its declared capacity -- those call for different responses.
+        if capacity_blocked is not None:
+            reason = (
+                f"{args.claim} reached its declared capacity of "
+                f"{(capacity_blocked.details or {}).get('capacity', {}).get('declared')} "
+                "concurrent attempt(s)"
+            )
+        elif capacity_stop:
+            reason = (
+                f"{args.claim} reached its declared capacity of {capacity.declared} "
+                "concurrent attempt(s)"
+            )
+        elif errors:
             reason = f"{len(errors)} were claimed by another agent first"
         else:
             reason = "no more workable tickets match"
@@ -3152,6 +3199,99 @@ def _worker_check(args, sink, service) -> None:
     print("  (worker constraints only; readiness is checked at acquisition)")
 
 
+# --- job board (multi-provider job board, B05) ------------------------------
+
+
+def cmd_board(args):
+    """Explain readiness for one worker. A query only: it claims nothing."""
+    sink = _require_sink(args)
+    try:
+        _run_board(args, sink)
+    except CoordinationError as error:
+        _file_error(args, error)
+
+
+def _board_ticket_line(ticket) -> str:
+    priority = "-" if ticket.priority is None else str(ticket.priority)
+    return (f"[{ticket.status}] p{priority} {ticket.tier or '-'} "
+            f"{ticket.domain or '-'} {ticket.title}")
+
+
+def _board_entry(ticket, verdict, location) -> dict:
+    return dict(ticket.to_dict(location), readiness=verdict.to_dict())
+
+
+def _run_board(args, sink) -> None:
+    """One-shot job board query for one worker: what is ready, and why not.
+
+    Readiness is a property of the whole ticket set, so the dependency graph is
+    built from every ticket (buckets included) even though only tickets in the
+    status workflow are explained. Nothing here writes: the store reads are
+    read-only (`workers.declaration_for`, `readiness.load`), so a board query
+    can never claim, reserve or start work."""
+    if args.count is not None and args.count < 1:
+        raise TicketError(f"--count must be a positive integer, got {args.count}")
+    every = sink.query(TicketQuery(buckets=("*",)))
+    visible = sink.query(TicketQuery())
+    if args.epic:
+        visible = [ticket for ticket in visible if ticket.epic == args.epic]
+    store = sink.coordination()
+    declaration = workers.declaration_for(store, args.worker, declared_tier=args.tier)
+    state = readiness.load(store, every)
+    capacity = readiness.capacity_for(state, args.worker, declaration)
+    candidates = [ticket for ticket in visible if ticket.status != "closed"]
+    candidates.sort(key=lambda ticket: (ticket.priority_sort_key(), ticket.id))
+    results = readiness.evaluate_all(
+        candidates, state, worker_id=args.worker, declaration=declaration, capacity=capacity
+    )
+    ready = [ticket for ticket, verdict in results if verdict.ready]
+    excluded = [(ticket, verdict) for ticket, verdict in results if not verdict.ready]
+    picks = readiness.suggestions(results, args.count)
+
+    if args.json:
+        locations = sink.location_map([ticket for ticket, _ in results])
+        _print_json(coordination.ok_result({
+            "worker": declaration.to_dict(),
+            "worker_state": "enabled" if declaration.enabled else "disabled",
+            "capacity": capacity.to_dict(),
+            "ready": [_board_entry(t, v, locations.get(t.id)) for t, v in results if v.ready],
+            "excluded": [_board_entry(t, v, locations.get(t.id)) for t, v in excluded],
+            "suggestions": [ticket.id for ticket in picks],
+            "notice": readiness.QUERY_NOTICE,
+        }))
+    else:
+        source = "registered profile" if declaration.registered else "ad-hoc (no profile)"
+        activity = "enabled" if declaration.enabled else "DISABLED"
+        capacity_text = (
+            "unlimited (none declared)" if capacity.unlimited
+            else f"{capacity.active} of {capacity.declared} active, {capacity.remaining} free"
+        )
+        print(f"worker {args.worker} ({source}, {activity}, tier {declaration.tier or '-'}) "
+              f"-- capacity: {capacity_text}")
+        print(f"notice: {readiness.QUERY_NOTICE}")
+        print(f"ready ({len(ready)}):")
+        for ticket, verdict in results:
+            if not verdict.ready:
+                continue
+            print(f"  {ticket.id}  {_board_ticket_line(ticket)}")
+            for hint in verdict.hints:
+                print(f"    hint [{hint.code}] {hint.message}")
+        print(f"excluded ({len(excluded)}):")
+        for ticket, verdict in excluded:
+            print(f"  {ticket.id}  {_board_ticket_line(ticket)}")
+            for reason in verdict.reasons:
+                print(f"    refused [{reason.code}] ({reason.axis}) {reason.message}")
+            for hint in verdict.hints:
+                print(f"    hint [{hint.code}] {hint.message}")
+        print("suggestions: "
+              + (", ".join(ticket.id for ticket in picks) if picks else "none"))
+
+    if not ready:
+        # Nothing is ready for this worker right now; the explanation above is
+        # still the answer, and exit 2 keeps `list next`'s "nothing to do" signal.
+        sys.exit(EXIT_EMPTY)
+
+
 # --- reservations (multi-provider job board, B02) ---------------------------
 
 
@@ -4957,6 +5097,33 @@ def build_parser():
     _json_flag(p_w_check)
     _sink_flag(p_w_check)
     p_w_check.set_defaults(func=cmd_worker)
+
+    p_board = sub.add_parser(
+        "board",
+        help="explain what one worker can pick up now (a query; claims nothing)",
+        description="Explain job-board readiness for WORKER: every candidate ticket "
+        "(optionally only one --epic) is reported ready, or with the structured reasons "
+        "that exclude it -- status/classification, unmet dependencies, an active attempt, "
+        "a reservation, a published offer or direct assignment, package order or "
+        "continuity binding, worker constraints (tier, capability, locality, cost "
+        "ceiling) and declared capacity. The same evaluation backs 'list next' and "
+        "acquisition, so the ready set here is what 'arbite list next --claim WORKER' "
+        "would offer. Local/low-cost offer preferences are reported as advisory hints "
+        "and never decide pickup -- use a hard constraint or a direct assignment to "
+        "enforce an owner's choice. Read-only: nothing is claimed or written. Exits 2 "
+        "when no candidate is ready for that worker.",
+    )
+    p_board.add_argument("--worker", required=True, metavar="W",
+                         help="worker id to explain readiness for (registered or ad-hoc)")
+    p_board.add_argument("--epic", default=None, metavar="E",
+                         help="only explain this epic's tickets")
+    p_board.add_argument("--tier", choices=TIERS, default=None,
+                         help="a per-call tier declaration (may not exceed a registered profile)")
+    p_board.add_argument("--count", type=int, default=None, metavar="N",
+                         help="limit how many suggestions are listed")
+    _json_flag(p_board)
+    _sink_flag(p_board)
+    p_board.set_defaults(func=cmd_board)
 
     p_reserve = sub.add_parser(
         "reserve",

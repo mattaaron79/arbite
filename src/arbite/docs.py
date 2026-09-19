@@ -541,12 +541,15 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "(`declared_tier_exceeds_profile`), `--force` does not bypass it, and a disabled profile "
         "takes no new work while its history and running attempts are kept. Tier changes happen "
         "only through `arbite worker update --tier`, recorded as a `worker_updated` event. "
-        "`last_checkin` is the worker's own declaration, never verified liveness; declared "
-        "capacity is recorded but not yet enforced. `arbite worker check <id> [--ticket T] "
-        "[--require-capability CAP] [--local-only] [--max-cost N --max-cost-unit U]` explains "
-        "eligibility with stable reason codes and writes nothing; an unknown value fails an "
-        "explicit constraint. Offers and continuity packages are below; a unified job board is "
-        "not available yet."
+        "`last_checkin` is the worker's own declaration, never verified liveness. Declared "
+        "`--capacity` is the limit on *concurrent active attempts* for that worker id, enforced "
+        "when work is acquired (a `--count N` batch or two concurrent claims cannot overfill it; "
+        "a short batch is a correct result) -- only active attempts count, so a reservation or a "
+        "later continuity-package member does not consume capacity, and a profile change affects "
+        "future acquisition only: it never revokes running work. `arbite worker check <id> "
+        "[--ticket T] [--require-capability CAP] [--local-only] [--max-cost N --max-cost-unit U]` "
+        "explains eligibility with stable reason codes and writes nothing; an unknown value fails "
+        "an explicit constraint. Offers, continuity packages and the job board are below."
     )
     add("")
 
@@ -627,6 +630,36 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "`--force` skips that). `arbite package show|list [--state] [--ticket] [--worker]` "
         "report progress, the current member, external prerequisites and the next action. All "
         "take `--json`."
+    )
+    add("")
+
+    # -- Job board ---------------------------------------------------------
+    add("## Job board and readiness")
+    add("")
+    add(
+        "`arbite board --worker W [--epic E] [--tier T] [--count N] [--json]` explains, for one "
+        "worker, what is ready now and why everything else is not; it is a query and claims "
+        "nothing. Every candidate ticket in the status workflow (optionally narrowed to one "
+        "`--epic`) is reported `ready` or with structured `reasons`, each carrying a stable "
+        "`code` and the `axis` it belongs to: `status` and `classification` "
+        "(`ticket_not_open`, `ticket_unclassified`), `dependency` (`dependencies_unmet`), "
+        "`attempt` (`active_attempt`), `reservation` (`reserved_elsewhere`, or "
+        "`worker_identity_required` when no worker was named), `offer` (`offer_ineligible`, with "
+        "the nested eligibility reasons such as `worker_not_allowed`), `continuity` "
+        "(`package_order`, `package_bound_elsewhere`), `worker` (`worker_ineligible`: tier, "
+        "capability, locality, cost ceiling) and `capacity` (`capacity_exhausted`). The output "
+        "also reports the worker's declared capacity, the active attempts counted against it and "
+        "the free slots, plus `suggestions` -- the compatible ready work in the order `list next` "
+        "would offer it. Readiness is derived from current state every time, and the same "
+        "evaluator backs plain `list next` and acquisition, so a board cannot disagree with what "
+        "`claim` accepts; a board query still cannot promise that a ticket it reports ready is "
+        "free when you act on it, because `claim`/`list next --claim` re-check every condition "
+        "under the operation lock. Local/low-cost offer preferences (`--prefer-local`, "
+        "`--prefer-low-cost`, `--prefer-worker`) are reported as advisory hints and never decide "
+        "pickup -- the first eligible claimant wins -- so an owner who wants a preference "
+        "*enforced* uses a hard constraint (`--require-capability`, `--local-only`, `--max-cost`, "
+        "`--min-tier`, `--allowed-worker`) or a direct `arbite offer assign`. The command exits 2 "
+        "when nothing is ready for that worker."
     )
     add("")
 

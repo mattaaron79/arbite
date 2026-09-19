@@ -135,7 +135,18 @@ import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from . import coordination, eligibility, errors, graph, offers, packages, reservations, schema, workers
+from . import (
+    coordination,
+    eligibility,
+    errors,
+    graph,
+    offers,
+    packages,
+    readiness,
+    reservations,
+    schema,
+    workers,
+)
 from .application import Actor, CoordinationService, require_active_attempt
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
@@ -276,48 +287,12 @@ def require_claimable(
     The compare-and-swap that follows this guard is what makes a *concurrent*
     claim lose; this function is what makes an *unready* ticket refuse with a
     reason rather than a generic conflict.
+
+    The checks themselves are `arbite.readiness.ticket_reasons`, the one
+    vocabulary the board, `list next` and acquisition all evaluate, so a query
+    can never disagree with the operation that acquires the work.
     """
-    if ticket.status != "open":
-        hint = ""
-        if ticket.status == "in_progress":
-            hint = (
-                f" -- use 'arbite claim {ticket.id} --agent <id> --adopt' for a legacy "
-                "ticket with no attempt record, or '--force --reason <why>' to take over"
-            )
-        raise TicketError(
-            f"ticket {ticket.id} is '{ticket.status}', not 'open'; only an open ticket "
-            f"can be claimed{hint}"
-        )
-
-    for field_name in ("type", "tier", "domain"):
-        value = getattr(ticket, field_name, None)
-        if schema.is_placeholder(value):
-            raise TicketError(
-                f"ticket {ticket.id} is not classified yet ({field_name} is {value!r}); "
-                f"finish triage (arbite fetch / arbite set) before claiming it"
-            )
-
-    unmet = graph.unmet_dependencies(ticket, by_id)
-    if unmet:
-        raise TicketError(
-            f"ticket {ticket.id} has unmet dependencies: {', '.join(sorted(unmet))}; "
-            "close them before claiming it (readiness is enforced on the operation, "
-            "not just in 'list next')"
-        )
-
-    if active_attempt is not None:
-        raise CoordinationConflict(
-            f"ticket {ticket.id} already has an active attempt {active_attempt.id} "
-            f"(worker {active_attempt.worker_id}, generation {active_attempt.generation}); "
-            "only one attempt may be active per ticket -- release it first, or pass "
-            "--force --reason <why> for an explicit administrative takeover",
-            details={
-                "ticket_id": ticket.id,
-                "attempt_id": active_attempt.id,
-                "worker_id": active_attempt.worker_id,
-                "generation": active_attempt.generation,
-            },
-        )
+    readiness.require_claimable(ticket, by_id, active_attempt)
 
 
 @dataclass(frozen=True)
@@ -924,7 +899,18 @@ class TicketLifecycle:
                     "it first"
                 )
 
-        self.require_eligible(current, worker_id, declared_tier=declared_tier)
+        declaration = self.worker_declaration(worker_id, declared_tier=declared_tier)
+        eligibility.evaluate(
+            eligibility.requirements_for_ticket(current), declaration
+        ).require(subject=f"ticket {current.id}")
+        # Declared capacity (B05) is enforced here, under the operation lock, so a
+        # concurrent claim and a --count batch cannot overfill one worker. Only
+        # active attempts count, and an attempt this same worker is superseding is
+        # not counted twice.
+        readiness.require_capacity(
+            self.coordination.store, worker_id, declaration,
+            ticket_id=current.id, superseded_attempt=active,
+        )
 
         now = self.now()
         attempt = WorkAttempt(
