@@ -19,6 +19,8 @@ The tests cover the four C06 acceptance criteria directly:
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -576,3 +578,33 @@ def test_read_observations_persist_with_the_documented_fields(sink, arbite_dir):
     assert {event.payload["path"] for event in events} == {"src/a.py"}
     assert all(event.category == "read" for event in events)
     assert any(event.payload["write_authorizing"] for event in events)
+
+
+def test_discovery_skips_git_ignored_paths_unless_asked(sink, arbite_dir):
+    reads, _claims, _attempt, root, _service = _project(sink, arbite_dir)
+    if shutil.which("git") is None:
+        pytest.skip("git is not available")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / ".gitignore").write_text("__pycache__/\n*.log\n")
+    (root / "src" / "__pycache__").mkdir()
+    (root / "src" / "__pycache__" / "a.cpython.pyc").write_bytes(b"\x00")
+    (root / "src" / "run.log").write_text("beta in a log\n")
+
+    page = reads.list("src")
+    paths = {entry.path for entry in page.entries}
+    assert "src/a.py" in paths
+    assert not any("__pycache__" in path or path.endswith(".log") for path in paths)
+    assert page.excluded_ignored == 2
+    assert filereads.MARKER_IGNORED_EXCLUDED in page.markers
+
+    found = {match.path for match in reads.search("beta", "src").matches}
+    assert "src/b.py" in found and "src/run.log" not in found
+
+    everything = reads.list("src", include_ignored=True)
+    assert "src/run.log" in {entry.path for entry in everything.entries}
+    assert everything.excluded_ignored == 0
+
+    # A tracked file is listed even when an ignore rule matches it.
+    (root / "src" / "tracked.log").write_text("kept\n")
+    subprocess.run(["git", "-C", str(root), "add", "-f", "src/tracked.log"], check=True)
+    assert "src/tracked.log" in {entry.path for entry in reads.list("src").entries}

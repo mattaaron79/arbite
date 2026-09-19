@@ -53,6 +53,7 @@ from __future__ import annotations
 import codecs
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -114,6 +115,7 @@ MARKER_OUTPUT_TRUNCATED = "output_truncated"
 MARKER_SCAN_LIMIT_REACHED = "scan_limit_reached"
 MARKER_PROTECTED_EXCLUDED = "protected_paths_excluded"
 MARKER_SYMLINKS_SKIPPED = "symlinks_skipped"
+MARKER_IGNORED_EXCLUDED = "ignored_paths_excluded"
 MARKER_VERSION_OMITTED = "version_omitted"
 MARKER_CONTENT_NOT_SCANNED = "content_not_scanned"
 MARKER_SKIPPED_TRUNCATED = "skipped_report_truncated"
@@ -227,6 +229,7 @@ class ListPage:
     scan_limit_reached: bool
     excluded_protected: int
     skipped_symlinks: int
+    excluded_ignored: int = 0
     markers: List[str] = field(default_factory=list)
 
     @property
@@ -248,6 +251,7 @@ class ListPage:
             "scan_limit_reached": self.scan_limit_reached,
             "excluded_protected": self.excluded_protected,
             "skipped_symlinks": self.skipped_symlinks,
+            "excluded_ignored": self.excluded_ignored,
             "markers": list(self.markers),
         }
 
@@ -270,6 +274,7 @@ class SearchPage:
     scan_limit_reached: bool
     excluded_protected: int
     skipped_symlinks: int
+    excluded_ignored: int = 0
     skipped: List[dict] = field(default_factory=list)
     skipped_truncated: bool = False
     markers: List[str] = field(default_factory=list)
@@ -295,6 +300,7 @@ class SearchPage:
             "scan_limit_reached": self.scan_limit_reached,
             "excluded_protected": self.excluded_protected,
             "skipped_symlinks": self.skipped_symlinks,
+            "excluded_ignored": self.excluded_ignored,
             "skipped": list(self.skipped),
             "skipped_truncated": self.skipped_truncated,
             "markers": list(self.markers),
@@ -424,6 +430,26 @@ class _Walk:
     excluded_protected: int
     skipped_symlinks: int
     scan_limit_reached: bool
+    excluded_ignored: int = 0
+
+
+def _git_ignored(root: str, relative_prefix: str) -> frozenset:
+    """Git-ignored paths under `relative_prefix`, root-relative (directories end in '/').
+
+    Empty when `root` is not in a git work tree or git is unavailable, so discovery
+    then lists everything. Tracked files are never reported, even if they match an
+    ignore rule."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--others", "--ignored",
+             "--exclude-standard", "--directory", "--", relative_prefix or "."],
+            capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if proc.returncode != 0:
+        return frozenset()
+    return frozenset(p for p in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if p)
 
 
 def _classify(data: bytes) -> str:
@@ -570,19 +596,20 @@ class FileReadService:
         *,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        include_ignored: bool = False,
     ) -> ListPage:
         """Enumerate workspace entries under `prefix` (or the root), bounded.
 
         Ordering is by canonical path, so a page is deterministic. Directories,
         regular files, protected paths and symlinks are distinguished; protected
-        metadata (`.arbite`/`.git`) and symlinks are excluded and *counted*, and
-        the result's markers say so. A file's whole-file version is included
+        metadata (`.arbite`/`.git`), git-ignored paths (unless `include_ignored`)
+        and symlinks are excluded and *counted*, and the result's markers say so. A file's whole-file version is included
         unless the file is too large to digest, in which case `version_omitted`
         is set for that entry."""
         absolute_prefix, relative_prefix = self._resolve_prefix(prefix, mode=path_policy.MODE_LIST)
         offset = _bound_offset(offset)
         limit, limit_capped = _bound_limit(limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT)
-        walk = self._walk(absolute_prefix, relative_prefix)
+        walk = self._walk(absolute_prefix, relative_prefix, include_ignored=include_ignored)
 
         ordered = sorted(walk.entries, key=lambda item: item[0])
         total = len(ordered)
@@ -607,6 +634,8 @@ class FileReadService:
             markers.append(MARKER_PROTECTED_EXCLUDED)
         if walk.skipped_symlinks:
             markers.append(MARKER_SYMLINKS_SKIPPED)
+        if walk.excluded_ignored:
+            markers.append(MARKER_IGNORED_EXCLUDED)
         if any(entry.version_omitted for entry in entries):
             markers.append(MARKER_VERSION_OMITTED)
 
@@ -623,6 +652,7 @@ class FileReadService:
             scan_limit_reached=walk.scan_limit_reached,
             excluded_protected=walk.excluded_protected,
             skipped_symlinks=walk.skipped_symlinks,
+            excluded_ignored=walk.excluded_ignored,
             markers=markers,
         )
 
@@ -633,6 +663,7 @@ class FileReadService:
         *,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        include_ignored: bool = False,
     ) -> SearchPage:
         """Text/path discovery for `pattern` (a regular expression).
 
@@ -648,7 +679,9 @@ class FileReadService:
         )
         offset = _bound_offset(offset)
         limit, limit_capped = _bound_limit(limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT)
-        walk = self._walk(absolute_prefix, relative_prefix, directories=False)
+        walk = self._walk(
+            absolute_prefix, relative_prefix, directories=False, include_ignored=include_ignored
+        )
 
         files = sorted(rel for rel, kind in walk.entries if kind == "file")
         matches: List[SearchMatch] = []
@@ -745,6 +778,8 @@ class FileReadService:
             markers.append(MARKER_PROTECTED_EXCLUDED)
         if walk.skipped_symlinks:
             markers.append(MARKER_SYMLINKS_SKIPPED)
+        if walk.excluded_ignored:
+            markers.append(MARKER_IGNORED_EXCLUDED)
         if skipped:
             markers.append(MARKER_CONTENT_NOT_SCANNED)
         if skipped_truncated:
@@ -767,6 +802,7 @@ class FileReadService:
             scan_limit_reached=scan_limit_reached,
             excluded_protected=walk.excluded_protected,
             skipped_symlinks=walk.skipped_symlinks,
+            excluded_ignored=walk.excluded_ignored,
             skipped=skipped,
             skipped_truncated=skipped_truncated,
             markers=markers,
@@ -1015,7 +1051,10 @@ class FileReadService:
         )
         return target.absolute, target.relative
 
-    def _walk(self, absolute_prefix: str, relative_prefix: str, *, directories=True) -> _Walk:
+    def _walk(
+        self, absolute_prefix: str, relative_prefix: str, *, directories=True,
+        include_ignored: bool = False,
+    ) -> _Walk:
         """Bounded, deterministic enumeration under `absolute_prefix`.
 
         Deterministic because every directory's children are sorted before use and
@@ -1029,6 +1068,8 @@ class FileReadService:
         entries: List[Tuple[str, str]] = []
         excluded = 0
         symlinks = 0
+        ignored = frozenset() if include_ignored else _git_ignored(self.root, relative_prefix)
+        ignored_count = 0
         scanned = 0
         reached = False
 
@@ -1046,6 +1087,9 @@ class FileReadService:
                 relative = _join_rel(relative_dir, name)
                 if is_protected_path(relative):
                     excluded += 1
+                    continue
+                if relative + "/" in ignored:
+                    ignored_count += 1
                     continue
                 absolute = os.path.join(dirpath, name)
                 if os.path.islink(absolute):
@@ -1067,6 +1111,9 @@ class FileReadService:
                 if is_protected_path(relative):
                     excluded += 1
                     continue
+                if relative in ignored:
+                    ignored_count += 1
+                    continue
                 absolute = os.path.join(dirpath, name)
                 if os.path.islink(absolute):
                     symlinks += 1
@@ -1075,7 +1122,7 @@ class FileReadService:
             if reached:
                 break
 
-        return _Walk(entries, excluded, symlinks, reached)
+        return _Walk(entries, excluded, symlinks, reached, ignored_count)
 
     def _list_entry(self, relative: str, kind: str) -> DiscoveryEntry:
         if kind == "directory":
@@ -1176,6 +1223,7 @@ __all__ = [
     "FileReadService",
     "ListPage",
     "MARKER_CONTENT_NOT_SCANNED",
+    "MARKER_IGNORED_EXCLUDED",
     "MARKER_LIMIT_CAPPED",
     "MARKER_OFFSET_ADVANCED",
     "MARKER_OUTPUT_TRUNCATED",

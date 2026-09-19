@@ -428,3 +428,14 @@ def test_external_drift_is_observed_and_never_attributed_to_the_agent(sink, arbi
     assert "unattributed_observed" in view.markers
     # It is not smuggled into the agent's mechanical evidence.
     assert all(op["operation_id"] != operation_id for op in view.operations)
+
+
+def test_ticket_view_reports_the_active_attempt(sink, arbite_dir):
+    project = _project(sink, arbite_dir)
+    view = project.view()
+    assert view.attempt_id is None
+    assert view.active_attempt_id == project.attempt.id
+    assert view.to_dict()["active_attempt_id"] == project.attempt.id
+
+    _end_attempt_and_close(project)
+    assert project.view().active_attempt_id is None

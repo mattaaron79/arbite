@@ -423,12 +423,15 @@ class ChangeView:
     counts: Dict[str, Any] = field(default_factory=dict)
     bounds: Dict[str, Any] = field(default_factory=dict)
     markers: List[str] = field(default_factory=list)
+    #: The ticket's live attempt, whatever `attempt_id` scoped the view to.
+    active_attempt_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "scope": self.scope,
             "ticket_id": self.ticket_id,
             "attempt_id": self.attempt_id,
+            "active_attempt_id": self.active_attempt_id,
             "generated_at": self.generated_at,
             "view": "arbite.changes",
             "read_only": True,
@@ -634,7 +637,9 @@ class ChangesQuery:
             "unattributed": len(unattributed),
         }
 
+        active = max((a for a in attempts if a.is_active), key=lambda a: a.generation, default=None)
         return ChangeView(
+            active_attempt_id=active.id if active is not None else None,
             scope="attempt" if attempt_id is not None else "ticket",
             ticket_id=ticket_id,
             attempt_id=attempt_id,

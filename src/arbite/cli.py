@@ -2720,7 +2720,8 @@ def cmd_file_list(args):
     try:
         service, _attempt, _svc = _file_read_context(args, sink, require_attempt=False)
         page = service.list(
-            getattr(args, "path", None), limit=args.limit, offset=args.offset
+            getattr(args, "path", None), limit=args.limit, offset=args.offset,
+            include_ignored=args.include_ignored,
         )
     except CoordinationError as error:
         _file_error(args, error)
@@ -2738,6 +2739,7 @@ def cmd_file_search(args):
             getattr(args, "path", None),
             limit=args.limit,
             offset=args.offset,
+            include_ignored=args.include_ignored,
         )
     except CoordinationError as error:
         _file_error(args, error)
@@ -4969,9 +4971,9 @@ def build_parser():
         help="list workspace entries under PATH (bounded, deterministic)",
         description="Enumerate entries under PATH (default: the workspace root) in "
         "canonical-path order. Output is bounded (--limit, hard cap 2000) with "
-        "--offset paging; protected arbite/.git metadata and symlinks are excluded "
-        "and counted, and the result says so in its markers. Listing is read-only: "
-        "it authorizes no mutation.",
+        "--offset paging; protected arbite/.git metadata, git-ignored paths and "
+        "symlinks are excluded and counted, and the result says so in its markers. "
+        "Listing is read-only: it authorizes no mutation.",
     )
     p_file_list.add_argument(
         "path",
@@ -4985,6 +4987,10 @@ def build_parser():
     )
     p_file_list.add_argument(
         "--offset", type=int, default=None, metavar="N", help="entries to skip (paging)"
+    )
+    p_file_list.add_argument(
+        "--include-ignored", action="store_true",
+        help="also list git-ignored paths (e.g. __pycache__), skipped by default",
     )
     _json_flag(p_file_list)
     _sink_flag(p_file_list)
@@ -5013,6 +5019,10 @@ def build_parser():
     )
     p_file_search.add_argument(
         "--offset", type=int, default=None, metavar="N", help="matches to skip (paging)"
+    )
+    p_file_search.add_argument(
+        "--include-ignored", action="store_true",
+        help="also search git-ignored paths, skipped by default",
     )
     _json_flag(p_file_search)
     _sink_flag(p_file_search)
