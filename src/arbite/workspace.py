@@ -143,13 +143,16 @@ def ensure_binding(
     store,
     clock=None,
     rebind: bool = False,
+    allow_unquiescent: bool = False,
+    override_reason: Optional[str] = None,
 ) -> BindingResolution:
     """Ensure `root` is bound to exactly the `(sink_kind, location)` store.
 
     Idempotent for a matching binding. A conflicting selection raises
     `StoreBindingConflict` unless `rebind=True`, and an explicit rebind verifies
     that the previously bound store has no active work before it rewrites the
-    marker (see `require_quiescent`).
+    marker (see `require_quiescent`). ``allow_unquiescent`` with a non-empty
+    ``override_reason`` is the explicit administrative override of that check.
     """
     moment = (clock or utc_now)()
     real_root = os.path.realpath(str(root))
@@ -234,7 +237,12 @@ def ensure_binding(
             },
         )
 
-    require_quiescent(previous, workspace_id)
+    require_quiescent(
+        previous,
+        workspace_id,
+        allow_unquiescent=allow_unquiescent,
+        override_reason=override_reason,
+    )
     binding = _store_binding(
         store,
         StoreBinding(
@@ -265,13 +273,27 @@ def ensure_binding(
     )
 
 
-def require_quiescent(previous: StoreBinding, workspace_id: str) -> None:
+def require_quiescent(
+    previous: StoreBinding,
+    workspace_id: str,
+    *,
+    allow_unquiescent: bool = False,
+    override_reason: Optional[str] = None,
+) -> None:
     """Refuse unless the previously bound store has no active work.
 
     Quiescence means: no active `WorkAttempt` and no active `FileClaim` for this
     workspace in the store the marker names. If that store cannot be opened, the
     rebind is refused -- an unverifiable "probably stopped" is not good enough to
     hand a workspace's ownership to a second store.
+
+    ``allow_unquiescent`` is the explicit administrative override (planning rule:
+    an override needs a reason and retains history): with a non-empty
+    ``override_reason`` live work no longer raises here, so a caller that has
+    already reported the override can complete it. A missing reason is not an
+    override and raises exactly as before. The job-board half of quiescence
+    (live reservations/offers/packages) is checked by
+    `coordination_export.require_quiescent_store`, which the same callers run.
     """
     old_store = open_store(previous.sink_kind, previous.location)
     if old_store is None:
@@ -290,6 +312,8 @@ def require_quiescent(previous: StoreBinding, workspace_id: str) -> None:
     except CoordinationError:
         raise
     if active_attempts or active_claims:
+        if allow_unquiescent and isinstance(override_reason, str) and override_reason.strip():
+            return
         raise CoordinationConflict(
             f"refusing to rebind workspace {workspace_id}: the store it is bound to "
             f"({previous.sink_kind}:{previous.location}) still has "

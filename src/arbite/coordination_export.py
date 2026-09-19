@@ -95,6 +95,45 @@ Reads create nothing: every read path is guarded by ``store.is_initialised()``
 and an untouched legacy store yields a well-formed *empty* bundle (correct
 namespace and contract, no records).
 
+## Job-board records and quiescent transfers
+
+`worker_profiles`, `reservations`, `offers` and `packages` are store-level (they
+name workers and tickets, not a workspace), so they are exported whatever
+`workspace_id` is selected and imported back verbatim: a profile keeps its
+enabled/disabled state and history, a reservation keeps its owner, members and
+released state, an offer keeps its state/revision and the attempt that accepted
+it, and a package keeps its order, bound worker, current member, handoff notes
+and completed-member history. A *disabled* profile is not dropped either: the
+worker ids that events and attempts refer to must still resolve after a
+transfer, and arbite has no profile *removal* (only `disable`), so nothing here
+can erase the actor reference behind retained history.
+
+Ticket ids inside job-board records are checked against the ticket store by
+`coordination_doctor`, not here: a bundle carries no ticket records, so a bundle
+can only verify its job-board records against each other (see
+`bundle_problems`: dangling reservation/package references and overlapping
+membership).
+
+Moving a store that still has work in flight is refused by
+`require_quiescent_store`: active attempts/claims, pending intents or journals,
+an active reservation, a published (unaccepted) offer, or a live package all
+block it. A caller with an explicit administrative reason may pass
+`allow_unquiescent=True` with an `override_reason`; the blockers are then
+*returned* rather than raised, so an override is reported by the command that
+made it instead of being silent.
+
+## Cursor provenance after an import
+
+Importing does not make the source store's cursor tokens valid here. The
+destination assigns fresh cursors and records the source -> destination mapping
+in the namespace registry (evidence of what arrived, not a permission), and a
+token names the store that issued it, so a source token stays
+`cursor_foreign_store` here. `arbite.events.query` makes that explicit rather
+than silent: when the token's namespace *was imported into this store*, the
+refusal also names the destination cursor that source position now lives at, and
+the way forward is always the same -- query this store once with `--after 0` and
+resume from the token it returns.
+
 ## Importing
 
 `import_coordination` writes records in one store transaction (artifact *blobs*
@@ -137,7 +176,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import artifacts, coordination
-from .coordination import Event
+from .coordination import (
+    OFFER_LIVE_STATES,
+    PACKAGE_LIVE_STATES,
+    Event,
+)
 from .errors import ArtifactCorrupt, CoordinationConflict, InvalidRecord, UnsupportedCoordination
 from .sinks.base import Problem
 
@@ -691,6 +734,14 @@ def bundle_problems(bundle) -> list:
     - ``coordination_dangling_reference`` -- an attempt/binding/receipt/intent/
       observation/event naming a workspace, attempt, ticket, operation or
       coordination subject the bundle does not contain.
+    - ``coordination_dangling_offer`` -- an offer naming a reservation or a
+      package the bundle does not contain.
+    - ``coordination_dangling_package`` -- a package naming a reservation the
+      bundle does not contain.
+    - ``coordination_overlapping_reservation`` /
+      ``coordination_overlapping_offer`` / ``coordination_overlapping_package``
+      -- one ticket held by two active reservations, two live offers or two live
+      packages, which the job-board invariants forbid.
     - ``coordination_missing_artifact`` -- a receipt/intent ``artifact_refs``
       digest (or artifact id) with no matching ``artifacts`` entry, or an
       artifact entry whose data was required but omitted.
@@ -875,6 +926,89 @@ def bundle_problems(bundle) -> list:
                     f"{label} names subject {subject!r}, which is not in the bundle",
                     fixed=False,
                 ))
+
+    # -- job-board references and combined scheduling invariants ---------
+    # Only references between *job-board* records are decidable from a bundle:
+    # a bundle carries no ticket records, so ticket membership is checked by
+    # `coordination_doctor` against the live ticket store, not guessed here.
+    reservations = group("reservations")
+    offers = group("offers")
+    packages = group("packages")
+    reservation_ids = {r.get("id") for r in reservations}
+    package_ids = {p.get("id") for p in packages}
+
+    for offer in offers:
+        label = f"offer {offer.get('id')!r}"
+        reservation_id = offer.get("reservation_id")
+        if reservation_id is not None and reservation_id not in reservation_ids:
+            problems.append(Problem(
+                "coordination_dangling_offer",
+                f"{label} names reservation {reservation_id!r}, which is not in the "
+                "bundle",
+                fixed=False,
+            ))
+        package_id = offer.get("package_id")
+        if package_id is not None and package_id not in package_ids:
+            problems.append(Problem(
+                "coordination_dangling_offer",
+                f"{label} names package {package_id!r}, which is not in the bundle",
+                fixed=False,
+            ))
+    for package in packages:
+        reservation_id = package.get("reservation_id")
+        if reservation_id is not None and reservation_id not in reservation_ids:
+            problems.append(Problem(
+                "coordination_dangling_package",
+                f"package {package.get('id')!r} names reservation {reservation_id!r}, "
+                "which is not in the bundle",
+                fixed=False,
+            ))
+
+    def _holders(records, live, members):
+        held: dict = {}
+        for record in records:
+            if not live(record):
+                continue
+            for ticket in members(record) or []:
+                held.setdefault(ticket, []).append(record.get("id"))
+        return held
+
+    def _report_overlaps(held, code, label):
+        for ticket in sorted(held):
+            ids = sorted(str(holder) for holder in held[ticket])
+            if len(ids) > 1:
+                problems.append(Problem(
+                    code,
+                    f"ticket {ticket!r} is held by {len(ids)} {label} "
+                    f"({', '.join(ids)}); job-board membership must not overlap",
+                    ticket_id=ticket,
+                    fixed=False,
+                ))
+
+    _report_overlaps(
+        _holders(
+            reservations,
+            lambda record: record.get("state") == "active",
+            lambda record: record.get("members"),
+        ),
+        "coordination_overlapping_reservation", "active reservations",
+    )
+    _report_overlaps(
+        _holders(
+            offers,
+            lambda record: record.get("state") in OFFER_LIVE_STATES,
+            lambda record: record.get("tickets"),
+        ),
+        "coordination_overlapping_offer", "live offers",
+    )
+    _report_overlaps(
+        _holders(
+            packages,
+            lambda record: record.get("state") in PACKAGE_LIVE_STATES,
+            lambda record: record.get("tickets"),
+        ),
+        "coordination_overlapping_package", "live packages",
+    )
 
     # -- artifacts -------------------------------------------------------
     artifact_items = bundle.get("artifacts")
@@ -1137,18 +1271,27 @@ def import_coordination(sink, bundle, *, verify: bool = True,
 
 
 def quiescence_blockers(store, workspace_id) -> dict:
-    """What would block migrating `workspace_id` out of `store`, or `{}`-ish.
+    """What would block moving `workspace_id` out of `store`; empty lists = quiet.
 
     Accepts a `TicketSink` or a `CoordinationStore`. Returns
     ``{"active_attempt_ids", "active_claim_paths", "pending_intent_ids",
-    "pending_operations"}``; every list is empty when the workspace is quiescent.
+    "pending_operations", "active_reservation_ids", "published_offer_ids",
+    "live_package_ids"}``; every list is empty when the workspace is quiescent.
     An uninitialised store is trivially quiescent and the check creates nothing.
 
-    Active work is read in one read transaction (active `work_attempt`,
-    `file_claim`, `operation_intent` in `INTENT_ACTIVE_STATES` and pending
-    `lifecycle_intent`, both reported as `pending_intent_ids`), and leftover
-    file-sink journals come from ``store.recover_pending``: a report whose state
-    is not clean (`pending`, `unknown`, `drifted`) blocks.
+    Active ticket-store work is read in one read transaction (active
+    `work_attempt`, `file_claim`, `operation_intent` in `INTENT_ACTIVE_STATES`
+    and pending `lifecycle_intent`, both reported as `pending_intent_ids`), and
+    leftover file-sink journals come from ``store.recover_pending``: a report
+    whose state is not clean (`pending`, `unknown`, `drifted`) blocks.
+
+    Pending job-board work is read in the same transaction: an **active**
+    reservation, a **published** (unaccepted) offer and a **live** package
+    (`open`/`bound`) all block, because moving them would move a hold that is
+    still deciding who may acquire work. Released reservations, finished offers
+    and completed/released packages are history and do not block -- which is
+    what makes a quiescent job-board transfer possible at all. Job-board records
+    are store-level (no `workspace_id`), so this part is not filtered.
     """
     store = _store_of(store)
     blockers = {
@@ -1156,6 +1299,9 @@ def quiescence_blockers(store, workspace_id) -> dict:
         "active_claim_paths": [],
         "pending_intent_ids": [],
         "pending_operations": [],
+        "active_reservation_ids": [],
+        "published_offer_ids": [],
+        "live_package_ids": [],
     }
     if not store.is_initialised():
         return blockers
@@ -1185,10 +1331,18 @@ def quiescence_blockers(store, workspace_id) -> dict:
             if i.is_pending
             and (workspace_id is None or i.workspace_id == workspace_id)
         ]
+        # Job-board holds: a live reservation/package or a published offer is
+        # still deciding who may take work, so it is not quiescent.
+        reservations = [r for r in tx.find("reservation") if r.is_active]
+        offers = [o for o in tx.find("offer") if o.is_published]
+        packages = [p for p in tx.find("package") if p.is_live]
 
     blockers["active_attempt_ids"] = sorted(a.id for a in attempts)
     blockers["active_claim_paths"] = sorted({c.path for c in claims})
     blockers["pending_intent_ids"] = sorted(i.id for i in intents)
+    blockers["active_reservation_ids"] = sorted(r.id for r in reservations)
+    blockers["published_offer_ids"] = sorted(o.id for o in offers)
+    blockers["live_package_ids"] = sorted(p.id for p in packages)
 
     pending_operations = []
     for report in store.recover_pending(workspace_id or ""):
@@ -1205,16 +1359,36 @@ def quiescence_blockers(store, workspace_id) -> dict:
     return blockers
 
 
-def require_quiescent_store(store, workspace_id) -> None:
-    """Raise `CoordinationConflict` unless `workspace_id` has no active work.
+def require_quiescent_store(
+    store,
+    workspace_id,
+    *,
+    allow_unquiescent: bool = False,
+    override_reason: Optional[str] = None,
+) -> dict:
+    """Return the blockers of `workspace_id`, raising unless it has no active work.
 
-    Naming the blocking attempts/claims/intents/journals is the point: a caller
-    must be able to see *why* a migration was refused rather than guess. Inspects
-    nothing else and writes nothing.
+    Naming the blocking attempts/claims/intents/journals and job-board holds is
+    the point: a caller must be able to see *why* a transfer was refused rather
+    than guess. Inspects nothing else and writes nothing.
+
+    With ``allow_unquiescent=True`` an explicit administrative override is
+    recorded instead of refused: the (non-empty) ``override_reason`` is required,
+    nothing is repaired or dropped, and the blockers are *returned* so the caller
+    can report exactly what it moved while the board was still busy.
     """
     blockers = quiescence_blockers(store, workspace_id)
     if not any(blockers.values()):
-        return
+        return blockers
+    if allow_unquiescent:
+        if not (isinstance(override_reason, str) and override_reason.strip()):
+            raise InvalidRecord(
+                "an administrative override of the quiescence check needs a "
+                "non-empty reason: the reason is what makes the override explicit "
+                "rather than a silent transfer of live work",
+                details={"workspace_id": workspace_id, **blockers},
+            )
+        return blockers
     pieces = []
     if blockers["active_attempt_ids"]:
         pieces.append("active attempt(s): " + ", ".join(blockers["active_attempt_ids"]))
@@ -1230,10 +1404,26 @@ def require_quiescent_store(store, workspace_id) -> None:
                 for op in blockers["pending_operations"]
             )
         )
+    if blockers["active_reservation_ids"]:
+        pieces.append(
+            "active reservation(s): " + ", ".join(blockers["active_reservation_ids"])
+        )
+    if blockers["published_offer_ids"]:
+        pieces.append(
+            "published offer(s): " + ", ".join(blockers["published_offer_ids"])
+        )
+    if blockers["live_package_ids"]:
+        pieces.append("live package(s): " + ", ".join(blockers["live_package_ids"]))
     raise CoordinationConflict(
-        f"refusing to migrate workspace {workspace_id!r}: it is not quiescent "
-        f"({'; '.join(pieces)}); end the work and reconcile it first",
-        details={"workspace_id": workspace_id, **blockers},
+        f"refusing to move workspace {workspace_id!r}: it is not quiescent "
+        f"({'; '.join(pieces)}); end the work and reconcile it first, or pass an "
+        "explicit administrative override (--force --reason) if you accept that "
+        "both stores will hold this work in flight",
+        details={
+            "workspace_id": workspace_id,
+            "code": "store_not_quiescent",
+            **blockers,
+        },
     )
 
 
@@ -1258,6 +1448,11 @@ def _history_fingerprint(bundle) -> str:
     namespaces and revisions are deliberately excluded, so a source and its
     re-exported destination compare equal even though every destination cursor is
     freshly assigned.
+
+    ``worker_profiles``, ``reservations``, ``offers`` and ``packages`` are hashed
+    in full -- their record dicts are store-independent, so no projection is
+    needed -- which means a transfer that dropped or altered one of those records
+    fails this verification instead of passing as "history preserved".
 
     ``workspace_bound`` events are excluded: they record where a workspace *is*
     bound, which is per-store administrative state rather than migrated history.
@@ -1309,17 +1504,27 @@ def _history_fingerprint(bundle) -> str:
         "claims": claims,
         "receipts": receipts,
         "events": events,
+        "job_board": {
+            name: sorted(
+                json.dumps(record, sort_keys=True, separators=(",", ":"))
+                for record in group(name)
+            )
+            for name in ("worker_profiles", "reservations", "offers", "packages")
+        },
     }
     blob = json.dumps(projection, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def migrate_coordination(source_sink, target_sink, *, workspace_id: Optional[str] = None,
-                         overwrite: bool = False) -> dict:
+                         overwrite: bool = False, allow_unquiescent: bool = False,
+                         override_reason: Optional[str] = None) -> dict:
     """Move one workspace's history from `source_sink` to `target_sink`.
 
     Steps, in order: resolve the workspace (the argument, else the single
-    workspace in the source), refuse unless the source is quiescent, export,
+    workspace in the source), refuse unless the source is quiescent -- or, with
+    ``allow_unquiescent=True`` and a non-empty ``override_reason``, record what
+    was overridden and continue -- export,
     verify the bundle, import it into the target, then **verify the destination**
     by re-exporting and comparing cursor-free history fingerprints. Nothing in
     the target is touched before the source bundle verifies, and this function
@@ -1353,7 +1558,12 @@ def migrate_coordination(source_sink, target_sink, *, workspace_id: Optional[str
             details={"workspace_id": workspace_id, "workspace_ids": ids},
         )
 
-    require_quiescent_store(source_store, workspace_id)
+    overridden = require_quiescent_store(
+        source_store,
+        workspace_id,
+        allow_unquiescent=allow_unquiescent,
+        override_reason=override_reason,
+    )
 
     bundle = export_coordination(source_sink, workspace_id=workspace_id)
     problems = bundle_problems(bundle)
@@ -1402,6 +1612,7 @@ def migrate_coordination(source_sink, target_sink, *, workspace_id: Optional[str
             "source_namespace": bundle.get("cursor_namespace"),
             "target_namespace": recheck.get("cursor_namespace"),
             "source_fingerprint": source_fingerprint,
+            "unquiescent_override": overridden or None,
         }
     )
     return result

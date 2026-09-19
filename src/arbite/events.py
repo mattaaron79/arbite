@@ -13,6 +13,15 @@ store's namespace, or a bare non-zero integer (whose store cannot be checked at
 all, so it could silently read the wrong position) all fail with a structured
 error code. ``0`` means "from the beginning of this store's stream".
 
+A stream that was *imported* here does not change that. The import records the
+source -> destination cursor map in the namespace registry (evidence of where
+those events landed), and a token from the source store is still
+`cursor_foreign_store` here: the destination's cursors are its own, so reading a
+source cursor as a position would silently return the wrong page. The refusal is
+*enriched* instead -- when the registry knows that namespace it also names the
+mapped destination cursor and the token to resume from, so the way forward is a
+query this store can answer.
+
 **Paging.** `query` returns one ordered page: `after_cursor`, `limit` and optional
 category/kind/subject filters. The cursor a page hands back is the cursor of the
 last event the page *consumed* -- not merely the last one it returned -- so a
@@ -73,7 +82,9 @@ EVENTS_NOTICE = (
     "committed/reconciled events are reported: an interrupted file-sink transaction "
     "is replayed forward (or stays absent) before its events are visible. Pass the "
     "returned `next_cursor` token back as --after to resume; a cursor is meaningful "
-    "only within the store that issued it"
+    "only within the store that issued it, so a token from a store whose events were "
+    "imported here is still refused as foreign -- with the mapped destination cursor "
+    "named when the import recorded one"
 )
 
 ACTIVITY_NOTICE = (
@@ -192,8 +203,66 @@ def event_view(event, namespace: str, *, include_token: bool = True) -> Dict[str
     return data
 
 
-def query(
-    sink,
+def _foreign_cursor_detail(store, error: ForeignCursor, namespace: str) -> ForeignCursor:
+    """`error`, enriched when the foreign namespace was imported into this store.
+
+    Refusing is deliberate -- a token names the store that issued it, and this
+    store's cursors are its own -- but a caller who asked here after moving a
+    store deserves the mapping instead of a bare refusal. The namespace registry
+    records where the import's events landed, so when it knows that namespace the
+    refusal also names the destination cursor and the exact token to resume from.
+    Reading the registry is best-effort and creates nothing.
+    """
+    details = dict(error.details)
+    token_namespace = details.get("token_namespace")
+    try:
+        entries = store.namespaces()
+    except Exception:
+        entries = []
+    entry = next(
+        (
+            candidate for candidate in entries
+            if isinstance(candidate, dict) and candidate.get("namespace") == token_namespace
+        ),
+        None,
+    )
+    if entry is None:
+        return error
+    cursor = details.get("cursor")
+    source = None
+    if isinstance(cursor, str) and CURSOR_SEPARATOR in cursor:
+        source = cursor.rpartition(CURSOR_SEPARATOR)[2]
+    mapped = None
+    cursor_map = entry.get("cursor_map")
+    if source is not None and source.isdigit() and isinstance(cursor_map, dict):
+        mapped = cursor_map.get(source)
+        if mapped is None:
+            mapped = cursor_map.get(int(source))
+    details["imported_namespace"] = token_namespace
+    details["imported_at"] = entry.get("imported_at")
+    details["imported_event_count"] = entry.get("event_count")
+    message = (
+        f"{error} -- that namespace was imported into this store on "
+        f"{entry.get('imported_at')} ({entry.get('event_count')} event(s)), which is "
+        "why this store can say where its cursor landed but will not read it as its "
+        "own position: "
+    )
+    if mapped is not None:
+        details["mapped_cursor"] = int(mapped)
+        details["mapped_cursor_token"] = cursor_token(namespace, int(mapped))
+        message += (
+            f"source cursor {source} became destination cursor {mapped} here, so "
+            f"resume with --after {cursor_token(namespace, int(mapped))}"
+        )
+    else:
+        message += (
+            "this source cursor is not in the recorded map, so start from --after 0 "
+            "and resume from the token this store returns"
+        )
+    return ForeignCursor(message, details=details)
+
+
+def query(    sink,
     *,
     after=None,
     limit: Optional[int] = None,
@@ -210,7 +279,10 @@ def query(
     """
     store = _require_store(sink)
     namespace = store.cursor_namespace()
-    after_cursor = parse_cursor(after, namespace)
+    try:
+        after_cursor = parse_cursor(after, namespace)
+    except ForeignCursor as error:
+        raise _foreign_cursor_detail(store, error, namespace) from None
     resolved_limit = DEFAULT_LIMIT if limit is None else int(limit)
     if resolved_limit < 1:
         raise InvalidRecord(f"--limit must be a positive integer, got {limit}")

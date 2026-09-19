@@ -1788,6 +1788,12 @@ def cmd_migrate(args):
     refusal rather than hidden behind a "would migrate" line -- and writes
     nothing.
     """
+    if args.force and not (args.reason or "").strip():
+        raise TicketError(
+            "--force needs a non-empty --reason: overriding the quiescence check "
+            "moves work that is still in flight, and the reason is what makes that "
+            "administrative decision explicit"
+        )
     project_root = config.find_project_root()
     source = config.open_sink(args.from_sink, project_root)
     target = config.open_sink_kind(args.to_sink, project_root)
@@ -1837,9 +1843,23 @@ def cmd_migrate(args):
     # nothing). The same CoordinationConflict names the blocking
     # attempts/claims/intents/journals.
     workspace_id = None
+    overridden_blockers: dict = {}
     if coordination_active:
         workspace_id = _migration_workspace_id(source_store, project_root)
-        coordination_export.require_quiescent_store(source_store, workspace_id)
+        overridden_blockers = coordination_export.require_quiescent_store(
+            source_store,
+            workspace_id,
+            allow_unquiescent=args.force,
+            override_reason=args.reason,
+        )
+        if any(overridden_blockers.values()):
+            print(
+                f"warning: --force overrides the quiescence check for {workspace_id} "
+                f"({_coordination_blocker_line(overridden_blockers)}); reason: "
+                f"{args.reason}. Nothing is dropped and the source keeps its records, "
+                "but both stores now hold this work in flight",
+                file=sys.stderr,
+            )
 
     if args.dry_run:
         present = (
@@ -1867,7 +1887,10 @@ def cmd_migrate(args):
                 f"(namespace {bundle.get('cursor_namespace')}): "
                 f"{counts['work_attempts']} attempt(s), {counts['file_claims']} claim(s), "
                 f"{counts['operation_receipts']} receipt(s), "
-                f"{counts['operation_intents']} intent(s), {counts['events']} event(s), "
+                f"{counts['operation_intents']} intent(s), "
+                f"{counts['worker_profiles']} profile(s), "
+                f"{counts['reservations']} reservation(s), {counts['offers']} offer(s), "
+                f"{counts['packages']} package(s), {counts['events']} event(s), "
                 f"{counts['artifacts']} artifact(s); artifacts and evidence are retained "
                 "(disk growth is expected)"
             )
@@ -1908,6 +1931,8 @@ def cmd_migrate(args):
             target_store,
             workspace_id=workspace_id,
             overwrite=args.overwrite,
+            allow_unquiescent=args.force,
+            override_reason=args.reason,
         )
         records = result.get("records", {})
         print(
@@ -1917,6 +1942,9 @@ def cmd_migrate(args):
             f"{records.get('file_claims', 0)} claim(s), "
             f"{records.get('operation_receipts', 0)} receipt(s), "
             f"{records.get('operation_intents', 0)} intent(s), "
+            f"{records.get('worker_profiles', 0)} profile(s), "
+            f"{records.get('reservations', 0)} reservation(s), "
+            f"{records.get('offers', 0)} offer(s), {records.get('packages', 0)} package(s), "
             f"{result.get('events', 0)} event(s), {result.get('artifacts', 0)} artifact(s); "
             "destination verified, artifacts and evidence are retained "
             "(disk growth is expected)"
@@ -1941,7 +1969,13 @@ def cmd_migrate(args):
     # Only now, after the destination verified and the copy is done, move the
     # authoritative binding so the marker, the stored binding and the config agree.
     if coordination_active:
-        _rebind_to_coordination_store(project_root, target, target_store)
+        _rebind_to_coordination_store(
+            project_root,
+            target,
+            target_store,
+            allow_unquiescent=args.force,
+            override_reason=args.reason,
+        )
 
     # The destination holds the tickets now, so it becomes the project default --
     # otherwise the next plain command would read the store you just migrated away
@@ -1967,7 +2001,42 @@ _COORDINATION_WORK_KINDS = (
     "operation_intent",
     "recovery_report",
     "lifecycle_intent",
+    # Job-board records (B07) are coordination state too: a registered profile,
+    # a reservation, an offer or a package that stayed behind would be lost.
+    "worker_profile",
+    "reservation",
+    "offer",
+    "package",
 )
+
+
+def _coordination_blocker_line(blockers) -> str:
+    """One line describing what a quiescence override allowed through.
+
+    Used by `migrate --force` and `rebind --force` so the override is *reported*
+    rather than silent: an administrative override must be visible in exactly the
+    command that made it.
+    """
+    labels = (
+        ("active_attempt_ids", "active attempt(s)"),
+        ("active_claim_paths", "active file claim(s)"),
+        ("pending_intent_ids", "pending intent(s)"),
+        ("pending_operations", "unreconciled operation(s)"),
+        ("active_reservation_ids", "active reservation(s)"),
+        ("published_offer_ids", "published offer(s)"),
+        ("live_package_ids", "live package(s)"),
+    )
+    pieces = []
+    for key, label in labels:
+        values = blockers.get(key) or []
+        if not values:
+            continue
+        rendered = ", ".join(
+            value if isinstance(value, str) else str(value.get("operation_id", value))
+            for value in values
+        )
+        pieces.append(f"{label}: {rendered}")
+    return "; ".join(pieces) or "nothing"
 
 
 def _coordination_state_present(store) -> bool:
@@ -2055,7 +2124,9 @@ def _migration_workspace_id(source_store, project_root):
     return None
 
 
-def _rebind_to_coordination_store(project_root, target, target_store) -> None:
+def _rebind_to_coordination_store(project_root, target, target_store, *,
+                                  allow_unquiescent: bool = False,
+                                  override_reason=None) -> None:
     """Make `target` the authoritative store for this project's workspace.
 
     Writes the marker through `workspace.ensure_binding`, which also stores the
@@ -2063,7 +2134,9 @@ def _rebind_to_coordination_store(project_root, target, target_store) -> None:
     `workspace_bound` event. Already matching the target is a no-op; no marker
     means this is the first bind (`rebind=False`); a marker naming a different
     store is an explicit rebind (`rebind=True`), which verifies the previously
-    bound store is quiescent.
+    bound store is quiescent. `allow_unquiescent` with an `override_reason` is
+    the explicit administrative override the caller (migrate --force) has already
+    reported, so the same refusal is not raised twice for one decision.
     """
     arbite_dir = project_root / config.ARBITE_DIRNAME
     marker = workspace.load_marker(arbite_dir)
@@ -2080,6 +2153,8 @@ def _rebind_to_coordination_store(project_root, target, target_store) -> None:
         location=location,
         store=target_store,
         rebind=marker is not None,
+        allow_unquiescent=allow_unquiescent,
+        override_reason=override_reason,
     )
 
 
@@ -2108,6 +2183,7 @@ _EXPORT_COORDINATION_COUNT_KEYS = (
     "worker_profiles",
     "reservations",
     "offers",
+    "packages",
     "events",
     "artifacts",
 )
@@ -2281,6 +2357,11 @@ def cmd_rebind(args):
             "rebind needs --to KIND to name the store being switched to "
             f"(valid: {', '.join(SINK_KINDS)})"
         )
+    if args.force and not (args.reason or "").strip():
+        raise TicketError(
+            "--force needs a non-empty --reason: overriding the quiescence check "
+            "hands a workspace to another store while work is still in flight"
+        )
     project_root = config.find_project_root()
     arbite_dir = project_root / config.ARBITE_DIRNAME
     current = config.open_sink(getattr(args, "sink", None), project_root)
@@ -2304,6 +2385,7 @@ def cmd_rebind(args):
             "--to store"
         )
 
+    overridden: dict = {}
     if marker is not None:
         previous = coordination.StoreBinding(
             id=coordination.new_record_id("store_binding"),
@@ -2312,7 +2394,34 @@ def cmd_rebind(args):
             location=from_location,
             bound_at=marker["bound_at"],
         )
-        workspace.require_quiescent(previous, workspace_id)
+        workspace.require_quiescent(
+            previous,
+            workspace_id,
+            allow_unquiescent=args.force,
+            override_reason=args.reason,
+        )
+        previous_store = workspace.open_store(from_kind, from_location)
+        if previous_store is None:
+            raise UnsupportedCoordination(
+                f"cannot verify quiescence for the previously bound store "
+                f"{from_kind}:{from_location}: unsupported sink kind; rebind "
+                "explicitly only after confirming the workspace has no active work",
+                details={"workspace_id": workspace_id},
+            )
+        overridden = coordination_export.require_quiescent_store(
+            previous_store,
+            workspace_id,
+            allow_unquiescent=args.force,
+            override_reason=args.reason,
+        )
+        if any(overridden.values()):
+            print(
+                f"warning: --force overrides the quiescence check for {workspace_id} "
+                f"({_coordination_blocker_line(overridden)}); reason: {args.reason}. "
+                "Nothing is revoked or dropped here, but the work stays behind in "
+                f"{from_kind}:{from_location}",
+                file=sys.stderr,
+            )
 
     dest_store = destination.coordination()
     if dest_store is None:
@@ -2351,6 +2460,7 @@ def cmd_rebind(args):
                 "workspace_id": workspace_id,
                 "dry_run": True,
                 "verified": True,
+                "unquiescent_override": overridden if any(overridden.values()) else None,
             },
             [
                 f"would rebind workspace {workspace_id} from {from_label} to {to_label} "
@@ -2366,6 +2476,8 @@ def cmd_rebind(args):
         location=dest_location,
         store=dest_store,
         rebind=marker is not None,
+        allow_unquiescent=args.force,
+        override_reason=args.reason,
     )
     written = config.set_configured_sink(destination.kind, project_root)
     _emit_rebind_result(
@@ -2377,6 +2489,7 @@ def cmd_rebind(args):
             "workspace_id": resolution.workspace_id,
             "dry_run": False,
             "verified": True,
+            "unquiescent_override": overridden or None,
         },
         [
             f"rebound workspace {resolution.workspace_id} from {from_label} to {to_label}",
@@ -4565,7 +4678,10 @@ def build_parser():
         "never modified -- this is a copy -- and a successful run makes the destination the "
         "project default, so later commands read the store the tickets now live in. Tickets "
         "already present in the destination are skipped unless --overwrite is given; --prune "
-        "additionally retires the source store once the copy is verified.",
+        "additionally retires the source store once the copy is verified. A source with work "
+        "still in flight -- an active attempt or claim, an active reservation, a published "
+        "(unaccepted) offer or a live package -- is refused (naming the records) unless "
+        "--force --reason explicitly overrides that check, and the override is reported.",
     )
     p_migrate.add_argument(
         "--to",
@@ -4620,6 +4736,22 @@ def build_parser():
         default=None,
         help="transfer tickets only, leaving all coordination history in the source store",
     )
+    p_migrate.add_argument(
+        "--force",
+        action="store_true",
+        help="administrative override: transfer even though the source store still has "
+        "work in flight (active attempts/claims, an active reservation, a published "
+        "offer, a live package). Requires --reason and reports exactly what was "
+        "overridden; nothing is dropped and the source keeps its records, but both "
+        "stores then hold that work in flight",
+    )
+    p_migrate.add_argument(
+        "--reason",
+        default=None,
+        metavar="TEXT",
+        help="why a --force migration is being made (required with --force); recorded "
+        "in the command's output",
+    )
     _sink_flag(p_migrate)
     p_migrate.set_defaults(func=cmd_migrate)
 
@@ -4630,7 +4762,10 @@ def build_parser():
         "then exit 3 if any problem remains. The shared checks cover duplicate ids, invalid "
         "field values, dependency cycles, dangling and self dependencies, in_progress "
         "tickets with no assignee, blocked tickets with no reason, and closed-date "
-        "mismatches. The sink adds its own: for the file sink, frontmatter/folder drift (the "
+        "mismatches, plus the coordination checks (dangling job-board references, "
+        "overlapping reservation/offer/package membership, attempts that disagree with "
+        "their ticket, an invalid continuity binding, impossible capacity arithmetic and "
+        "an unreadable namespace registry -- reported, never reassigned or repaired). The sink adds its own: for the file sink, frontmatter/folder drift (the "
         "folder is authoritative), stray temp files from an interrupted write, and closed "
         "tickets archived under the wrong month; for the SQLite sink, a note index that has "
         "drifted from the ticket body, orphaned index rows, an unexpected schema version and "
@@ -4695,7 +4830,9 @@ def build_parser():
         description="Explicitly change which store a workspace coordinates against, then "
         "make it the project default. Verifies first, writing nothing until every check "
         "passes: the currently bound store must be quiescent (no active attempt or file "
-        "claim), the destination must expose a coordination store, its contract version "
+        "claim and no active reservation, published offer or live package; --force --reason "
+        "is the explicit administrative override, which is reported), the destination must "
+        "expose a coordination store, its contract version "
         "must match, and when it is already initialised its coordination doctor must find "
         "no problems. --dry-run runs every check and reports what would change. There is no "
         "daemon, retry or automatic takeover.",
@@ -4712,6 +4849,21 @@ def build_parser():
         "--dry-run",
         action="store_true",
         help="run every verification and report what would change, writing nothing",
+    )
+    p_rebind.add_argument(
+        "--force",
+        action="store_true",
+        help="administrative override: rebind even though the currently bound store "
+        "still has work in flight (active attempts/claims, an active reservation, a "
+        "published offer, a live package). Requires --reason and reports exactly what "
+        "was overridden; the work stays behind in the old store",
+    )
+    p_rebind.add_argument(
+        "--reason",
+        default=None,
+        metavar="TEXT",
+        help="why a --force rebind is being made (required with --force); recorded in "
+        "the command's output",
     )
     _json_flag(p_rebind)
     _sink_flag(p_rebind)

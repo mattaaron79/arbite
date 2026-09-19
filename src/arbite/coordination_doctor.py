@@ -25,6 +25,49 @@ Every individual check is wrapped so that malformed state is *reported* rather t
 crashing `arbite doctor`; only `Exception` is caught, so `KeyboardInterrupt` and
 `SystemExit` still propagate.
 
+## Job-board findings (planning key B07)
+
+The same code checks both sinks, and every job-board finding is report-only: an
+inconsistency here has more than one defensible resolution, so the doctor never
+repairs, reassigns or releases anything.
+
+- ``coordination_dangling_offer`` -- an offer naming a reservation, a package, a
+  ticket or (for an accepted/completed offer) the attempt that accepted it, where
+  the named record is not stored. Worker ids are *not* required to resolve: an
+  ad-hoc worker legitimately has no profile, so a missing profile is never
+  reported as a dangling worker subject.
+- ``coordination_dangling_package`` -- a package naming a ticket or a reservation
+  that is not stored.
+- ``coordination_dangling_reservation`` -- a reservation naming a ticket that is
+  not in the ticket store.
+- ``coordination_overlapping_reservation`` / ``coordination_overlapping_offer`` /
+  ``coordination_overlapping_package`` -- one ticket held by two active
+  reservations, two live offers or two live packages.
+- ``coordination_package_reservation_mismatch`` -- a live package whose recorded
+  reservation no longer covers its members, or a live package member held by an
+  active reservation the package does not record (the "reserved while packaged"
+  case). The rules come from `reservations`/`packages` themselves: reservation
+  creation is all-or-nothing and refuses an overlapping member, package creation
+  refuses a member reserved elsewhere and records the reservation that held its
+  members, and at most one live package/offer may target a ticket.
+- ``coordination_continuity_binding_invalid`` -- a live package whose bound worker
+  is missing, or whose profile is disabled, so no remaining member can be
+  acquired until an explicit `package handoff`. Nothing is revoked: a disabled
+  profile stops new acquisitions and deletes no history.
+- ``coordination_attempt_mismatch`` -- an active attempt whose ticket is missing,
+  closed or shelved (unless a pending lifecycle intent already explains it), an
+  attempt whose worker disagrees with the ticket's assignee, or an ``in_progress``
+  ticket with no attempt at all (legacy-adopted or released -- the doctor names
+  both ways forward and does not choose).
+- ``coordination_capacity_exceeded`` -- a worker with more active attempts than
+  its profile's declared capacity where at least one of those attempts started
+  after the profile was last updated, so acquisition should have refused it. A
+  capacity lowered below running work is explicitly allowed and is not reported.
+- ``coordination_namespace_mismatch`` -- a namespace-registry entry that cannot be
+  interpreted against this store: this store's own namespace registered as an
+  import, a non-numeric cursor map, a destination cursor outside the stored
+  stream, or a map that walks backwards.
+
 ## Fix policy (enforced here, stated here)
 
 AUTO-FIX (`fixed=True`, only when the answer is unambiguous):
@@ -46,7 +89,8 @@ AUTO-FIX (`fixed=True`, only when the answer is unambiguous):
 
 REPORT ONLY (never repaired here): drifted pending intents (the bytes match neither
 side), missing/corrupt artifacts, revision drift, event cursor conflicts, orphan
-claims, invalid generations, unreadable records, and `coordination_binding_drift`.
+claims, invalid generations, unreadable records, `coordination_binding_drift`, and
+every job-board finding listed above.
 
 **The stored binding is authoritative and the marker MIRROR is never rewritten.**
 Rewriting `.arbite/workspace-binding.json` from here would silently move which store
@@ -69,9 +113,15 @@ from . import coordination, workspace
 from .coordination import (
     ABSENT,
     INTENT_ACTIVE_STATES,
+    OFFER_LIVE_STATES,
+    PACKAGE_LIVE_STATES,
     FileClaim,
+    Offer,
     OperationIntent,
+    Package,
+    Reservation,
     WorkAttempt,
+    WorkerProfile,
     digest_of_bytes,
     is_digest,
     is_opaque_id,
@@ -215,6 +265,25 @@ def _read_store(store):
     return records, events
 
 
+def _tickets_by_id(sink):
+    """`{ticket_id: Ticket}` for the sink, or `None` when it cannot be read.
+
+    `None` means "unverifiable": the job-board checks then skip every comparison
+    that needs a ticket's status rather than reporting a phantom finding. Reading
+    is read-only and creates nothing, and a doctor given a bare store has no sink
+    to ask (the `tickets` id set is still used where it was passed in).
+    """
+    query = getattr(sink, "query", None)
+    if not callable(query):
+        return None
+    try:
+        from .query import TicketQuery
+
+        return {ticket.id: ticket for ticket in query(TicketQuery(buckets=("*",)))}
+    except Exception:
+        return None
+
+
 def _build_context(sink, store, *, fix, tickets, pending_before, allow_binding_read):
     records, events = _read_store(store)
     by_kind: dict = {}
@@ -241,6 +310,10 @@ def _build_context(sink, store, *, fix, tickets, pending_before, allow_binding_r
             workspace_roots[record.id] = root
 
     receipt_ids = {r.id for r in by_kind.get("operation_receipt", [])}
+    pending_lifecycle_tickets = {
+        intent.ticket_id for intent in by_kind.get("lifecycle_intent", [])
+        if getattr(intent, "is_pending", False)
+    }
 
     return {
         "sink": sink,
@@ -254,6 +327,8 @@ def _build_context(sink, store, *, fix, tickets, pending_before, allow_binding_r
         "events": events,
         "workspace_roots": workspace_roots,
         "receipt_ids": receipt_ids,
+        "tickets_by_id": _tickets_by_id(sink),
+        "pending_lifecycle_tickets": pending_lifecycle_tickets,
         "pending_before": pending_before,
         "allow_binding_read": allow_binding_read,
         "artifact_state": {"checked": False, "ok": True, "capability": None},
@@ -1095,6 +1170,455 @@ def _check_pending_lifecycle_intents(ctx):
     return problems
 
 
+def _check_job_board_references(ctx):
+    """Finding 13: a job-board record naming a subject that is not stored.
+
+    Ticket ids are judged against the ticket store (when it can be read) and
+    job-board ids against the stored job-board records. Worker ids are NOT
+    required to resolve -- an ad-hoc worker has no profile by design -- so a
+    missing profile is never reported as a dangling worker subject. Nothing here
+    is repaired: a dangling reference has more than one defensible resolution.
+    """
+    problems = []
+    by_kind = ctx["by_kind"]
+    reservations = [r for r in by_kind.get("reservation", []) if isinstance(r, Reservation)]
+    packages = [p for p in by_kind.get("package", []) if isinstance(p, Package)]
+    offers = [o for o in by_kind.get("offer", []) if isinstance(o, Offer)]
+    attempts = {
+        a.id: a for a in by_kind.get("work_attempt", []) if isinstance(a, WorkAttempt)
+    }
+    reservation_ids = {r.id for r in reservations}
+    package_ids = {p.id for p in packages}
+    tickets = ctx["tickets"]
+
+    def missing_ticket(ticket_id: str) -> bool:
+        return tickets is not None and ticket_id not in tickets
+
+    def first_ticket(record):
+        return record.tickets[0] if record.tickets else None
+
+    for reservation in reservations:
+        for member in reservation.members:
+            if missing_ticket(member):
+                problems.append(Problem(
+                    "coordination_dangling_reservation",
+                    f"reservation {reservation.id!r} (owner {reservation.owner!r}, "
+                    f"state {reservation.state!r}) names ticket {member!r}, which is "
+                    "not in the ticket store",
+                    ticket_id=member,
+                    fixed=False,
+                ))
+
+    for package in packages:
+        label = f"package {package.id!r}"
+        for ticket in package.tickets:
+            if missing_ticket(ticket):
+                problems.append(Problem(
+                    "coordination_dangling_package",
+                    f"{label} (state {package.state!r}) names ticket {ticket!r}, "
+                    "which is not in the ticket store",
+                    ticket_id=ticket,
+                    fixed=False,
+                ))
+        if package.reservation_id is not None and package.reservation_id not in reservation_ids:
+            problems.append(Problem(
+                "coordination_dangling_package",
+                f"{label} records reservation_id={package.reservation_id!r}, which "
+                "is not stored",
+                ticket_id=first_ticket(package),
+                fixed=False,
+            ))
+
+    for offer in offers:
+        label = f"offer {offer.id!r}"
+        ticket_id = first_ticket(offer)
+        if offer.reservation_id is not None and offer.reservation_id not in reservation_ids:
+            problems.append(Problem(
+                "coordination_dangling_offer",
+                f"{label} (state {offer.state!r}) names reservation "
+                f"{offer.reservation_id!r}, which is not stored",
+                ticket_id=ticket_id,
+                fixed=False,
+            ))
+        if offer.package_id is not None and offer.package_id not in package_ids:
+            problems.append(Problem(
+                "coordination_dangling_offer",
+                f"{label} (state {offer.state!r}) names package {offer.package_id!r}, "
+                "which is not stored",
+                ticket_id=ticket_id,
+                fixed=False,
+            ))
+        for ticket in offer.tickets:
+            if missing_ticket(ticket):
+                problems.append(Problem(
+                    "coordination_dangling_offer",
+                    f"{label} (state {offer.state!r}) names ticket {ticket!r}, which "
+                    "is not in the ticket store",
+                    ticket_id=ticket,
+                    fixed=False,
+                ))
+        if offer.state not in ("accepted", "completed"):
+            continue
+        attempt = attempts.get(offer.attempt_id)
+        if attempt is None:
+            problems.append(Problem(
+                "coordination_dangling_offer",
+                f"{label} is {offer.state!r} but names attempt {offer.attempt_id!r}, "
+                "which is not stored, so the acceptance cannot be attributed",
+                ticket_id=ticket_id,
+                fixed=False,
+            ))
+        elif attempt.ticket_id not in offer.tickets:
+            problems.append(Problem(
+                "coordination_attempt_mismatch",
+                f"{label} is {offer.state!r} and names attempt {attempt.id!r}, which "
+                f"belongs to ticket {attempt.ticket_id!r}, not to the offer's "
+                f"ticket(s) {', '.join(offer.tickets)}",
+                ticket_id=ticket_id,
+                fixed=False,
+            ))
+        elif offer.accepted_by and attempt.worker_id != offer.accepted_by:
+            problems.append(Problem(
+                "coordination_attempt_mismatch",
+                f"{label} says it was accepted by {offer.accepted_by!r} but attempt "
+                f"{attempt.id!r} belongs to {attempt.worker_id!r}",
+                ticket_id=ticket_id,
+                fixed=False,
+            ))
+    return problems
+
+
+def _check_job_board_overlaps(ctx):
+    """Finding 14: overlapping membership, and reservations that lost coverage.
+
+    The rules are the ones `reservations`/`packages` enforce at write time:
+    reservation creation is all-or-nothing and refuses an overlapping member,
+    package creation refuses a member reserved elsewhere and records the
+    reservation that held its members, and one ticket may be the target of at
+    most one live package and at most one live offer. "Reserved while packaged"
+    is reported only when the holds disagree with what the package recorded -- a
+    package that records its reservation is exactly the legal case.
+    """
+    problems = []
+    by_kind = ctx["by_kind"]
+    reservations = [r for r in by_kind.get("reservation", []) if isinstance(r, Reservation)]
+    packages = [p for p in by_kind.get("package", []) if isinstance(p, Package)]
+    offers = [o for o in by_kind.get("offer", []) if isinstance(o, Offer)]
+
+    def report(bucket, code, label):
+        for ticket in sorted(bucket):
+            ids = sorted(bucket[ticket])
+            if len(ids) > 1:
+                problems.append(Problem(
+                    code,
+                    f"ticket {ticket!r} is held by {len(ids)} {label} "
+                    f"({', '.join(ids)}); the job-board invariants allow one",
+                    ticket_id=ticket,
+                    fixed=False,
+                ))
+
+    held_by_reservation: dict = {}
+    for reservation in reservations:
+        if not reservation.is_active:
+            continue
+        for member in reservation.members:
+            held_by_reservation.setdefault(member, []).append(reservation.id)
+    report(held_by_reservation, "coordination_overlapping_reservation",
+           "active reservations")
+
+    live_offers: dict = {}
+    for offer in offers:
+        if offer.state not in OFFER_LIVE_STATES:
+            continue
+        for ticket in offer.tickets:
+            live_offers.setdefault(ticket, []).append(offer.id)
+    report(live_offers, "coordination_overlapping_offer", "live offers")
+
+    live_packages: dict = {}
+    for package in packages:
+        if not package.is_live:
+            continue
+        for ticket in package.tickets:
+            live_packages.setdefault(ticket, []).append(package.id)
+    report(live_packages, "coordination_overlapping_package", "live packages")
+
+    by_reservation_id = {r.id: r for r in reservations}
+    for package in packages:
+        if not package.is_live:
+            continue
+        label = f"package {package.id!r}"
+        if package.reservation_id is not None:
+            reservation = by_reservation_id.get(package.reservation_id)
+            if reservation is not None and reservation.is_active:
+                uncovered = sorted(set(package.tickets) - set(reservation.members))
+                if uncovered:
+                    problems.append(Problem(
+                        "coordination_package_reservation_mismatch",
+                        f"{label} records reservation {reservation.id!r}, which no "
+                        f"longer holds its member(s) {', '.join(uncovered)}; the "
+                        "package's hold and the reservation have diverged",
+                        ticket_id=uncovered[0],
+                        fixed=False,
+                    ))
+        for ticket in package.tickets:
+            others = [
+                reservation_id
+                for reservation_id in held_by_reservation.get(ticket, [])
+                if reservation_id != package.reservation_id
+            ]
+            if others:
+                problems.append(Problem(
+                    "coordination_package_reservation_mismatch",
+                    f"ticket {ticket!r} is a member of live {label} and of active "
+                    f"reservation(s) {', '.join(sorted(others))}, which the package "
+                    "does not record; a package member is reserved by the package's "
+                    "own coordinator or not at all",
+                    ticket_id=ticket,
+                    fixed=False,
+                ))
+    return problems
+
+
+def _check_continuity_bindings(ctx):
+    """Finding 15: a live package whose continuity identity cannot take work.
+
+    A package binds its remaining members to one worker id, so the doctor reports
+    a binding that names no worker at all, or one whose profile is *disabled*
+    (arbite has no profile removal -- `disable` is the closest thing, and it must
+    not erase history). The finding names the explicit `package handoff` that
+    resolves it: nothing is reassigned here, and a disabled profile revokes
+    nothing that is already running.
+    """
+    problems = []
+    profiles = {
+        profile.worker_id: profile
+        for profile in ctx["by_kind"].get("worker_profile", [])
+        if isinstance(profile, WorkerProfile)
+    }
+    for package in ctx["by_kind"].get("package", []):
+        if not isinstance(package, Package) or not package.is_live:
+            continue
+        if not package.bound_worker:
+            if package.state == "bound":
+                problems.append(Problem(
+                    "coordination_continuity_binding_invalid",
+                    f"package {package.id!r} is bound but names no bound_worker, so "
+                    "its remaining members cannot be acquired; rebind it explicitly",
+                    ticket_id=package.current,
+                    fixed=False,
+                ))
+            continue
+        profile = profiles.get(package.bound_worker)
+        if profile is not None and not profile.is_enabled:
+            problems.append(Problem(
+                "coordination_continuity_binding_invalid",
+                f"package {package.id!r} is bound to {package.bound_worker!r}, whose "
+                f"profile is disabled (disabled at {profile.disabled_at!r}); its "
+                "remaining member(s) cannot be acquired until an explicit "
+                "`package handoff` rebinds or releases them. Nothing is revoked here, "
+                "and a disabled profile deletes no history",
+                ticket_id=package.current,
+                fixed=False,
+            ))
+    return problems
+
+
+def _check_attempt_consistency(ctx):
+    """Finding 16: an attempt and its ticket disagreeing.
+
+    Only durable facts are compared: an active attempt whose ticket is missing,
+    closed or shelved; an active attempt whose worker is not the ticket's declared
+    assignee; and an `in_progress` ticket with no attempt at all, in a store that
+    does use coordination (a legacy-adopted or released ticket -- the doctor names
+    both ways forward and chooses neither). A store with no attempt records at all
+    is a legacy store, where an assigned `in_progress` ticket is the documented
+    pre-coordination state and is not reported.
+    A pending lifecycle intent already explains a ticket/attempt disagreement, so
+    those tickets are skipped here rather than reported twice.
+    """
+    problems = []
+    attempts = [
+        a for a in ctx["by_kind"].get("work_attempt", []) if isinstance(a, WorkAttempt)
+    ]
+    tickets = ctx["tickets"]
+    if tickets is None:
+        return problems
+    by_id = ctx["tickets_by_id"]
+    pending = ctx["pending_lifecycle_tickets"]
+    for attempt in attempts:
+        if not attempt.is_active:
+            continue
+        if attempt.ticket_id not in tickets:
+            problems.append(Problem(
+                "coordination_attempt_mismatch",
+                f"attempt {attempt.id!r} is active for ticket {attempt.ticket_id!r}, "
+                "which is not in the ticket store; nothing can acquire or mutate "
+                "that attempt -- resolve it explicitly",
+                ticket_id=attempt.ticket_id,
+                fixed=False,
+            ))
+            continue
+        if by_id is None or attempt.ticket_id in pending:
+            continue
+        ticket = by_id.get(attempt.ticket_id)
+        if ticket is None:
+            continue
+        if ticket.status in ("closed", "shelved"):
+            problems.append(Problem(
+                "coordination_attempt_mismatch",
+                f"attempt {attempt.id!r} is active but its ticket "
+                f"{attempt.ticket_id!r} is {ticket.status!r}; end the attempt through "
+                "the lifecycle rather than by hand",
+                ticket_id=attempt.ticket_id,
+                fixed=False,
+            ))
+        elif ticket.assignee and ticket.assignee != attempt.worker_id:
+            problems.append(Problem(
+                "coordination_attempt_mismatch",
+                f"attempt {attempt.id!r} belongs to {attempt.worker_id!r} but ticket "
+                f"{attempt.ticket_id!r} is assigned to {ticket.assignee!r}",
+                ticket_id=attempt.ticket_id,
+                fixed=False,
+            ))
+    if by_id is None or not attempts:
+        # No attempt record anywhere means this store simply does not (yet) use
+        # coordination: every in_progress ticket is the documented legacy state
+        # that `claim --adopt` exists for, not an inconsistency to report.
+        return problems
+    claimed = {attempt.ticket_id for attempt in attempts}
+    for ticket_id in sorted(by_id):
+        ticket = by_id[ticket_id]
+        if ticket.status != "in_progress" or ticket_id in claimed or ticket_id in pending:
+            continue
+        problems.append(Problem(
+            "coordination_attempt_mismatch",
+            f"ticket {ticket_id!r} is in_progress (assignee {ticket.assignee!r}) but "
+            "no work attempt is recorded for it; adopt the claim if it is real "
+            f"(`arbite claim {ticket_id} --adopt`) or release it if it is not -- the "
+            "doctor does not guess which",
+            ticket_id=ticket_id,
+            fixed=False,
+        ))
+    return problems
+
+
+def _check_capacity_arithmetic(ctx):
+    """Finding 17: declared capacity contradicted by post-update acquisitions.
+
+    A profile's declared capacity limits concurrent active attempts and is
+    enforced at acquisition, while a capacity *lowered* below running work is
+    explicitly allowed -- so only attempts that started after the profile was last
+    updated are reported. Nothing is released or reassigned.
+    """
+    problems = []
+    profiles = {
+        profile.worker_id: profile
+        for profile in ctx["by_kind"].get("worker_profile", [])
+        if isinstance(profile, WorkerProfile) and profile.capacity is not None
+    }
+    active: dict = {}
+    for attempt in ctx["by_kind"].get("work_attempt", []):
+        if isinstance(attempt, WorkAttempt) and attempt.is_active:
+            active.setdefault(attempt.worker_id, []).append(attempt)
+    for worker_id in sorted(active):
+        profile = profiles.get(worker_id)
+        if profile is None:
+            continue
+        rows = active[worker_id]
+        if len(rows) <= profile.capacity:
+            continue
+        unexpected = sorted(
+            attempt.id for attempt in rows
+            if isinstance(attempt.started, str) and isinstance(profile.updated, str)
+            and attempt.started > profile.updated
+        )
+        if not unexpected:
+            continue
+        problems.append(Problem(
+            "coordination_capacity_exceeded",
+            f"worker {worker_id!r} declares capacity {profile.capacity} but has "
+            f"{len(rows)} active attempt(s), and {len(unexpected)} of them started "
+            f"after the profile was last updated ({profile.updated}): "
+            f"{', '.join(unexpected)}. Acquisition enforces capacity, so this "
+            "arithmetic cannot come from a normal claim; nothing is released here",
+            fixed=False,
+        ))
+    return problems
+
+
+def _check_namespace_registry(ctx):
+    """Finding 18: a namespace-registry entry unreadable against this store.
+
+    The registry records where an import's cursors came from. An entry is unusable
+    when it names this store's *own* namespace (a store cannot import itself),
+    when a mapped cursor is not numeric, when a destination cursor falls outside
+    the stored stream, or when the map walks backwards. Cursor provenance stays
+    explicit: those source cursors are still refused here as foreign (see
+    `arbite.events`), and the registry is the evidence of where they landed --
+    never a reason to start accepting them silently.
+    """
+    problems = []
+    store = ctx["store"]
+    entries = _safe_list(store.namespaces)
+    if not entries:
+        return problems
+    try:
+        own_namespace = store.cursor_namespace()
+    except Exception:  # pragma: no cover - defensive
+        own_namespace = None
+    newest = 0
+    for entry in ctx["events"]:
+        cursor = entry.get("cursor") if isinstance(entry, dict) else None
+        if isinstance(cursor, int) and not isinstance(cursor, bool):
+            newest = max(newest, cursor)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        namespace = entry.get("namespace")
+        if own_namespace is not None and namespace == own_namespace:
+            problems.append(Problem(
+                "coordination_namespace_mismatch",
+                f"the namespace registry has an entry for this store's own "
+                f"namespace {namespace!r}; a store cannot import itself",
+                fixed=False,
+            ))
+        cursor_map = entry.get("cursor_map") or {}
+        if not isinstance(cursor_map, dict):
+            continue
+        pairs = []
+        for source, destination in cursor_map.items():
+            try:
+                pairs.append((int(source), int(destination)))
+            except (TypeError, ValueError):
+                problems.append(Problem(
+                    "coordination_namespace_mismatch",
+                    f"namespace {namespace!r} has a non-numeric cursor map entry "
+                    f"{source!r} -> {destination!r}",
+                    fixed=False,
+                ))
+        ordered = sorted(pairs)
+        for source, destination in ordered:
+            if destination < 1 or destination > newest:
+                problems.append(Problem(
+                    "coordination_namespace_mismatch",
+                    f"namespace {namespace!r} maps source cursor {source} to "
+                    f"destination cursor {destination}, outside this store's stored "
+                    f"event stream (newest cursor {newest})",
+                    fixed=False,
+                ))
+        for (source_a, dest_a), (source_b, dest_b) in zip(ordered, ordered[1:]):
+            if dest_b <= dest_a:
+                problems.append(Problem(
+                    "coordination_namespace_mismatch",
+                    f"namespace {namespace!r} maps source cursor {source_a} to "
+                    f"destination {dest_a} and source cursor {source_b} to "
+                    f"destination {dest_b}; an import appends in source order, so the "
+                    "map cannot walk backwards",
+                    fixed=False,
+                ))
+    return problems
+
+
 _CHECKS = (
     ("orphan claims", _check_orphan_claims),
     ("invalid generations", _check_invalid_generations),
@@ -1109,6 +1633,12 @@ _CHECKS = (
     ("pending operations", _check_pending_operations),
     ("stale operation indexes", _check_stale_operation_index),
     ("pending lifecycle intents", _check_pending_lifecycle_intents),
+    ("job-board references", _check_job_board_references),
+    ("job-board overlaps", _check_job_board_overlaps),
+    ("continuity bindings", _check_continuity_bindings),
+    ("attempt consistency", _check_attempt_consistency),
+    ("capacity arithmetic", _check_capacity_arithmetic),
+    ("namespace registry", _check_namespace_registry),
 )
 
 

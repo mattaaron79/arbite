@@ -544,6 +544,9 @@ def test_quiescence_blockers_detect_active_work(kind, sink, arbite_dir):
         "active_claim_paths": [],
         "pending_intent_ids": [],
         "pending_operations": [],
+        "active_reservation_ids": [],
+        "published_offer_ids": [],
+        "live_package_ids": [],
     }
     x.require_quiescent_store(store, workspace.id)
 
@@ -578,6 +581,9 @@ def test_quiescence_of_an_uninitialised_store_creates_nothing(kind, arbite_dir):
         "active_claim_paths": [],
         "pending_intent_ids": [],
         "pending_operations": [],
+        "active_reservation_ids": [],
+        "published_offer_ids": [],
+        "live_package_ids": [],
     }
     x.require_quiescent_store(store, "ws-00000000000000aa")
     assert store.is_initialised() is False
