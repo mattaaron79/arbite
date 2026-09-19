@@ -6,7 +6,6 @@ build/
 dist/
 tickets/
 plans/
-.arbite/
 
 # Local / personal editor settings
 .vscode/

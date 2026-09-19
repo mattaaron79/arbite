@@ -1,23 +1,30 @@
-"""Generate realistic seed ticket data for the local .arbite/ directory.
+"""Generate realistic seed ticket data for the local arbite store.
 
 Simulates ~2.5 months (2026-06 through 2026-08-18) of a real arbite workflow
 for a Blender addon that generates assets across the mesh / image_gen /
 audio_gen / ui / io domains. Tickets are created, claimed, noted on, blocked,
-unblocked, and closed in *chronological* order, using the same code paths
-(`Ticket`, `save_ticket`, `move_ticket`, `status_dir`) that the `arbite` CLI
-uses -- so the files land in exactly the folders/format the CLI would produce
-and round-trip cleanly through `arbite list` / `arbite deps` etc.
+unblocked, and closed in *chronological* order, using the same sink API
+(`create`, `update`, `move_to_bucket`, `remove`) that the `arbite` CLI itself
+uses -- so the data lands in exactly the state the CLI would produce and
+round-trips cleanly through `arbite list` / `arbite deps` / `arbite doctor`.
 
-Idempotent: existing *.md tickets under .arbite/{open,in_progress,blocked,
-closed} are removed first, then regenerated. The agents/ scratchpads are also
-rewritten to reflect current state (one active ticket per agent).
+Which store it seeds is decided the same way a command decides it: `--sink`,
+then ARBITE_SINK, then the `sink:` key in arbite.yaml, then the default (file).
+Because the data is built through the interface rather than by writing files,
+`--sink sqlite` seeds a database with the same ticket set -- which makes the two
+sinks directly comparable, and is a pleasant way to browse a filterable store.
+
+Idempotent: every ticket in the store is removed first, then regenerated. The
+agents/ scratchpads are rewritten too (they are harness-facing files, not
+tickets, and live under .arbite/ whatever the sink).
 
 Re-run anytime with:
-    python scripts/seed_demo.py
+    python scripts/seed_demo.py [--sink file|sqlite]
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +32,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from arbite.ticket import (  # noqa: E402
+from arbite.config import ARBITE_DIRNAME, sink_spec  # noqa: E402
+from arbite.query import TicketQuery  # noqa: E402
+from arbite.schema import (  # noqa: E402
     BLANK_DESCRIPTION,
     BLANK_DOMAIN,
     BLANK_TIER,
@@ -34,13 +43,10 @@ from arbite.ticket import (  # noqa: E402
     BLANK_WARNING,
     DEFAULT_BODY,
     Ticket,
-    load_all_tickets,
-    move_ticket,
-    save_ticket,
-    status_dir,
 )
+from arbite.sinks import DEFAULT_SINK_KIND, SINK_KINDS, build_sink  # noqa: E402
 
-TICKETS_ROOT = ROOT / ".arbite"
+TICKETS_ROOT = ROOT / ARBITE_DIRNAME
 
 
 @dataclass
@@ -480,27 +486,25 @@ SPECS = [
 SPECS_BY_ID = {s.id: s for s in SPECS}
 
 
-def _clean_tickets(root: Path) -> None:
-    """Remove previously generated ticket *.md files (keeps agents/ and .gitkeep)."""
-    for status in ("open", "in_progress", "blocked"):
-        d = root / status
-        if d.is_dir():
-            for p in d.glob("*.md"):
-                p.unlink()
-    closed = root / "closed"
-    if closed.is_dir():
-        for month in sorted(closed.iterdir()):
-            if month.is_dir():
-                for p in month.glob("*.md"):
-                    p.unlink()
+def _clean_tickets(sink) -> None:
+    """Remove every ticket already in the store, so re-running is idempotent.
+
+    Done through the sink rather than by deleting files, which is the same
+    property this script exists to demonstrate: it works on any store, and a
+    deleted ticket takes its derived rows/state with it. agents/ and AGENTS.md
+    are not tickets and are left alone."""
+    existing = sink.ids()
+    for ticket_id in existing:
+        sink.remove(ticket_id)
+    if existing:
+        print(f"removed {len(existing)} existing ticket(s)")
 
 
 def _append_note(t: Ticket, date: str, text: str) -> None:
     t.body = t.body.rstrip("\n") + f"\n- {date}: {text}"
 
 
-def _create_ticket(spec: Spec, date: str) -> tuple[Ticket, Path]:
-    tickets_root = TICKETS_ROOT
+def _create_ticket(spec: Spec, date: str, sink) -> Ticket:
     if spec.blank:
         title, typ, tier, domain = BLANK_TITLE, BLANK_TYPE, BLANK_TIER, BLANK_DOMAIN
         desc = BLANK_DESCRIPTION
@@ -526,13 +530,27 @@ def _create_ticket(spec: Spec, date: str) -> tuple[Ticket, Path]:
         closed=None,
         body=body,
     )
-    path = tickets_root / "open" / f"{spec.id}.md"
-    save_ticket(t, path)
-    return t, path
+    sink.create(t)
+    return t
 
 
 def main() -> None:
-    _clean_tickets(TICKETS_ROOT)
+    parser = argparse.ArgumentParser(description="Seed a demo arbite store")
+    parser.add_argument(
+        "--sink",
+        choices=SINK_KINDS,
+        default=None,
+        help=f"which store to seed (default: ARBITE_SINK / arbite.yaml / "
+        f"{DEFAULT_SINK_KIND})",
+    )
+    args = parser.parse_args()
+
+    resolved = sink_spec(args.sink, ROOT)
+    sink = build_sink(resolved, TICKETS_ROOT)
+    sink.init()
+    print(f"seeding the {sink.kind} sink at {sink.root}")
+
+    _clean_tickets(sink)
 
     # Build a global chronological timeline so the simulation iterates events in
     # an order that makes sense in the real world (a ticket can't be claimed
@@ -544,16 +562,15 @@ def main() -> None:
             timeline.append((ev.date, i, spec.id, ev.action, ev.payload))
     timeline.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    live: dict[str, tuple[Ticket, Path]] = {}
+    live: dict = {}
     for date, _seq, tid, action, payload in timeline:
         spec = SPECS_BY_ID[tid]
         if action == "create":
-            t, path = _create_ticket(spec, date)
-            live[tid] = (t, path)
+            live[tid] = _create_ticket(spec, date, sink)
             print(f"{date} create  {tid}")
             continue
 
-        t, path = live[tid]
+        t = live[tid]
         if action == "note":
             _append_note(t, date, payload)
             t.updated = date
@@ -562,82 +579,90 @@ def main() -> None:
             t.assignee = payload
             t.updated = date
             _append_note(t, date, f"Claimed by {payload}.")
-            path = move_ticket(path, t, TICKETS_ROOT, "in_progress")
+            t.status = "in_progress"
+            sink.update(t)
             print(f"{date} claim   {tid} -> {payload}")
         elif action == "block":
             t.blocked_by = payload
             t.updated = date
             _append_note(t, date, f"Blocked: {payload}.")
-            path = move_ticket(path, t, TICKETS_ROOT, "blocked")
+            t.status = "blocked"
+            sink.update(t)
             print(f"{date} block   {tid}: {payload[:60]}{'...' if len(payload) > 60 else ''}")
         elif action == "unblock":
             t.blocked_by = None
             t.updated = date
             _append_note(t, date, "Unblocked -- resumed work.")
-            path = move_ticket(path, t, TICKETS_ROOT, "in_progress")
+            t.status = "in_progress"
+            sink.update(t)
             print(f"{date} unblock {tid}")
         elif action == "close":
             t.closed = date
             t.updated = date
             _append_note(t, date, "Closed.")
-            path = move_ticket(path, t, TICKETS_ROOT, "closed")
+            t.status = "closed"
+            sink.update(t)
             print(f"{date} close   {tid}")
-        live[tid] = (t, path)
+        live[tid] = t
 
-    _write_agent_scratchpads()
-    _summarize()
+    _write_agent_scratchpads(sink)
+    _summarize(sink)
 
 
-def _active_ticket(agent: str) -> str:
+def _active_ticket(agent: str, sink) -> str:
     """Find the agent's current in_progress ticket id, if any."""
-    for _, t in load_all_tickets(TICKETS_ROOT):
-        if t.status == "in_progress" and t.assignee == agent:
-            return t.id
-    return ""
+    rows = sink.query(TicketQuery(status=("in_progress",), assignee=agent))
+    return rows[0].id if rows else ""
 
 
-def _write_agent_scratchpads() -> None:
-    """Update .arbite/agents/ scratchpads to reflect who is working what now."""
+def _write_agent_scratchpads(sink) -> None:
+    """Update .arbite/agents/ scratchpads to reflect who is working what now.
+
+    Scratchpads are harness-facing files rather than tickets, so they stay plain
+    markdown under .arbite/ whatever the sink is."""
     agents = ["claude.haiku.001", "claude.sonnet.002", "claude.opus.001", "gpt.4o.001"]
+    agents_dir = TICKETS_ROOT / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
     for agent in agents:
-        active = _active_ticket(agent)
+        active = _active_ticket(agent, sink)
         body = f"# {agent}\n\n" if active else f"# {agent}\n\nNo ticket claimed yet.\n"
         if active:
-            body += f"Currently working: {active} (verify it is still in .arbite/in_progress/).\n"
-        (TICKETS_ROOT / "agents" / f"{agent}.md").write_text(body, encoding="utf-8")
+            body += (
+                f"Currently working: {active} (verify with 'arbite show {active} --json' "
+                "that it is still in_progress and assigned to you).\n"
+            )
+        (agents_dir / f"{agent}.md").write_text(body, encoding="utf-8")
         print(f"{'=' * 8} scratchpad {agent}: {active or 'idle'}")
 
 
-def _summarize() -> None:
+def _summarize(sink) -> None:
     print("\n" + "=" * 72)
     print("SEED DATA SUMMARY")
     print("=" * 72)
-    by_status: dict[str, list] = {"open": [], "in_progress": [], "blocked": [], "closed": []}
-    problems: list[str] = []
-    for path, t in load_all_tickets(TICKETS_ROOT):
-        by_status.setdefault(t.status, []).append((path, t))
-        expected = status_dir(t.status, TICKETS_ROOT, closed_date=t.closed)
-        if path.parent.resolve() != expected.resolve():
-            problems.append(f"{t.id}: frontmatter says {t.status} but file is under {path.parent}")
+    by_status: dict = {}
+    everything = sink.query(TicketQuery(buckets=("*",)))
+    for t in everything:
+        by_status.setdefault(t.status, []).append(t)
 
-    total = 0
-    for status in ("open", "in_progress", "blocked", "closed"):
-        rows = by_status[status]
-        total += len(rows)
+    for status in ("open", "in_progress", "blocked", "shelved", "closed"):
+        rows = by_status.get(status, [])
         print(f"\n[{status}] ({len(rows)})")
-        for path, t in sorted(rows, key=lambda r: r[0]):
+        for t in sorted(rows, key=lambda x: (x.priority_sort_key(), x.id)):
             who = t.assignee or "-"
             deps = f"  deps={t.depends_on}" if t.depends_on else ""
             blk = f"  blocked_by={t.blocked_by[:48]}" if t.blocked_by else ""
             print(f"  {t.id:<10} {who:<18} {t.title or '(blank template)'}{deps}{blk}")
 
-    print(f"\nTotal tickets: {total}")
+    print(f"\nTotal tickets: {len(everything)}")
+    # The old version compared each file's folder with its frontmatter by hand;
+    # the store now answers that question for whichever sink is in use.
+    problems = sink.check()
     if problems:
-        print("\nFOLDER/STATUS MISMATCHES:")
+        print("\nINTEGRITY PROBLEMS (arbite doctor):")
         for p in problems:
-            print(f"  - {p}")
+            print(f"  - {p.kind}: {p.detail}")
     else:
-        print("Folder/status sync: OK (every file is in the folder its frontmatter claims)")
+        print(f"Integrity: OK (the {sink.kind} sink reports no problems)")
 
 
 if __name__ == "__main__":

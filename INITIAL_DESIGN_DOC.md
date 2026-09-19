@@ -10,23 +10,40 @@ their status changes — no database, no server.
 
 Build this as a Python CLI named `arbite`.
 
+> **Update — the `sinks` branch (v0.2.0).** Storage now sits behind a *sink*
+> interface (`src/arbite/sinks/base.py`): a CRUD-shaped surface (create / read /
+> update / delete / query) plus a compare-and-swap token on update, buckets,
+> canonical rendering and integrity checks. The file-based system described in this
+> document is the default implementation (`file`); a second `sqlite` implementation
+> exists as an independent store, and the shared conformance suite runs against
+> both, which is how the interface is kept honest rather than aspirational.
+>
+> Everything below that talks about folders, file moves and `ls` therefore describes
+> **the file sink**, not arbite as a whole — the folder-is-status mechanic became a
+> feature of one implementation instead of an assumption in every command. The
+> ticket schema, the command surface and the exit codes are unchanged. See
+> README.md's Sinks section for the interface, the selection rules and the
+> tradeoffs between the two stores.
+
 ## Design principles
 
-- Tickets are markdown files with YAML frontmatter: structured metadata up
-  top, freeform human/agent-written notes in the body.
-- **Status is represented by folder location, not just a field** — an agent
-  or human should be able to tell what's actionable via `ls`, without
-  opening files. The frontmatter `status` field mirrors the folder and must
-  never be allowed to drift from it — the CLI enforces this on every move.
-- **The ticket's folder location is the single source of truth for state.**
-  Anything else (an agent's own memory file, assumptions from a previous
-  session) is a hint, not authority, and must be checked against actual
-  ticket location before being trusted.
-- Filenames stay stable across folder moves (a ticket keeps the same
-  filename whether it's in `open/`, `in_progress/`, or `closed/2026-08/`),
-  so `git log --follow` traces a ticket's full lifecycle as folder-move
-  commits — this is intentional, since it's how "dev history" gets
-  generated from the ticket system for free.
+- A ticket is a `Ticket`: structured metadata (frontmatter fields) plus a freeform
+  human/agent-written body. How that is stored is the sink's business.
+- **Status is a field, and one location is its single source of truth.** In the file
+  sink the folder a ticket sits in mirrors `status`, and an agent or human can tell
+  what is actionable via `ls` without opening files; the frontmatter field must never
+  be allowed to drift from the folder, and the CLI enforces that on every move. In a
+  database sink the stored status is the truth and there is no folder to read — but
+  the *behaviour* is the same, which is why the folder rule belongs to the file sink
+  rather than to the commands.
+- **The ticket's own record is the source of truth for its state.** Anything else (an
+  agent's own memory file, assumptions from a previous session) is a hint, not
+  authority, and must be checked against the actual ticket before being trusted.
+- Filenames stay stable across folder moves in the file sink (a ticket keeps the same
+  filename whether it's in `open/`, `in_progress/`, or `closed/2026-08/`), so
+  `git log --follow` traces a ticket's full lifecycle as folder-move commits — this
+  is intentional, since it's how "dev history" gets generated from the ticket system
+  for free.
 
 ## Directory layout
 
@@ -75,7 +92,7 @@ Build this as a Python CLI named `arbite`.
 id: tic-a1b2
 title: Fix off-by-one in vertex normal calc
 status: open              # raw | open | in_progress | blocked | shelved | closed — mirrors folder
-type: bug                  # bug | feature | refactor | chore | memo | wish
+type: bug                  # bug | feature | request | refactor | chore | memo | wish
 tier: medium                # low | medium | high | frontier — agent capability tier required
 domain: mesh                 # what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io
 epic: mesh-pipeline          # larger initiative this ticket belongs to (optional); freeform label for filtering
@@ -172,14 +189,17 @@ Command name: `arbite`. Suggested commands to implement:
 - `arbite create [--priority N] [--epic E]` — create a new ticket in `open/`
   (priority is a numeric urgency index, lower = more urgent, optional; `--epic`
   groups it under a larger initiative)
-- `arbite raw <memo|feature|bug|wish> <message>` — quick-capture an
+- `arbite raw <memo|feature|request|bug|wish> <message>` — quick-capture an
   unclassified ticket with `status: raw` in `raw/` (not `open/`, so it never
   shows up in `arbite list next`); auto-grouped under the `classification`
   epic so triage/classification jobs can find it with `arbite list next
-  --epic classification`. A `wish` raw ticket is a wishlist item: its body
-  notes that wishlist items are to be reclassified as `feature`, classified
-  with the correct tags, description, analysis, and possible epic, then filed
-  in the `wishlist/` folder — not opened as work
+  --epic classification`. A `request` raw ticket is a request for a change
+  that is not necessarily a bug or a new feature, but a tweak or lateral
+  change to something that already exists; its body notes as much, and it is
+  ordinary work once classified (unlike a wish). A `wish` raw ticket is a
+  wishlist item: its body notes that wishlist items are to be reclassified as
+  `feature`, classified with the correct tags, description, analysis, and
+  possible epic, then filed in the `wishlist/` folder — not opened as work
 - `arbite fetch [type]` — pull the oldest raw ticket (`status: raw`,
   optionally filtered by `type`) and print it exactly like `arbite show`
   would (raw markdown, or `--json`), with a `derived_note` injected at the
@@ -248,6 +268,21 @@ Command name: `arbite`. Suggested commands to implement:
   edits.
 - `arbite deps <id>` — walk `depends_on` to show a dependency tree (nice
   to have, not required for first pass)
+- `arbite sink [info|init]` — report the active sink (kind, location, capabilities,
+  per-status counts) or create its store; the sink is chosen by `--sink`, then
+  `ARBITE_SINK`, then a `sink:` key in `arbite.yaml`, then the default (`file`)
+- `arbite delete <id> --force [--agent <id>] [--reason <text>]` — remove a ticket
+  from the store. Refuses without `--force`, and records a `Deleted by <agent>` note
+  first so the last state the ticket ever had is attributable; `close` is the
+  non-destructive alternative
+- `arbite migrate --to <kind> [--from <kind>] [--dry-run] [--overwrite] [--prune]` —
+  copy every ticket (status-managed and bucketed alike) from one sink into another,
+  preserving ids, timestamps, body, tags, dependencies, notes and buckets. The source
+  is never modified unless `--prune` asks for it, and a `file → sqlite → file` round
+  trip reproduces the original files byte for byte, which is the end-to-end test of
+  the interface. `--prune` deletes the source tickets after a successful copy, so a
+  migration can also retire a store; it refuses when any ticket was skipped, because
+  a stale destination copy would then be the only copy left
 - `arbite doctor [--fix]` — check the invariants nothing else enforces.
   Tickets are plain files in a git repo: humans `mv` them, merges and rebases
   mangle them, an interrupted write can strand a temp file. Every arbite
@@ -346,6 +381,55 @@ arbite/
 - Keep runtime dependencies minimal (YAML parsing library is likely the only
   hard requirement) since pipx installs into an isolated venv per tool and
   extra dependencies just add install time for no benefit here.
+
+## The sink interface (added on the `sinks` branch)
+
+A sink is the storage backend, chosen per command (`--sink <kind>`, then
+`ARBITE_SINK`, then `sink:` in `arbite.yaml`, then the default `file`). Both
+implementations satisfy one contract:
+
+| Method | Verb | Notes |
+| --- | --- | --- |
+| `new_id()`, `create(ticket)` | Create | duplicate id is a conflict |
+| `get`, `get_many`, `exists`, `query`, `notes` | Read | `query` takes a `TicketQuery` |
+| `render(ticket)`, `location(id)`, `location_map(tickets)` | Read | the canonical text, and an opaque location |
+| `update(ticket, expect=None)`, `add_note(...)` | Update | `expect` is the compare-and-swap |
+| `delete(id)` | Delete | irreversible; the CLI gates it behind `--force` |
+| `bucket(id)`, `move_to_bucket(id, bucket)` | — | filing, which is not a state change |
+| `init()`, `describe()`, `check(fix=False)` | — | lifecycle, capabilities, integrity |
+
+Design notes that were judgement calls, recorded here because they are the kind of
+thing worth re-litigating deliberately rather than by accident:
+
+- **The choice is written down, not remembered.** `arbite init` and a successful
+  `arbite migrate` write `sink: <kind>` into `arbite.yaml`, so the store a command
+  created or copied into is the one later commands read. A per-command flag stays a
+  legitimate one-off, but a *project* whose tickets live in a store nothing selects
+  is a trap: from the outside an unselected store is indistinguishable from an empty
+  backlog, so commands warn on stderr and the generated guide names the stray store
+  and its ticket count. (An `ARBITE_SINK` selection is reported, never written -- it
+  is one process's decision, not the project's.)
+- **The status→location side effect belongs to the sink.** Commands set `status` and
+  call `update()`; only the file sink knows that means relocating a file.
+- **Compare-and-swap is an argument, not a method.** `Expect(status=..., assignee=...)`
+  is enforced *inside* each sink's write (an exclusive create in the file sink, a
+  conditional `UPDATE` in a transaction for SQLite), so there is one write path and a
+  claim cannot bypass it.
+- **The SQLite sink's schema is normalized** (`tickets`, `ticket_tags`,
+  `ticket_deps`, `ticket_notes`) rather than one table of JSON blobs, because the
+  point of a second implementation is to exercise the interface with genuinely
+  different storage.
+- **Notes are a derived index.** `body` stays authoritative (so a hand-written note
+  still counts and `render` is byte-identical across sinks); `ticket_notes` is
+  parsed out of it on every write, and `doctor` reports — and `--fix` rebuilds — an
+  index that has drifted.
+- **Text search is not pushed into SQL `LIKE`.** SQLite folds case in ASCII only,
+  while the reference matcher uses Python's `str.lower`, so `LIKE` can miss a row the
+  contract says matches. Structured predicates are pushed down; text matching uses
+  the shared matcher.
+- **The integrity checks are shared where they mean the same thing** and per-sink
+  where they don't, so `doctor` cannot quietly mean two different things.
+- **Agent scratchpads stay files on both sinks**: harness-facing state, not tickets.
 
 ## Not yet decided / open for judgment calls
 
