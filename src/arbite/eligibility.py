@@ -4,7 +4,7 @@ Pure policy with no storage access: *what is known about a worker* (a
 `WorkerDeclaration`, built from a registered `WorkerProfile` or from an ad-hoc
 worker id) is evaluated against *what a piece of work requires* (a
 `Requirements`), producing an `Eligibility` with structured, stable reason codes.
-Acquisition (`arbite.lifecycle`), and later offers, packages and the board, call
+Acquisition (`arbite.lifecycle`), offers, packages and the board all call
 the same `evaluate()` so a list filter can never be more permissive than the
 operation that acquires the work.
 
@@ -412,7 +412,8 @@ def requirements_for_ticket(ticket) -> Requirements:
     Today that is only its `tier` classification, evaluated unrestricted: an
     ad-hoc worker with no known tier may still claim it (legacy behaviour, noted
     as unverified), while a registered profile's configured tier must reach it.
-    Offers/reservations add restricted requirements in later slices."""
+    A published offer adds restricted requirements of its own
+    (`offers.requirements_of`)."""
     tier = getattr(ticket, "tier", None)
     return Requirements(min_tier=tier if tier in TIER_RANK else None, restricted=False)
 

@@ -105,11 +105,10 @@ Claim and mutate source files through arbite -- not a shell or editor -- so a co
 arbite claim T --agent ME                                           # prints your attempt id A
 arbite file claim PATH [PATH ...] --ticket T --attempt A            # own every file of the task at once
 arbite file read PATH --ticket T --attempt A --version-only --json  # read token R, no content served
-arbite file read PATH --ticket T --attempt A --lines 40:90           # look at only what you need
 arbite file edit PATH --ticket T --attempt A --read-token R --edits -    # stdin: [{"old": "...", "new": "..."}]
 arbite file write PATH --ticket T --attempt A [--read-token R] --input - # new (claimed-absent) file: no token
 ```
-A read token proves the file is unchanged since you took it, not that you read it. Take a fresh one after every claim and before each mutation: tokens are single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. Lost the attempt id? `arbite show T --json` reports `active_attempt.id`.
+Read files with your own tools -- reading changes nothing; only mutations must go through arbite. A read token proves the file is unchanged since you took it, not that you read it. Take a fresh one after every claim and before each mutation: tokens are single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. Lost the attempt id? `arbite show T --json` reports `active_attempt.id`.
 There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: a generated file written into the source tree is unattributed drift. Mutation evidence is never garbage-collected. Arbite cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
 
 ## Sole command: "Work Next|All <epic>"
@@ -136,6 +135,9 @@ Use your session to classify all tickets, looking deeper into the requirements, 
 
 In addition to etiquette specified in .arbite/AGENTS.md, please add to notes of ticket when closing a paragraph explaining what the user, QA, or other
 agents will be able to observe via integration testing, if any new effects will be observable.
+
+## Arbite feedback
+Before closing a ticket, add one note that starts with `arbite feedback:` saying what helped and what got in the way when using arbite for that work (commands, refusals, extra calls, missing features, confusing docs). Keep it to a few lines, and say "nothing notable" for a side with nothing to report. The owner compiles these with `arbite search "arbite feedback:"`.
 
 ## Git
 By default and unless otherwise specified, check into main/master after closing a ticket.
@@ -1181,15 +1183,15 @@ def render_quickstart(active_info=None, stale_info=None) -> str:
     add(
         "In a shared checkout, change source files through the proxy, not a shell or editor, so "
         "no agent silently overwrites another's work. A **read token** is a freshness receipt "
-        "(\"the file was at version X\"), not proof you read it: get one cheaply with "
-        "`--version-only`, and look at code with `--lines START:END` rather than whole-file reads."
+        "(\"the file was at version X\"), not proof you read it. Read code with your own tools "
+        "(reading changes nothing), and take the token with `--version-only` just before you "
+        "change the file."
     )
     add("")
     add("```bash")
     add("T=tic-a1b2 A=att-...   # A: the attempt id your claim printed")
     add("arbite file claim src/a.py src/b.py --ticket $T --attempt $A   # every file of the task, once")
     add("arbite file read src/a.py --ticket $T --attempt $A --version-only --json   # -> data.read_token")
-    add("arbite file read src/a.py --ticket $T --attempt $A --lines 120:180        # see only what you need")
     add("arbite file edit src/a.py --ticket $T --attempt $A --read-token R --edits - <<'EOF'")
     add('[{"old": "exact text, unique in the file", "new": "replacement"},')
     add(' {"old": "a second unique anchor", "new": "its replacement"}]')

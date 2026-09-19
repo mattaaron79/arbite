@@ -22,13 +22,12 @@ Every acquisition prints your **attempt id** (`attempt att-...`, or `attempt_id`
 
 ## Edit files through arbite
 
-In a shared checkout, change source files through the proxy, not a shell or editor, so no agent silently overwrites another's work. A **read token** is a freshness receipt ("the file was at version X"), not proof you read it: get one cheaply with `--version-only`, and look at code with `--lines START:END` rather than whole-file reads.
+In a shared checkout, change source files through the proxy, not a shell or editor, so no agent silently overwrites another's work. A **read token** is a freshness receipt ("the file was at version X"), not proof you read it. Read code with your own tools (reading changes nothing), and take the token with `--version-only` just before you change the file.
 
 ```bash
 T=tic-a1b2 A=att-...   # A: the attempt id your claim printed
 arbite file claim src/a.py src/b.py --ticket $T --attempt $A   # every file of the task, once
 arbite file read src/a.py --ticket $T --attempt $A --version-only --json   # -> data.read_token
-arbite file read src/a.py --ticket $T --attempt $A --lines 120:180        # see only what you need
 arbite file edit src/a.py --ticket $T --attempt $A --read-token R --edits - <<'EOF'
 [{"old": "exact text, unique in the file", "new": "replacement"},
  {"old": "a second unique anchor", "new": "its replacement"}]
