@@ -554,3 +554,28 @@ def test_profile_change_affects_future_work_without_revoking_a_running_attempt(c
     assert full["capacity"]["exhausted"] is True
     assert ready_ids(full) == []
     cli("claim", waiting, "--agent", "w.up", expect=1)
+
+
+def test_acquisition_reports_the_attempt_id_that_show_json_exposes(cli):
+    first = make(cli, "claimed directly", priority=1)
+    second = make(cli, "claimed by list next", priority=2)
+    third = make(cli, "claimed by list next as text", priority=3)
+    assert json.loads(cli("show", first, "--json").stdout)["active_attempt"] is None
+
+    printed = re.search(r"attempt (att-[0-9a-f]+)", cli("claim", first, "--agent", "w.a").stdout)
+    shown = json.loads(cli("show", first, "--json").stdout)["active_attempt"]
+    assert printed and shown["id"] == printed.group(1)
+    assert shown["worker_id"] == "w.a" and shown["generation"] == 1
+
+    batch = json.loads(cli("list", "next", "--claim", "w.a", "--count", "1", "--json").stdout)
+    assert [ticket["id"] for ticket in batch] == [second]
+    assert batch[0]["attempt_id"] == json.loads(
+        cli("show", second, "--json").stdout)["active_attempt"]["id"]
+
+    text = cli("list", "next", "--claim", "w.a")
+    listed = re.search(rf"claimed {third} for w.a \(attempt (att-[0-9a-f]+)\)", text.stderr)
+    assert listed and listed.group(1) == json.loads(
+        cli("show", third, "--json").stdout)["active_attempt"]["id"]
+
+    cli("close", first, "--agent", "w.a")
+    assert json.loads(cli("show", first, "--json").stdout)["active_attempt"] is None

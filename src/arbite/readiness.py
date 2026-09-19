@@ -309,6 +309,15 @@ def active_attempt_count(store, worker_id: str) -> int:
         ])
 
 
+def active_attempt_for(store, ticket_id: str):
+    """The ticket's active attempt, or None (short read transaction)."""
+    if store is None or _store_is_empty(store):
+        return None
+    with store.transaction(write=False) as tx:
+        found = list(tx.find("work_attempt", ticket_id=ticket_id, state="active"))
+    return max(found, key=lambda attempt: attempt.generation) if found else None
+
+
 def capacity_for(state: BoardState, worker_id: Optional[str], declaration) -> Capacity:
     """Capacity as seen by a query: declared limit vs. the snapshot's active count."""
     return Capacity(declared=declaration.capacity, active=state.active_for(worker_id))
@@ -574,6 +583,7 @@ __all__ = [
     "Readiness",
     "ReadinessReason",
     "active_attempt_count",
+    "active_attempt_for",
     "capacity_for",
     "capacity_reason",
     "evaluate",

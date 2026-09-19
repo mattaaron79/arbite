@@ -856,6 +856,7 @@ def _cmd_list_next(args, sink, every):
         _emit_tickets([], args.json, sink)
         return
     claimed = []
+    attempt_ids = {}
     errors = []
     capacity_blocked = None
     capacity_stop = False
@@ -884,6 +885,7 @@ def _cmd_list_next(args, sink, every):
             errors.append(str(e))
             continue
         claimed.append(result.ticket)
+        attempt_ids[result.ticket.id] = result.attempt.id
 
     if not claimed:
         if capacity_blocked is not None:
@@ -894,14 +896,16 @@ def _cmd_list_next(args, sink, every):
 
     if args.json:
         locations = sink.location_map(claimed)
-        _print_json([t.to_dict(locations.get(t.id)) for t in claimed])
+        _print_json([dict(t.to_dict(locations.get(t.id)), attempt_id=attempt_ids[t.id])
+                     for t in claimed])
     else:
         _print_flat(claimed)
         # The table is the result; the claim receipts are commentary on stderr.
         # Flush first so the two streams stay in order when stdout is a pipe.
         sys.stdout.flush()
         for t in claimed:
-            print(f"claimed {t.id} for {args.claim} -> {sink.location(t.id)}", file=sys.stderr)
+            print(f"claimed {t.id} for {args.claim} (attempt {attempt_ids[t.id]}) -> "
+                  f"{sink.location(t.id)}", file=sys.stderr)
     if len(claimed) < wanted:
         # Say so explicitly, and say why: a dispatcher that asked for 3 and got
         # 2 needs to know whether the queue ran dry, it lost races, or the worker
@@ -1067,8 +1071,9 @@ def cmd_claim(args):
             sink.update(taken, expect=expect)
             result = lifecycle.AcquisitionResult(taken, result.attempt, True, True,
                                                  offer_id=result.offer_id)
-    via = f" (accepted offer {result.offer_id})" if result.offer_id else ""
-    print(f"claimed {result.ticket.id} for {args.agent}{via} -> {sink.location(result.ticket.id)}")
+    via = f"accepted offer {result.offer_id}, " if result.offer_id else ""
+    print(f"claimed {result.ticket.id} for {args.agent} ({via}attempt {result.attempt.id}) -> "
+          f"{sink.location(result.ticket.id)}")
 
 
 def cmd_release(args):
@@ -1446,7 +1451,15 @@ def cmd_show(args):
     sink = _require_sink(args)
     t = sink.get(args.id)
     if args.json:
-        _print_json(t.to_dict(sink.location(t.id)))
+        data = t.to_dict(sink.location(t.id))
+        active = readiness.active_attempt_for(sink.coordination(), t.id)
+        data["active_attempt"] = None if active is None else {
+            "id": active.id,
+            "worker_id": active.worker_id,
+            "generation": active.generation,
+            "started": active.started,
+        }
+        _print_json(data)
         return
     print(sink.render(t), end="")
 
