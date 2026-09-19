@@ -9,6 +9,19 @@ Use arbite ticketing system for all tasks. See /.arbite/AGENTS.md. Create a tick
 When claiming a ticket, please use an identity format like: "claude.opus-5.001" where the company.model.instance is your best educated guess unless otherwise specified.
 If orchestrating, let subagents know their identity and instance number.
 
+## Shared directory: use arbite for file work
+Read, claim and mutate source files through arbite -- not a shell or editor -- so a competing agent cannot silently overwrite your work:
+```bash
+arbite file list [PATH] --json                        # discover
+arbite file search PATTERN [PATH] --json             # discover
+arbite file claim PATH --ticket T --attempt A        # own the whole file
+arbite file read  PATH --ticket T --attempt A --json # RE-READ; a pre-claim read does not authorize a write
+arbite file write|edit|remove|rename ... --read-token R
+```
+Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a stale or consumed token is refused with `stale_read` and no bytes change.
+Every `arbite file` command needs your active `--attempt` id; get it from `arbite export --scope coordination --no-artifacts` (the `work_attempts` entry with your ticket_id and `state: active`).
+There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: arbite records proxy mutations only, so a generated file written into the source tree is unattributed drift. Mutation evidence and artifacts accumulate and are never garbage-collected. Arbite enforces its own operations and reports observed drift, but it cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
+
 ## Sole command: "Work Next|All <epic>"
 
 If your sole command is "Work Next" or "Work All", you can use the following commands to find the next arbite ticket(s):

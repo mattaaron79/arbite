@@ -25,8 +25,34 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, config, docs, graph, schema
-from .errors import ArbiteError, Conflict, TicketError
+from . import (
+    __version__,
+    application,
+    changes,
+    config,
+    coordination,
+    coordination_doctor,
+    coordination_export,
+    docs,
+    fileclaims,
+    filemutations,
+    filereads,
+    graph,
+    lifecycle,
+    schema,
+    workspace,
+)
+from .application import Actor
+from .errors import (
+    ArbiteError,
+    ClaimConflict,
+    Conflict,
+    CoordinationConflict,
+    CoordinationError,
+    CoordinationNotFound,
+    TicketError,
+    UnsupportedCoordination,
+)
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
 from .sinks import SINK_KINDS, Expect, SinkInfo, build_sink
@@ -221,6 +247,33 @@ def _expect_from(ticket: Ticket) -> Expect:
     (`note`, `set` of a non-status field) still use it; only `move_to_bucket`
     does not, because filing is not a state change."""
     return Expect(status=ticket.status, assignee=ticket.assignee)
+
+
+def _lifecycle(args, sink, agent=None) -> "lifecycle.TicketLifecycle":
+    """The ticket lifecycle for this command, built lazily.
+
+    Ticket acquisition and every transition now run through `arbite.lifecycle`,
+    which needs the workspace's coordination service. That service is constructed
+    with `application.coordination_service_for` -- the documented C03 stopgap that
+    derives a stable workspace id from the canonical project root, because the CLI
+    has no workspace registry yet (C04's job). Constructing it is cheap and
+    idempotent; nothing here is policy, only plumbing."""
+    acting = agent or getattr(args, "agent", None) or getattr(args, "claim", None) or "system"
+    service = application.coordination_service_for(
+        sink, root=str(config.find_project_root()), actor=Actor(str(acting))
+    )
+    return lifecycle.TicketLifecycle(service, sink)
+
+
+def _revocation_requested(args, attempt, agent: str) -> bool:
+    """True when this call is an explicit administrative revocation of `attempt`.
+
+    `--force` by someone other than the attempt's worker is a revocation: the old
+    attempt is interrupted (not merely released) and the non-empty `--reason` is
+    recorded. A `--force` by the worker's own agent is not a revocation -- there is
+    nothing to revoke -- and `require_ownership` has already allowed it.
+    """
+    return bool(getattr(args, "force", False)) and attempt is not None and attempt.worker_id != agent
 
 
 def cmd_init(args):
@@ -682,30 +735,27 @@ def _cmd_list_next(args, sink, every):
         _emit_tickets([], args.json, sink)
         return
 
-    # Walk candidates in order, claiming until we have `wanted` of them: if
-    # another agent wins the race for one, move on to the next rather than
-    # failing the whole dispatch. Each claim is individually atomic, so a
-    # partial batch is a correct result, not a broken one.
+    # Walk candidates in order, claiming until we have `wanted` of them. Each
+    # acquisition goes through the lifecycle layer, so readiness and the "one
+    # active attempt per ticket" rule are enforced on the operation -- the
+    # `graph.is_workable` filter above only *selects* candidates and cannot be
+    # the authority. If another agent wins the race for one, move on to the next
+    # rather than failing the whole dispatch: each claim is individually atomic,
+    # so a partial batch is a correct result, not a broken one.
+    ctl = _lifecycle(args, sink, agent=args.claim)
     claimed = []
     errors = []
     for candidate in candidates:
         if len(claimed) == wanted:
             break
-        # The expectation is taken from the ticket as read, *before* the mutation
-        # below: taken afterwards it would describe the new state rather than the
-        # state the write has to replace.
-        expect = _expect_from(candidate)
-        candidate.status = "in_progress"
-        candidate.assignee = args.claim
-        candidate.updated = schema.now()
         try:
-            sink.update(candidate, expect=expect)
-        except Conflict as e:
-            # Lost the race for this one. The next candidate is untouched, so the
-            # loop simply moves on to it.
+            result = ctl.acquire(candidate, worker_id=args.claim)
+        except ArbiteError as e:
+            # Lost the race for this one (or it stopped being ready). The next
+            # candidate is untouched, so the loop simply moves on to it.
             errors.append(str(e))
             continue
-        claimed.append(candidate)
+        claimed.append(result.ticket)
 
     if not claimed:
         raise TicketError(
@@ -841,27 +891,39 @@ def _print_tree(scope, roots):
 
 
 def cmd_claim(args):
-    """Claim a ticket for an agent. Claiming is a compare-and-swap, not a
-    blind write: a ticket already assigned to somebody else is refused unless
-    --force, and the write carries the expectation that the ticket is still in
-    the state it was read in, so two agents racing for the same ticket can't
-    both come away believing they own it."""
+    """Claim a ticket for an agent, recording a work attempt.
+
+    Acquisition runs entirely through `arbite.lifecycle.TicketLifecycle.acquire`,
+    so readiness (open status, real classification, closed dependencies) and the
+    "one active attempt per ticket" rule are enforced on the operation, not just
+    in `list next`. Three explicit forms:
+
+    - a normal claim of an open, ready ticket (`--agent`);
+    - `--adopt`: take over a legacy `in_progress` ticket that has no attempt
+      record, starting its attempt now (no history is invented);
+    - `--force --reason <why>`: an administrative takeover that interrupts the
+      live attempt and starts a new one at a higher generation.
+
+    The ticket compare-and-swap is what makes two racing claims produce exactly
+    one winner; a losing claim raises before any attempt is recorded."""
     sink = _require_sink(args)
+    ctl = _lifecycle(args, sink, agent=args.agent)
     t = sink.get(args.id, unique=True)
     previous = t.assignee
-    if previous and previous != args.agent and not args.force:
-        raise TicketError(
-            f"ticket {t.id} is already assigned to {previous} (status: {t.status}); "
-            "pass --force to take it over"
-        )
-    if previous and previous != args.agent:
-        schema.append_note(t, args.agent, f"Claim taken over from {previous} (--force).")
-    expect = _expect_from(t)
-    t.status = "in_progress"
-    t.assignee = args.agent
-    t.updated = schema.now()
-    sink.update(t, expect=expect)
-    print(f"claimed {t.id} for {args.agent} -> {sink.location(t.id)}")
+    result = ctl.acquire(
+        t,
+        worker_id=args.agent,
+        adopt=bool(getattr(args, "adopt", False)),
+        takeover=bool(getattr(args, "force", False)),
+        reason=getattr(args, "reason", None),
+    )
+    if result.took_over and previous and previous != args.agent:
+        taken = sink.get(result.ticket.id, unique=True)
+        schema.append_note(taken, args.agent, f"Claim taken over from {previous} (--force).")
+        taken.updated = schema.now()
+        sink.update(taken, expect=_expect_from(taken))
+        result = lifecycle.AcquisitionResult(taken, result.attempt, True, True)
+    print(f"claimed {result.ticket.id} for {args.agent} -> {sink.location(result.ticket.id)}")
 
 
 def cmd_release(args):
@@ -870,9 +932,25 @@ def cmd_release(args):
     The counterpart to claim: an agent that stops work part-way (out of scope, out of
     context, wrong capability tier) needs one command that unassigns and
     reopens together, so the ticket becomes visible to `list next` again rather
-    than sitting in_progress owned by nobody who is still working it."""
+    than sitting in_progress owned by nobody who is still working it.
+
+    If the ticket has an active attempt, only its worker -- or an explicit
+    `--force --reason` administrative revocation -- may release it, and the
+    attempt is ended (with an `attempt_released` event) *before* the ticket moves.
+    A ticket with no attempt (a pre-C03 legacy ticket) keeps the old behaviour:
+    there is no attempt to bypass."""
     sink = _require_sink(args)
+    ctl = _lifecycle(args, sink, agent=args.agent)
     t = sink.get(args.id, unique=True)
+    attempt = ctl.active_attempt(t.id)
+    if attempt is not None:
+        ctl.require_ownership(
+            attempt,
+            args.agent,
+            force=getattr(args, "force", False),
+            reason=args.reason,
+            action="release",
+        )
     if t.status == "open" and t.assignee is None:
         raise TicketError(f"ticket {t.id} is already open and unassigned")
     previous = t.assignee
@@ -883,19 +961,50 @@ def cmd_release(args):
     t.blocked_by = None
     t.status = "open"
     t.updated = schema.now()
+    if attempt is not None:
+        state = "interrupted" if _revocation_requested(args, attempt, args.agent) else "released"
+        ctl.end_attempt(attempt, state=state, reason=args.reason or None)
     sink.update(t, expect=expect)
+    if attempt is None:
+        ctl.record_transition("released", t.id)
     owner = f" (was {previous})" if previous else ""
     print(f"released {t.id}{owner} -> {sink.location(t.id)}")
 
 
 def cmd_block(args):
+    """Mark a ticket blocked, ending any active attempt.
+
+    A blocked ticket is not being worked, so the worker's attempt is interrupted
+    (recorded with `attempt_interrupted`) rather than left live: leaving it active
+    would make the ticket unclaimable while it claims to be stalled. Only the
+    attempt's worker may block it, unless an explicit `--force --reason` revokes
+    the attempt."""
     sink = _require_sink(args)
+    agent = getattr(args, "agent", "system")
+    ctl = _lifecycle(args, sink, agent=agent)
     t = sink.get(args.id, unique=True)
+    attempt = ctl.active_attempt(t.id)
+    if attempt is not None:
+        ctl.require_ownership(
+            attempt,
+            agent,
+            force=getattr(args, "force", False),
+            reason=args.reason,
+            action="block",
+        )
     expect = _expect_from(t)
     t.blocked_by = args.reason
     t.status = "blocked"
     t.updated = schema.now()
+    if attempt is not None:
+        ctl.end_attempt(attempt, state="interrupted", reason=args.reason)
     sink.update(t, expect=expect)
+    ctl.record_ticket_event(
+        "ticket_blocked",
+        t.id,
+        attempt_id=attempt.id if attempt is not None else None,
+        payload={"ticket_id": t.id, "blocked_by": args.reason, "agent": agent},
+    )
     print(f"blocked {t.id} ({args.reason}) -> {sink.location(t.id)}")
 
 
@@ -905,18 +1014,33 @@ def cmd_unblock(args):
     The symmetric counterpart to `block`. Doing this with `set status` leaves
     blocked_by populated, so the ticket claims to be stalled by something in
     every listing while sitting in open -- exactly the frontmatter drift the
-    folder-is-truth rule exists to prevent."""
+    folder-is-truth rule exists to prevent.
+
+    When the ticket still has an active attempt, returning it to `in_progress`
+    simply records activity on that attempt (`touch`); sending it to `open` ends
+    the attempt, because nobody then owns the work."""
     sink = _require_sink(args)
+    agent = getattr(args, "agent", "system")
+    ctl = _lifecycle(args, sink, agent=agent)
     t = sink.get(args.id, unique=True)
     if t.status != "blocked":
         raise TicketError(f"ticket {t.id} is not blocked (status: {t.status})")
+    attempt = ctl.active_attempt(t.id)
+    if attempt is not None:
+        ctl.require_ownership(
+            attempt,
+            agent,
+            force=getattr(args, "force", False),
+            reason=args.reason,
+            action="unblock",
+        )
     reason = t.blocked_by
     was = f" (was blocked by: {reason})" if reason else ""
     message = f"Unblocked: {args.reason}" if args.reason else "Unblocked."
     if reason:
         message = f"{message.rstrip('.')} (was blocked by: {reason})."
     expect = _expect_from(t)
-    schema.append_note(t, args.agent, message)
+    schema.append_note(t, agent, message)
     t.blocked_by = None
     t.updated = schema.now()
     # Back to whoever was working it if it is still assigned, otherwise open.
@@ -924,45 +1048,162 @@ def cmd_unblock(args):
     t.status = dest
     if dest == "open":
         t.assignee = None
+    if attempt is not None:
+        revoked = _revocation_requested(args, attempt, agent)
+        if dest == "in_progress" and not revoked:
+            ctl.touch(attempt)
+        else:
+            ctl.end_attempt(
+                attempt,
+                state="interrupted" if revoked else "released",
+                reason=args.reason or None,
+            )
     sink.update(t, expect=expect)
+    if dest == "in_progress" and attempt is None:
+        # `block` ended the previous attempt, so resuming mints a *fresh*
+        # generation: the old attempt and its file tokens stay dead, and a new
+        # read must be taken under the new attempt before any write.
+        ctl.start_resumed_attempt(t, worker_id=t.assignee, reason=args.reason)
+    ctl.record_ticket_event(
+        "ticket_unblocked", t.id, payload={"ticket_id": t.id, "status": dest, "agent": agent}
+    )
     print(f"unblocked {t.id}{was} -> {sink.location(t.id)}")
 
 
 def cmd_close(args):
+    """Close a ticket, finishing (or revoking) any active attempt.
+
+    Closing is a terminal transition, so an active attempt is *finished*
+    (`attempt_finished`) before the ticket becomes `closed` -- unless the caller
+    is another agent using `--force --reason`, which interrupts it instead. The
+    old attempt is never reactivated: resuming the ticket mints a new one."""
     sink = _require_sink(args)
+    agent = getattr(args, "agent", "system")
+    ctl = _lifecycle(args, sink, agent=agent)
     t = sink.get(args.id, unique=True)
+    attempt = ctl.active_attempt(t.id)
+    if attempt is not None:
+        ctl.require_ownership(
+            attempt,
+            agent,
+            force=getattr(args, "force", False),
+            reason=getattr(args, "reason", ""),
+            action="close",
+        )
     expect = _expect_from(t)
     t.closed = schema.now()
     t.updated = t.closed
     t.status = "closed"
+    if attempt is not None:
+        revoked = _revocation_requested(args, attempt, agent)
+        # end_attempt reconciles incomplete operations (an ambiguous one refuses
+        # the close) and releases the attempt's file claims in the same
+        # transaction that finishes/interrupts it.
+        ctl.end_attempt(
+            attempt,
+            state="interrupted" if revoked else "finished",
+            reason=(getattr(args, "reason", "") or "closed"),
+        )
+    else:
+        # No attempt to end, but a prior interrupted operation must still be
+        # reconciled so close cannot report itself clean over ambiguous bytes.
+        ctl.reconcile_operations()
+    # Defensive sweep: end_attempt already released the attempt's claims; this
+    # also releases any orphan claim a pre-C09 store may hold for the ticket.
+    ctl.release_ticket_claims(t.id, reason=getattr(args, "reason", "") or "closed")
     sink.update(t, expect=expect)
+    ctl.record_ticket_event(
+        "ticket_closed", t.id, payload={"ticket_id": t.id, "closed": t.closed, "agent": agent}
+    )
     print(f"closed {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_reopen(args):
+    """Reopen a ticket and record what its dependents lose.
+
+    Reopening must not silently undo running or finished work: the reopened
+    ticket is moved back to `open`, but tickets that depend on it are left with
+    their status and assignee untouched -- they get `dependency_invalidated`
+    events naming them instead. A claim that already committed keeps its attempt;
+    a claim that starts afterwards sees the reopened dependency and is refused by
+    readiness."""
     sink = _require_sink(args)
+    agent = getattr(args, "agent", "system")
+    ctl = _lifecycle(args, sink, agent=agent)
     t = sink.get(args.id, unique=True)
     if t.status == "open":
         raise TicketError(f"ticket {t.id} is already open")
+    attempt = ctl.active_attempt(t.id)
+    if attempt is not None:
+        ctl.require_ownership(
+            attempt,
+            agent,
+            force=getattr(args, "force", False),
+            reason=getattr(args, "reason", ""),
+            action="reopen",
+        )
     expect = _expect_from(t)
     t.closed = None
     t.blocked_by = None
     t.status = "open"
     t.updated = schema.now()
-    schema.append_note(t, args.agent, "Reopened.")
+    schema.append_note(t, agent, "Reopened.")
+    if attempt is not None:
+        revoked = _revocation_requested(args, attempt, agent)
+        ctl.end_attempt(
+            attempt,
+            state="interrupted" if revoked else "released",
+            reason=(getattr(args, "reason", "") or "reopened"),
+        )
     sink.update(t, expect=expect)
+    ctl.record_ticket_event(
+        "ticket_reopened", t.id, payload={"ticket_id": t.id, "agent": agent}
+    )
+    affected = ctl.invalidate_dependents(t, sink.query(TicketQuery(buckets=("*",))))
+    if affected:
+        print(
+            f"note: {len(affected)} live ticket(s) depend on {t.id} and are no longer "
+            f"workable: {', '.join(affected)}",
+            file=sys.stderr,
+        )
     print(f"reopened {t.id} -> {sink.location(t.id)}")
 
 
 def cmd_shelve(args):
+    """Shelve a ticket, releasing any active attempt.
+
+    A shelved ticket is parked, so its attempt is released (nobody is working it)
+    unless another agent is revoking with `--force --reason`, in which case it is
+    interrupted."""
     sink = _require_sink(args)
+    agent = getattr(args, "agent", "system")
+    ctl = _lifecycle(args, sink, agent=agent)
     t = sink.get(args.id, unique=True)
+    attempt = ctl.active_attempt(t.id)
+    if attempt is not None:
+        ctl.require_ownership(
+            attempt,
+            agent,
+            force=getattr(args, "force", False),
+            reason=args.reason,
+            action="shelve",
+        )
     expect = _expect_from(t)
     t.status = "shelved"
     t.updated = schema.now()
     message = "Shelved." if not args.reason else f"Shelved: {args.reason}"
     schema.append_note(t, "system", message)
+    if attempt is not None:
+        revoked = _revocation_requested(args, attempt, agent)
+        ctl.end_attempt(
+            attempt,
+            state="interrupted" if revoked else "released",
+            reason=args.reason or None,
+        )
     sink.update(t, expect=expect)
+    ctl.record_ticket_event(
+        "ticket_shelved", t.id, payload={"ticket_id": t.id, "agent": agent}
+    )
     print(f"shelved {t.id} -> {sink.location(t.id)}")
 
 
@@ -973,11 +1214,23 @@ def cmd_unshelve(args):
     paused) is moved back into the open status so it shows up in
     `arbite list next` again. The assignee and any stale block reason are
     cleared -- an unshelved ticket is back in the unclaimed pool, not reserved
-    for whoever parked it."""
+    for whoever parked it. Any active attempt is released, since the ticket is
+    returning to the unclaimed pool."""
     sink = _require_sink(args)
+    agent = getattr(args, "agent", "system")
+    ctl = _lifecycle(args, sink, agent=agent)
     t = sink.get(args.id, unique=True)
     if t.status != "shelved":
         raise TicketError(f"ticket {t.id} is not shelved (status: {t.status})")
+    attempt = ctl.active_attempt(t.id)
+    if attempt is not None:
+        ctl.require_ownership(
+            attempt,
+            agent,
+            force=getattr(args, "force", False),
+            reason=args.reason,
+            action="unshelve",
+        )
     expect = _expect_from(t)
     t.updated = schema.now()
     message = "Unshelved." if not args.reason else f"Unshelved: {args.reason}"
@@ -985,7 +1238,17 @@ def cmd_unshelve(args):
     t.assignee = None
     t.blocked_by = None
     t.status = "open"
+    if attempt is not None:
+        revoked = _revocation_requested(args, attempt, agent)
+        ctl.end_attempt(
+            attempt,
+            state="interrupted" if revoked else "released",
+            reason=args.reason or None,
+        )
     sink.update(t, expect=expect)
+    ctl.record_ticket_event(
+        "ticket_unshelved", t.id, payload={"ticket_id": t.id, "agent": agent}
+    )
     print(f"unshelved {t.id} -> {sink.location(t.id)}")
 
 
@@ -1119,6 +1382,7 @@ def cmd_set(args):
     and location stay in sync, and auto-dates 'closed' when a ticket is set to
     closed."""
     sink = _require_sink(args)
+    ctl = _lifecycle(args, sink)
     t = sink.get(args.id, unique=True)
     assignments = args.assignments
     if len(assignments) % 2 != 0:
@@ -1137,6 +1401,26 @@ def cmd_set(args):
                 f"(valid: {', '.join(sorted(schema.SETTABLE_PROPERTIES))})"
             )
         schema.validate_field(prop, value)
+
+    # `status`/`assignee` are ownership-bearing fields: while an attempt is live
+    # they must go through the lifecycle commands, which end/touch the attempt and
+    # record the change. Other field edits stay allowed and merely touch the
+    # attempt. With no attempt, the legacy field-edit behaviour is unchanged.
+    attempt = ctl.active_attempt(t.id)
+    requested_status = None
+    requested_assignee = None
+    for prop, value in pairs:
+        if prop == "status":
+            requested_status = value
+        if prop == "assignee":
+            requested_assignee = schema.coerce_field_value("assignee", value)
+    if attempt is not None:
+        ctl.refuse_status_edit(
+            t,
+            new_status=requested_status,
+            new_assignee=requested_assignee,
+            attempt=attempt,
+        )
 
     expect = _expect_from(t)
     original_status = t.status
@@ -1162,6 +1446,8 @@ def cmd_set(args):
         t.status = new_status
 
     sink.update(t, expect=expect)
+    if attempt is not None:
+        ctl.touch(attempt)
     what = ", ".join(prop for prop, _ in pairs)
     print(f"set {what} on {t.id} at {sink.location(t.id)}")
 
@@ -1246,6 +1532,11 @@ def cmd_delete(args):
             f"refusing to delete {t.id} without --force (deletion is irreversible; "
             f"'arbite close {t.id}' archives it instead)"
         )
+    # `--force` overrides the confirmation, never the lifecycle rules: a ticket
+    # with an active attempt/claim is refused so cleanup is not bypassed, and one
+    # with retained change history is refused rather than silently cascaded away.
+    ctl = _lifecycle(args, sink, agent=getattr(args, "agent", None))
+    ctl.require_deletable(t)
     note = f"Deleted by {args.agent}" + (f": {args.reason}" if args.reason else ".")
     location = sink.location(t.id)
     if not args.dry_run:
@@ -1274,7 +1565,32 @@ def cmd_migrate(args):
 
     A successful migration also makes the destination the project default: the
     tickets live there now, and leaving `sink:` pointing at the store you migrated
-    away from is the same silent-wrong-store trap `init` closes."""
+    away from is the same silent-wrong-store trap `init` closes.
+
+    Shared-directory coordination history (attempts, claims, receipts, intents,
+    events, artifacts) is moved too when *both* sinks expose a coordination store
+    and the source actually has coordination state. `--coordination` forces the
+    transfer on and `--no-coordination` forces it off. The transfer refuses a
+    non-quiescent source (naming what is active), verifies the destination, then
+    rebinds the marker, the stored `StoreBinding` and `sink:` so all three agree.
+    It never prunes source coordination state: artifacts and evidence are
+    retained, so disk growth is expected. `--prune` still prunes tickets only.
+
+    The order is deliberate and is the guarantee the command offers:
+
+    1. resolve the workspace and refuse a non-quiescent source -- this happens
+       *before* the destination is initialised or written, so a refused migration
+       leaves the destination exactly as it was (no tickets copied, marker and
+       `sink:` still naming the source);
+    2. copy the tickets;
+    3. transfer the coordination history and verify the destination;
+    4. rebind the marker and the stored `StoreBinding`;
+    5. switch `sink:` in the config.
+
+    `--dry-run` performs step 1 too -- so a non-quiescent source is reported as a
+    refusal rather than hidden behind a "would migrate" line -- and writes
+    nothing.
+    """
     project_root = config.find_project_root()
     source = config.open_sink(args.from_sink, project_root)
     target = config.open_sink_kind(args.to_sink, project_root)
@@ -1293,10 +1609,40 @@ def cmd_migrate(args):
             f"-- {hint}"
         )
 
+    source_store = source.coordination()
+    target_store = target.coordination()
+    coordination_available = source_store is not None and target_store is not None
+    coordination_state = coordination_available and _coordination_state_present(source_store)
+    if args.coordination is None:
+        coordination_active = coordination_state
+    elif args.coordination:
+        if not coordination_available:
+            raise UnsupportedCoordination(
+                "coordination transfer was requested, but the "
+                f"{source.kind if source_store is None else target.kind} sink does not "
+                "implement the shared-directory coordination contract"
+            )
+        coordination_active = True
+    else:
+        coordination_active = False
+
     tickets = source.query(TicketQuery(buckets=("*",)))
     if not tickets:
+        # The message is never lost, but when coordination state is being moved
+        # there is work to do even with no tickets -- so the early exit is skipped.
         print(f"no tickets found in the {source.kind} sink at {source.root}")
-        sys.exit(EXIT_EMPTY)
+        if not (coordination_active and coordination_state):
+            sys.exit(EXIT_EMPTY)
+
+    # Refuse a non-quiescent source BEFORE anything touches the destination. The
+    # ticket copy below writes into the destination, so the transfer's refusal has
+    # to happen here -- for a real run and for --dry-run alike (both write
+    # nothing). The same CoordinationConflict names the blocking
+    # attempts/claims/intents/journals.
+    workspace_id = None
+    if coordination_active:
+        workspace_id = _migration_workspace_id(source_store, project_root)
+        coordination_export.require_quiescent_store(source_store, workspace_id)
 
     if args.dry_run:
         present = (
@@ -1316,6 +1662,18 @@ def cmd_migrate(args):
                 )
             else:
                 print(f"would prune {len(tickets)} ticket(s) from the {source.kind} sink")
+        if coordination_active:
+            bundle = coordination_export.export_coordination(source_store)
+            counts = coordination_export.bundle_counts(bundle)
+            print(
+                "would transfer coordination history "
+                f"(namespace {bundle.get('cursor_namespace')}): "
+                f"{counts['work_attempts']} attempt(s), {counts['file_claims']} claim(s), "
+                f"{counts['operation_receipts']} receipt(s), "
+                f"{counts['operation_intents']} intent(s), {counts['events']} event(s), "
+                f"{counts['artifacts']} artifact(s); artifacts and evidence are retained "
+                "(disk growth is expected)"
+            )
         return
 
     target.init()
@@ -1344,6 +1702,29 @@ def cmd_migrate(args):
         summary += f" ({len(skipped)} already present, skipped: {', '.join(sorted(skipped))})"
     print(summary)
 
+    # Coordination first, and before any destructive prune: migrate_coordination
+    # refuses a non-quiescent source, exports, verifies the bundle, imports and
+    # then re-verifies the destination -- all before the marker or `sink:` move.
+    if coordination_active:
+        result = coordination_export.migrate_coordination(
+            source_store,
+            target_store,
+            workspace_id=workspace_id,
+            overwrite=args.overwrite,
+        )
+        records = result.get("records", {})
+        print(
+            "transferred coordination history "
+            f"({result.get('source_namespace')} -> {result.get('target_namespace')}): "
+            f"{records.get('work_attempts', 0)} attempt(s), "
+            f"{records.get('file_claims', 0)} claim(s), "
+            f"{records.get('operation_receipts', 0)} receipt(s), "
+            f"{records.get('operation_intents', 0)} intent(s), "
+            f"{result.get('events', 0)} event(s), {result.get('artifacts', 0)} artifact(s); "
+            "destination verified, artifacts and evidence are retained "
+            "(disk growth is expected)"
+        )
+
     if args.prune:
         # The copy is done; pruning is the destructive half, and it is refused
         # outright when it would leave a *stale* copy as the only copy. Nothing is
@@ -1360,6 +1741,11 @@ def cmd_migrate(args):
             source.remove(t.id)
         print(f"pruned {len(tickets)} ticket(s) from the {source.kind} sink at {source.root}")
 
+    # Only now, after the destination verified and the copy is done, move the
+    # authoritative binding so the marker, the stored binding and the config agree.
+    if coordination_active:
+        _rebind_to_coordination_store(project_root, target, target_store)
+
     # The destination holds the tickets now, so it becomes the project default --
     # otherwise the next plain command would read the store you just migrated away
     # from, which is the same silent-wrong-store trap `init` closes above.
@@ -1372,6 +1758,133 @@ def cmd_migrate(args):
         )
 
 
+#: Record kinds that mean a store holds actual coordination *work*. A workspace
+#: record and a store binding are created merely by building the lifecycle service
+#: (any `set`/`claim`/`close` binds the workspace), so they alone would make every
+#: migration of a once-touched project try to move coordination history.
+_COORDINATION_WORK_KINDS = (
+    "work_attempt",
+    "file_claim",
+    "read_observation",
+    "operation_receipt",
+    "operation_intent",
+    "recovery_report",
+)
+
+
+def _coordination_state_present(store) -> bool:
+    """Whether `store` holds real coordination *work*, not merely a binding.
+
+    A freshly initialised SQLite store already has its coordination tables, and a
+    workspace record plus store binding are written the first time any lifecycle
+    service is built (a `set`, a `claim`, ...). Requiring at least one attempt/
+    claim/observation/receipt/intent/recovery record makes "the source has
+    coordination state to move" mean substantive history rather than plumbing, so
+    ticket-only migrations are unchanged. Read-only and defensive: any failure
+    here just means "nothing to transfer", and an explicit --coordination still
+    reports the real problem through `migrate_coordination`.
+    """
+    try:
+        if not store.is_initialised():
+            return False
+        with store.transaction(write=False) as tx:
+            return any(list(tx.find(kind)) for kind in _COORDINATION_WORK_KINDS)
+    except ArbiteError:
+        return False
+
+
+def _marker_names_store(marker, store) -> bool:
+    """Whether the binding `marker` names the same store as `store`.
+
+    Compares both the kind (from the store's cursor namespace) and the location
+    (through `binding_location()`), so a marker for the file sink is never taken
+    to name the SQLite sink that happens to share the same `.arbite` directory.
+    Read-only: a store that cannot answer counts as "not this store".
+    """
+    try:
+        namespace = store.cursor_namespace()
+        location = store.binding_location()
+    except ArbiteError:
+        return False
+    kind = namespace.split(":", 1)[0] if isinstance(namespace, str) else None
+    if marker.get("sink_kind") != kind:
+        return False
+    return _same_location(marker.get("location"), location)
+
+
+def _same_location(left, right) -> bool:
+    """Whether two store locations denote the same place (realpath when possible)."""
+    if not left or not right:
+        return False
+    try:
+        return os.path.realpath(str(left)) == os.path.realpath(str(right))
+    except OSError:  # pragma: no cover - defensive
+        return str(left) == str(right)
+
+
+def _migration_workspace_id(source_store, project_root):
+    """The workspace a coordination migration is about, or `None`.
+
+    Prefers the project's binding marker when it names the *source* store and that
+    workspace actually exists in the source (the normal case: the marker says
+    which store the project coordinates against). Otherwise falls back to the
+    single workspace the source store holds, or `None` when there is none or more
+    than one -- `migrate_coordination` then resolves it and reports the ambiguity.
+    Read-only: an uninitialised source exports a well-formed empty bundle.
+    """
+    try:
+        bundle = coordination_export.export_coordination(source_store)
+    except ArbiteError:
+        return None
+    records = bundle.get("records") if isinstance(bundle, dict) else None
+    workspace_records = records.get("workspaces") if isinstance(records, dict) else None
+    workspace_ids = [
+        record.get("id")
+        for record in (workspace_records or [])
+        if isinstance(record, dict) and record.get("id")
+    ]
+    marker = None
+    try:
+        marker = workspace.load_marker(project_root / config.ARBITE_DIRNAME)
+    except ArbiteError:
+        marker = None
+    if marker is not None and _marker_names_store(marker, source_store):
+        marker_id = marker.get("workspace_id")
+        if marker_id in workspace_ids:
+            return marker_id
+    if len(workspace_ids) == 1:
+        return workspace_ids[0]
+    return None
+
+
+def _rebind_to_coordination_store(project_root, target, target_store) -> None:
+    """Make `target` the authoritative store for this project's workspace.
+
+    Writes the marker through `workspace.ensure_binding`, which also stores the
+    authoritative `StoreBinding` in the target and (best-effort) a
+    `workspace_bound` event. Already matching the target is a no-op; no marker
+    means this is the first bind (`rebind=False`); a marker naming a different
+    store is an explicit rebind (`rebind=True`), which verifies the previously
+    bound store is quiescent.
+    """
+    arbite_dir = project_root / config.ARBITE_DIRNAME
+    marker = workspace.load_marker(arbite_dir)
+    location = str(target.root)
+    if marker is not None and (
+        str(marker.get("sink_kind")) == str(target.kind)
+        and str(marker.get("location")) == location
+    ):
+        return
+    workspace.ensure_binding(
+        arbite_dir,
+        root=str(project_root),
+        sink_kind=target.kind,
+        location=location,
+        store=target_store,
+        rebind=marker is not None,
+    )
+
+
 def _target_exists(target) -> bool:
     """Whether the migration target already holds tickets. Used by --dry-run,
     which must not create the target's store merely to report on it."""
@@ -1379,6 +1892,872 @@ def _target_exists(target) -> bool:
         return bool(target.ids())
     except ArbiteError:
         return False
+
+
+# --- export and explicit rebind (shared-directory coordination, C11) --------
+
+
+_EXPORT_COORDINATION_COUNT_KEYS = (
+    "workspaces",
+    "store_bindings",
+    "work_attempts",
+    "file_claims",
+    "read_observations",
+    "operation_receipts",
+    "operation_intents",
+    "recovery_reports",
+    "events",
+    "artifacts",
+)
+
+
+def _ticket_export_document(sink) -> dict:
+    """The `--scope tickets` document, in the same rendering `list`/`show` use."""
+    rows = sink.query(TicketQuery(buckets=("*",)))
+    locations = sink.location_map(rows)
+    return {
+        "schema_version": 1,
+        "arbite_ticket_export": 1,
+        "sink": {"kind": sink.kind, "root": str(sink.root)},
+        "tickets": [t.to_dict(locations.get(t.id)) for t in rows],
+    }
+
+
+def _coordination_count_line(counts) -> str:
+    return ", ".join(
+        f"{counts.get(key, 0)} {key}" for key in _EXPORT_COORDINATION_COUNT_KEYS
+    )
+
+
+def cmd_export(args):
+    """Export coordination history and/or tickets as one JSON document.
+
+    READ-ONLY: nothing here creates the store, the `.arbite` directory or the
+    coordination layout. An uninitialised coordination store exports a
+    well-formed *empty* bundle (correct namespace and contract, no records) and
+    creates nothing.
+
+    Scopes:
+
+    - `coordination` (default): a `coordination_export` bundle.
+    - `tickets`: `{"schema_version": 1, "arbite_ticket_export": 1,
+      "sink": {"kind", "root"}, "tickets": [<ticket dicts>]}`.
+    - `all`: `{"schema_version": 1, "coordination": <bundle>,
+      "tickets": <ticket document>}`.
+
+    `--out FILE` writes the document atomically (temp + `os.replace`) and prints
+    a short human summary; without `--out` the document itself is printed to
+    stdout so it can be redirected. `--workspace ID` filters the coordination
+    export to one workspace and `--no-artifacts` keeps artifact *metadata* while
+    omitting the bytes (`data_omitted`).
+
+    `--json` prints a `coordination.ok_result(...)` status payload instead of the
+    document. The `data` mapping is stable and later tickets extend it::
+
+        {"scope", "workspace_id", "cursor_namespace", "retained_history",
+         "counts", "out", "include_artifacts"}
+
+    where `counts` is the bundle's per-group counts for `coordination`,
+    `{"tickets": n}` for `tickets`, and `{"coordination": {...}, "tickets": n}`
+    for `all`. `out` is the written path or `None`.
+    """
+    sink = _require_sink(args)
+    scope = args.scope
+
+    coordination_bundle = None
+    ticket_document = None
+    if scope in ("coordination", "all"):
+        coordination_bundle = coordination_export.export_coordination(
+            sink,
+            workspace_id=args.workspace,
+            include_artifacts=not args.no_artifacts,
+        )
+    if scope in ("tickets", "all"):
+        ticket_document = _ticket_export_document(sink)
+
+    if scope == "coordination":
+        document = coordination_bundle
+        counts = coordination_export.bundle_counts(coordination_bundle)
+        namespace = coordination_bundle.get("cursor_namespace")
+        ticket_count = None
+    elif scope == "tickets":
+        document = ticket_document
+        ticket_count = len(ticket_document["tickets"])
+        counts = {"tickets": ticket_count}
+        namespace = None
+    else:
+        ticket_count = len(ticket_document["tickets"])
+        document = {
+            "schema_version": 1,
+            "coordination": coordination_bundle,
+            "tickets": ticket_document,
+        }
+        counts = {
+            "coordination": coordination_export.bundle_counts(coordination_bundle),
+            "tickets": ticket_count,
+        }
+        namespace = coordination_bundle.get("cursor_namespace")
+
+    out_path = str(args.out) if args.out else None
+    if out_path is not None:
+        out_path = coordination_export.write_bundle(document, out_path)
+
+    if args.json:
+        _print_json(
+            coordination.ok_result(
+                {
+                    "scope": scope,
+                    "workspace_id": args.workspace,
+                    "cursor_namespace": namespace,
+                    "retained_history": True,
+                    "counts": counts,
+                    "out": out_path,
+                    "include_artifacts": not args.no_artifacts,
+                }
+            )
+        )
+        return
+
+    if out_path is None:
+        print(json.dumps(document, indent=2, ensure_ascii=False, default=str))
+        return
+
+    label = {
+        "coordination": "coordination export",
+        "tickets": "ticket export",
+        "all": "coordination+ticket export",
+    }[scope]
+    print(f"wrote {label} to {out_path}")
+    if scope in ("coordination", "all"):
+        print(f"  namespace {namespace}, retained_history True")
+        print(
+            "  "
+            + _coordination_count_line(
+                coordination_export.bundle_counts(coordination_bundle)
+            )
+        )
+    if scope in ("tickets", "all"):
+        print(f"  {ticket_count} ticket(s)")
+
+
+def _emit_rebind_result(args, payload, lines) -> None:
+    """Print the documented `ok_result` payload, or the human lines, never both."""
+    if getattr(args, "json", False):
+        _print_json(coordination.ok_result(payload))
+        return
+    for line in lines:
+        print(line)
+
+
+def cmd_rebind(args):
+    """Switch this project's authoritative coordination store, explicitly.
+
+    The current binding is the `.arbite/workspace-binding.json` marker when it
+    exists (the config/`--sink` selection only describes "from" when there is no
+    marker yet). Verification, in order, and every step *before* anything is
+    written:
+
+    1. the currently bound store is quiescent -- `workspace.require_quiescent`
+       refuses while it still has an active work attempt or file claim (no marker
+       means there is nothing to unbind);
+    2. the destination sink can be opened and exposes a coordination store;
+    3. the destination's `contract_version()` equals `coordination.CONTRACT_VERSION`;
+    4. when the destination store is already initialised,
+       `coordination_doctor.coordination_problems(..., fix=False)` must be empty.
+
+    Only then does it rewrite the marker through `workspace.ensure_binding`
+    (writing the stored `StoreBinding` too, and rebinding quiescently) and make
+    the destination the project default with `config.set_configured_sink`. There
+    is no sleeping, daemon, retry or automatic takeover.
+
+    `--dry-run` performs every check and writes nothing. `--json` prints a
+    `coordination.ok_result` payload with `rebound`, `from`, `to`, `workspace_id`,
+    `dry_run` and `verified`.
+    """
+    if not args.to:
+        raise TicketError(
+            "rebind needs --to KIND to name the store being switched to "
+            f"(valid: {', '.join(SINK_KINDS)})"
+        )
+    project_root = config.find_project_root()
+    arbite_dir = project_root / config.ARBITE_DIRNAME
+    current = config.open_sink(getattr(args, "sink", None), project_root)
+    marker = workspace.load_marker(arbite_dir)
+
+    destination = config.open_sink_kind(args.to, project_root)
+    dest_location = str(destination.root)
+
+    if marker is not None:
+        from_kind = str(marker["sink_kind"])
+        from_location = str(marker["location"])
+        workspace_id = marker["workspace_id"]
+    else:
+        from_kind = current.kind
+        from_location = str(current.root)
+        workspace_id = workspace.stable_workspace_id(str(project_root))
+
+    if from_kind == str(destination.kind) and from_location == dest_location:
+        raise TicketError(
+            f"already bound to {from_kind}:{from_location}; rebind needs a different "
+            "--to store"
+        )
+
+    if marker is not None:
+        previous = coordination.StoreBinding(
+            id=coordination.new_record_id("store_binding"),
+            workspace_id=workspace_id,
+            sink_kind=from_kind,
+            location=from_location,
+            bound_at=marker["bound_at"],
+        )
+        workspace.require_quiescent(previous, workspace_id)
+
+    dest_store = destination.coordination()
+    if dest_store is None:
+        raise UnsupportedCoordination(
+            f"the {destination.kind} sink does not implement the shared-directory "
+            "coordination contract, so it cannot become the authoritative store"
+        )
+    contract = dest_store.contract_version()
+    if contract != coordination.CONTRACT_VERSION:
+        raise TicketError(
+            f"the {destination.kind} sink implements coordination contract version "
+            f"{contract}, but this arbite speaks {coordination.CONTRACT_VERSION}; "
+            "refusing to rebind"
+        )
+    if dest_store.is_initialised():
+        problems = coordination_doctor.coordination_problems(destination, fix=False)
+        if problems:
+            kinds = ", ".join(sorted({p.kind for p in problems}))
+            raise CoordinationConflict(
+                f"refusing to rebind to {destination.kind}:{dest_location}: its "
+                f"coordination store has integrity problems that must be resolved first "
+                f"({kinds})",
+                details={"problems": [p.to_dict() for p in problems]},
+            )
+
+    from_label = f"{from_kind}:{from_location}"
+    to_label = f"{destination.kind}:{dest_location}"
+
+    if args.dry_run:
+        _emit_rebind_result(
+            args,
+            {
+                "rebound": False,
+                "from": {"kind": from_kind, "location": from_location},
+                "to": {"kind": destination.kind, "location": dest_location},
+                "workspace_id": workspace_id,
+                "dry_run": True,
+                "verified": True,
+            },
+            [
+                f"would rebind workspace {workspace_id} from {from_label} to {to_label} "
+                "(verified; nothing written)"
+            ],
+        )
+        return
+
+    resolution = workspace.ensure_binding(
+        arbite_dir,
+        root=str(project_root),
+        sink_kind=destination.kind,
+        location=dest_location,
+        store=dest_store,
+        rebind=marker is not None,
+    )
+    written = config.set_configured_sink(destination.kind, project_root)
+    _emit_rebind_result(
+        args,
+        {
+            "rebound": True,
+            "from": {"kind": from_kind, "location": from_location},
+            "to": {"kind": destination.kind, "location": dest_location},
+            "workspace_id": resolution.workspace_id,
+            "dry_run": False,
+            "verified": True,
+        },
+        [
+            f"rebound workspace {resolution.workspace_id} from {from_label} to {to_label}",
+            f"set 'sink: {destination.kind}' in {written.name}",
+        ],
+    )
+
+
+# --- file ownership (shared-directory coordination, C04) -------------------
+
+
+def _load_attempt_for(store, ticket_id: str, attempt_id: str):
+    """The work attempt `attempt_id`, which must belong to `ticket_id`."""
+    with store.transaction(write=False) as tx:
+        attempt = tx.get("work_attempt", attempt_id)
+    if attempt is None or attempt.ticket_id != ticket_id:
+        raise CoordinationNotFound(
+            f"no attempt {attempt_id!r} is recorded for ticket {ticket_id!r}",
+            details={"ticket_id": ticket_id, "attempt_id": attempt_id},
+        )
+    return attempt
+
+
+def _file_claim_context(args, sink):
+    """The `FileClaimService` and the attempt this file command acts for."""
+    store = sink.coordination()
+    if store is None:
+        raise UnsupportedCoordination(
+            f"the {sink.kind} sink does not implement the shared-directory "
+            "coordination contract, so file claims cannot be recorded"
+        )
+    attempt = _load_attempt_for(store, args.ticket, args.attempt)
+    service = application.coordination_service_for(
+        sink, root=str(config.find_project_root()), actor=Actor(attempt.worker_id)
+    )
+    if attempt.workspace_id != service.workspace.id:
+        raise ClaimConflict(
+            f"attempt {attempt.id} belongs to workspace {attempt.workspace_id}, but "
+            f"this project root is workspace {service.workspace.id}; file claims are "
+            "per workspace and cannot cross a rebind",
+            details={
+                "attempt_id": attempt.id,
+                "attempt_workspace": attempt.workspace_id,
+                "workspace_id": service.workspace.id,
+            },
+        )
+    return fileclaims.FileClaimService(service), attempt
+
+
+def _emit_file_result(args, payload, human_lines) -> None:
+    """Print the documented JSON payload, or the human lines, never both."""
+    if getattr(args, "json", False):
+        _print_json(coordination.ok_result(payload))
+        return
+    for line in human_lines:
+        print(line)
+
+
+def _file_error(args, error) -> None:
+    """Render a coordination failure as JSON under `--json`, else re-raise."""
+    if getattr(args, "json", False):
+        _print_json(error.to_result())
+        sys.exit(EXIT_ERROR)
+    raise error
+
+
+def cmd_file_claim(args):
+    """Claim one or more workspace paths exclusively for a ticket attempt.
+
+    Runs entirely through `arbite.fileclaims.FileClaimService`, so the canonical
+    path validation, the all-or-nothing claim set, the `file_busy` holder payload
+    and the idempotent reentrant acquisition are the same whether invoked here or
+    from another caller."""
+    sink = _require_sink(args)
+    try:
+        service, attempt = _file_claim_context(args, sink)
+        result = service.claim(attempt, args.paths)
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    payload = {
+        "workspace_id": result.workspace_id,
+        "ticket_id": result.ticket_id,
+        "attempt_id": result.attempt_id,
+        "operation_id": result.operation_id,
+        "paths": result.paths,
+        "claimed": [claim.to_dict() for claim in result.acquired],
+        "reentrant": [claim.to_dict() for claim in result.reentrant],
+    }
+    lines = [
+        f"claimed {claim.path} (generation {claim.generation}, "
+        f"version {claim.observed_version}) for {result.ticket_id} "
+        f"attempt {result.attempt_id}"
+        for claim in result.acquired
+    ] + [
+        f"already held {claim.path} (generation {claim.generation}) by "
+        f"{result.ticket_id} attempt {result.attempt_id}"
+        for claim in result.reentrant
+    ]
+    _emit_file_result(args, payload, lines or ["nothing claimed"])
+
+
+def cmd_file_release(args):
+    """Release this attempt's exclusive claims on one or more paths.
+
+    The work attempt is retained; only the file token is revoked. A later claim of
+    the same path mints a new generation, so an old read token cannot authorize a
+    write after the release."""
+    sink = _require_sink(args)
+    try:
+        service, attempt = _file_claim_context(args, sink)
+        result = service.release(attempt, args.paths, reason=args.reason)
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    payload = {
+        "workspace_id": result.workspace_id,
+        "ticket_id": result.ticket_id,
+        "attempt_id": result.attempt_id,
+        "operation_id": result.operation_id,
+        "reason": result.reason,
+        "released": [claim.to_dict() for claim in result.released],
+        "already_released": [claim.to_dict() for claim in result.already_released],
+    }
+    lines = [
+        f"released {claim.path} (generation {claim.generation}) for "
+        f"{result.ticket_id} attempt {result.attempt_id}: {result.reason}"
+        for claim in result.released
+    ] + [
+        f"already released {claim.path} (generation {claim.generation})"
+        for claim in result.already_released
+    ]
+    _emit_file_result(args, payload, lines or ["nothing released"])
+
+
+# --- bounded discovery and versioned reads (shared-directory coordination, C06) --
+
+
+def _line_range_arg(value):
+    """argparse type for `--lines START:END`: a usage error when malformed."""
+    try:
+        return filereads.parse_line_range(value)
+    except UnsupportedCoordination as error:
+        raise argparse.ArgumentTypeError(str(error))
+
+
+def _file_read_context(args, sink, *, require_attempt: bool):
+    """The `FileReadService` (and, when required, the attempt) a read command acts for.
+
+    Reads do not take ownership, so no claim is acquired here; the attempt is
+    loaded only to record whose observation a read is. The workspace check is the
+    same one the claim surface applies, so a read and a claim can never disagree
+    about which workspace a path belongs to."""
+    store = sink.coordination()
+    if store is None:
+        raise UnsupportedCoordination(
+            f"the {sink.kind} sink does not implement the shared-directory "
+            "coordination contract, so reads cannot be recorded"
+        )
+    service = application.coordination_service_for(
+        sink, root=str(config.find_project_root())
+    )
+    attempt = None
+    if require_attempt:
+        attempt = _load_attempt_for(store, args.ticket, args.attempt)
+        if attempt.workspace_id != service.workspace.id:
+            raise ClaimConflict(
+                f"attempt {attempt.id} belongs to workspace {attempt.workspace_id}, but "
+                f"this project root is workspace {service.workspace.id}; reads and claims "
+                "are per workspace and cannot cross a rebind",
+                details={
+                    "attempt_id": attempt.id,
+                    "attempt_workspace": attempt.workspace_id,
+                    "workspace_id": service.workspace.id,
+                },
+            )
+    return filereads.FileReadService(service), attempt, service
+
+
+def _discovery_lines(page) -> list:
+    """Human lines for a list/search page, with explicit truncation markers."""
+    lines = []
+    for entry in getattr(page, "entries", None) or []:
+        version = f" {entry.version}" if entry.version else ""
+        omitted = " (version omitted)" if entry.version_omitted else ""
+        lines.append(f"{entry.kind} {entry.path}{version}{omitted}")
+    for match in getattr(page, "matches", None) or []:
+        if match.line is None:
+            lines.append(f"path {match.path}")
+        else:
+            shown = match.text if not match.text_truncated else match.text + "..."
+            lines.append(f"{match.path}:{match.line}: {shown}")
+    for marker in page.markers:
+        lines.append(f"marker: {marker}")
+    if page.truncated:
+        if page.next_offset is not None:
+            lines.append(f"truncated: next_offset={page.next_offset}")
+        else:
+            lines.append("truncated: no deterministic next page (scan limit reached)")
+    return lines
+
+
+def cmd_file_list(args):
+    """List workspace entries (bounded, deterministic, JSON-capable)."""
+    sink = _require_sink(args)
+    try:
+        service, _attempt, _svc = _file_read_context(args, sink, require_attempt=False)
+        page = service.list(
+            getattr(args, "path", None), limit=args.limit, offset=args.offset
+        )
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    _emit_file_result(args, page.to_dict(), _discovery_lines(page) or ["no paths found"])
+
+
+def cmd_file_search(args):
+    """Search workspace paths and text lines (bounded, text/path discovery only)."""
+    sink = _require_sink(args)
+    try:
+        service, _attempt, _svc = _file_read_context(args, sink, require_attempt=False)
+        page = service.search(
+            args.pattern,
+            getattr(args, "path", None),
+            limit=args.limit,
+            offset=args.offset,
+        )
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    _emit_file_result(args, page.to_dict(), _discovery_lines(page) or ["no matches found"])
+
+
+def cmd_file_read(args):
+    """Serve a file (or a line range) with an explicit write receipt.
+
+    Unlike a mutation this takes no lock and acquires no ownership. A file held by
+    another attempt is still served, but the receipt is non-writable and names the
+    busy owner; `--fail-if-busy` refuses instead so a caller can avoid spending
+    tokens on bytes it may not write. Without `--json` the served text goes to
+    stdout and any non-writable/busy warning goes to stderr."""
+    sink = _require_sink(args)
+    try:
+        service, attempt, _svc = _file_read_context(args, sink, require_attempt=True)
+        receipt = service.read(
+            attempt,
+            args.path,
+            lines=getattr(args, "lines", None),
+            actor=Actor(attempt.worker_id),
+            fail_if_busy=args.fail_if_busy,
+        )
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    if getattr(args, "json", False):
+        _print_json(coordination.ok_result(receipt.to_dict()))
+        return
+    if receipt.busy:
+        print(
+            f"warning: {receipt.path} is held by ticket "
+            f"{receipt.busy_owner['holder_ticket']} (attempt "
+            f"{receipt.busy_owner['holder_attempt']}); this read is NOT "
+            "write-authorizing",
+            file=sys.stderr,
+        )
+    elif receipt.non_writable:
+        print(
+            f"warning: this read is NOT write-authorizing "
+            f"({receipt.non_writable_reason}); claim and re-read before writing",
+            file=sys.stderr,
+        )
+    end = "" if receipt.text.endswith("\n") else "\n"
+    print(receipt.text, end=end)
+
+
+def cmd_file_probe(args):
+    """Inspect an absent path for a safe create (records nothing, owns nothing)."""
+    sink = _require_sink(args)
+    try:
+        service, attempt, _svc = _file_read_context(args, sink, require_attempt=True)
+        receipt = service.probe(attempt, args.path)
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    payload = receipt.to_dict()
+    lines = [
+        f"{receipt.path}: " + ("exists" if receipt.exists else "absent"),
+        f"version: {receipt.version}",
+        f"safe_to_create: {'yes' if receipt.safe_to_create else 'no'}",
+        receipt.next_action,
+    ]
+    _emit_file_result(args, payload, lines)
+
+
+# --- version-checked mutations (shared-directory coordination, C07) ---------
+
+
+def _file_mutation_context(args, sink):
+    """The `FileMutationService` and the attempt a write/edit command acts for.
+
+    Mutations act for an explicitly loaded, active attempt and are recorded
+    through the same workspace binding as claims and reads, so a mutation can
+    never disagree about which workspace a path belongs to."""
+    store = sink.coordination()
+    if store is None:
+        raise UnsupportedCoordination(
+            f"the {sink.kind} sink does not implement the shared-directory "
+            "coordination contract, so file mutations cannot be recorded"
+        )
+    attempt = _load_attempt_for(store, args.ticket, args.attempt)
+    service = application.coordination_service_for(
+        sink, root=str(config.find_project_root()), actor=Actor(attempt.worker_id)
+    )
+    if attempt.workspace_id != service.workspace.id:
+        raise ClaimConflict(
+            f"attempt {attempt.id} belongs to workspace {attempt.workspace_id}, but "
+            f"this project root is workspace {service.workspace.id}; file mutations "
+            "are per workspace and cannot cross a rebind",
+            details={
+                "attempt_id": attempt.id,
+                "attempt_workspace": attempt.workspace_id,
+                "workspace_id": service.workspace.id,
+            },
+        )
+    return filemutations.FileMutationService(service), attempt
+
+
+def _read_payload_bytes(source: str) -> bytes:
+    """Read a mutation payload verbatim: `-` is stdin, anything else a file.
+
+    Payload temp files are transport for bytes the proxy is about to record, not
+    workspace mutations themselves: they are never claimed, journalled or
+    attributed."""
+    if source in ("-", None):
+        return sys.stdin.buffer.read()
+    try:
+        with open(source, "rb") as handle:
+            return handle.read()
+    except OSError as error:
+        raise UnsupportedCoordination(
+            f"could not read the payload file {source!r}: {error}",
+            details={"input": source},
+        ) from error
+
+
+def _read_payload_text(source: str) -> str:
+    data = _read_payload_bytes(source)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise UnsupportedCoordination(
+            f"the payload file {source!r} is not UTF-8 text: {error}",
+            details={"input": source},
+        ) from error
+
+
+def _mutation_payload(result) -> dict:
+    """The documented JSON payload for a successful (or replayed) mutation.
+
+    The whole-file `version` is the recorded after-digest; `read_token_invalidated`
+    states plainly that the token this call used has been consumed and a fresh
+    proxy read is required before another mutation. `created_parents` lists any
+    in-root directories this call created for a missing destination."""
+    first_path = result.paths[0] if result.paths else None
+    return {
+        "operation_id": result.operation_id,
+        "kind": result.kind,
+        "paths": list(result.paths),
+        "before": dict(result.before),
+        "after": dict(result.after),
+        "version": result.after.get(first_path) if first_path else None,
+        "artifact_refs": list(result.artifact_refs),
+        "claim_generation": result.receipt.claim_generation,
+        "applied": result.applied,
+        "deduplicated": result.deduplicated,
+        "recovered": result.recovered,
+        "created_parents": list(getattr(result, "created_parents", []) or []),
+        "receipt_timestamp": result.receipt.timestamp,
+        "read_token_invalidated": bool(result.applied),
+        "next_action": "read the file through arbite again before the next mutation",
+    }
+
+
+def _mutation_lines(result, verb: str) -> list:
+    lines = []
+    for path in result.paths:
+        if result.applied:
+            lines.append(f"{verb} {path} -> {result.after.get(path)}")
+        elif result.deduplicated:
+            lines.append(f"already applied {path} (operation {result.operation_id})")
+        else:
+            lines.append(f"{verb} {path} (no change)")
+    if result.applied:
+        lines.append(
+            "the read token is now invalid; read the file again through arbite "
+            "before the next mutation"
+        )
+    return lines
+
+
+def cmd_file_write(args):
+    """Create or replace a whole file with version-checked, journalled bytes.
+
+    An existing file requires `--read-token` for a fresh post-claim read; an
+    absent path is a create authorized by its absent-path claim. The payload is
+    read verbatim (`--input -` for stdin), so binary content round-trips."""
+    sink = _require_sink(args)
+    try:
+        mutations, attempt = _file_mutation_context(args, sink)
+        content = _read_payload_bytes(args.input)
+        result = mutations.write(
+            attempt, args.path, content, read_token=args.read_token
+        )
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    _emit_file_result(args, _mutation_payload(result), _mutation_lines(result, "wrote"))
+
+
+def cmd_file_edit(args):
+    """Apply an exact old/new edit batch to an existing file, once, all-or-nothing.
+
+    The batch comes from `--edits` (a JSON payload file, or `-` for stdin) and is
+    matched exactly against the file's current bytes; an absent, ambiguous or
+    overlapping selection refuses the whole batch with no bytes changed."""
+    sink = _require_sink(args)
+    try:
+        mutations, attempt = _file_mutation_context(args, sink)
+        edits = filemutations.parse_edits_json(_read_payload_text(args.edits))
+        result = mutations.edit(
+            attempt, args.path, edits, read_token=args.read_token
+        )
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    _emit_file_result(args, _mutation_payload(result), _mutation_lines(result, "edited"))
+
+
+def cmd_file_remove(args):
+    """Delete a file through the journal, preserving its bytes as evidence.
+
+    Removal needs a fresh `--read-token` (a read this attempt recorded after it
+    claimed the path) and is refused for a directory: arbite v1 has no recursive
+    deletion. The removed bytes are stored content-addressed before the unlink, so
+    the receipt can reproduce them."""
+    sink = _require_sink(args)
+    try:
+        mutations, attempt = _file_mutation_context(args, sink)
+        result = mutations.remove(attempt, args.path, read_token=args.read_token)
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    _emit_file_result(args, _mutation_payload(result), _mutation_lines(result, "removed"))
+
+
+def cmd_file_rename(args):
+    """Move SOURCE to DEST, owning and recording both paths.
+
+    The source needs a fresh `--read-token`; DEST is claimed as part of this call
+    and must be absent, or its current version must be given explicitly with
+    `--dest-expected`. A DEST held by another attempt is `file_busy` and changes
+    neither path. Missing in-root parent directories of DEST are created safely;
+    the moved bytes and (when DEST existed) the bytes it replaced are stored as
+    evidence, and both paths appear in the receipt."""
+    sink = _require_sink(args)
+    try:
+        mutations, attempt = _file_mutation_context(args, sink)
+        result = mutations.rename(
+            attempt,
+            args.source,
+            args.destination,
+            read_token=args.read_token,
+            dest_expected=args.dest_expected,
+        )
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    source = result.paths[0] if result.paths else None
+    destination = result.paths[1] if len(result.paths) > 1 else None
+    payload = _mutation_payload(result)
+    payload.update(
+        {
+            "source": source,
+            "destination": destination,
+            "destination_version": result.after.get(destination) if destination else None,
+        }
+    )
+    lines = []
+    for path in result.paths:
+        if result.applied:
+            lines.append(f"{path} -> {result.after.get(path)}")
+        elif result.deduplicated:
+            lines.append(f"already applied {path} (operation {result.operation_id})")
+        else:
+            lines.append(f"{path} (no change)")
+    if result.applied:
+        lines.insert(0, f"renamed {source} -> {destination}")
+        lines.append(
+            "the read token is now invalid; read the file again through arbite "
+            "before the next mutation"
+        )
+    _emit_file_result(args, payload, lines or ["nothing renamed"])
+
+
+# --- change receipts and net change views (shared-directory coordination, C10) --
+
+
+def _short_version(value) -> str:
+    """A digest (or the absent marker) in a width a human line can hold."""
+    if value == coordination.ABSENT:
+        return "<absent>"
+    text = str(value)
+    return text if len(text) <= 23 else text[:20] + "..."
+
+
+def _change_lines(view) -> list:
+    """Human lines for a change view: net changes first, then ordered operations."""
+    heading = f"{view.scope} changes for {view.ticket_id}"
+    if view.attempt_id:
+        heading += f" attempt {view.attempt_id}"
+    lines = [heading]
+    if not view.net_changes:
+        lines.append("no recorded file changes")
+    for entry in view.net_changes:
+        suffix = " (reverted)" if entry["reverted"] else ""
+        lines.append(
+            f"{entry['change']}{suffix}: {entry['path']} "
+            f"{_short_version(entry['before'])} -> {_short_version(entry['after'])}"
+        )
+    for entry in view.operations:
+        paths = ", ".join(entry["paths"]) or "-"
+        lines.append(
+            f"op {entry['operation_id']} {entry['operation_kind']} "
+            f"{entry['result']}: {paths}"
+        )
+    if view.unattributed:
+        lines.append(
+            f"{len(view.unattributed)} observed/unattributed finding(s) "
+            "(not attributed to any agent)"
+        )
+    if view.read_observations:
+        lines.append(
+            f"{len(view.read_observations)} read observation(s) (separate stream)"
+        )
+    if view.bounds["operations"]["truncated"]:
+        lines.append(
+            f"truncated: showing {view.bounds['operations']['returned']} of "
+            f"{view.bounds['operations']['total']} operations; "
+            f"next --offset {view.bounds['operations']['next_offset']}"
+        )
+    return lines
+
+
+def cmd_changes(args):
+    """Answer "what changed for this ticket (or attempt), and is it verifiable?".
+
+    Read-only, bounded and one-shot. Mechanical operation receipts (with
+    before/after digests and per-artifact verification), the folded net change
+    view, agent-authored ticket notes and observed/unattributed drift are returned
+    as SEPARATE sections, so a closure never needs an LLM summary to produce a
+    file-change manifest. Read observations are a separate stream that only
+    appears with --include-reads.
+    """
+    sink = _require_sink(args)
+    try:
+        ticket = sink.get(args.id, unique=True)
+        store = sink.coordination()
+        if store is None:
+            raise UnsupportedCoordination(
+                f"the {sink.kind} sink does not implement the shared-directory "
+                "coordination contract, so change evidence cannot be queried"
+            )
+        view = changes.ChangesQuery(store, ticket=ticket).view(
+            ticket.id,
+            attempt_id=args.attempt,
+            include_reads=args.include_reads,
+            limit=args.limit,
+            offset=args.offset,
+        )
+    except CoordinationError as error:
+        _file_error(args, error)
+        return
+    _emit_file_result(args, view.to_dict(), _change_lines(view))
 
 
 def build_parser():
@@ -1715,8 +3094,22 @@ def build_parser():
     p_claim.add_argument(
         "--force",
         action="store_true",
-        help="take over a ticket already assigned to another agent (records the takeover "
-        "as a note); without this, claiming someone else's ticket is an error",
+        help="administrative takeover: interrupt the ticket's live work attempt and start "
+        "a new one for this agent (requires a non-empty --reason). Without it, claiming a "
+        "ticket that already has an active attempt is refused",
+    )
+    p_claim.add_argument(
+        "--adopt",
+        action="store_true",
+        help="adopt a legacy in_progress ticket that has no attempt record (e.g. one "
+        "started by a pre-coordination arbite): start its attempt now, recording the "
+        "pre-existing declared assignee in the attempt handoff. Never implicit",
+    )
+    p_claim.add_argument(
+        "--reason",
+        default="",
+        help="why an administrative takeover is being made (required with --force when the "
+        "ticket has a live attempt); recorded in the attempt and its events",
     )
     _sink_flag(p_claim)
     p_claim.set_defaults(func=cmd_claim)
@@ -1739,6 +3132,12 @@ def build_parser():
     p_release.add_argument(
         "--reason", default="", help="why it's being released; included in the note (optional)"
     )
+    p_release.add_argument(
+        "--force",
+        action="store_true",
+        help="revoke another agent's active attempt on this ticket (requires a non-empty "
+        "--reason); without it, only the attempt's own worker may release it",
+    )
     _sink_flag(p_release)
     p_release.set_defaults(func=cmd_release)
 
@@ -1750,6 +3149,17 @@ def build_parser():
     p_block.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_block.add_argument(
         "--reason", required=True, help="why it's stalled: freeform text or another ticket id (required)"
+    )
+    p_block.add_argument(
+        "--agent",
+        default="system",
+        help="agent id blocking it; must be the active attempt's worker, unless --force "
+        "revokes that attempt (default: system)",
+    )
+    p_block.add_argument(
+        "--force",
+        action="store_true",
+        help="revoke another agent's active attempt while blocking (requires --reason)",
     )
     _sink_flag(p_block)
     p_block.set_defaults(func=cmd_block)
@@ -1777,6 +3187,11 @@ def build_parser():
         help="send it back to open and clear the assignee even if it is still assigned, "
         "instead of returning it to in_progress for its current owner",
     )
+    p_unblock.add_argument(
+        "--force",
+        action="store_true",
+        help="revoke another agent's active attempt while unblocking (requires --reason)",
+    )
     _sink_flag(p_unblock)
     p_unblock.set_defaults(func=cmd_unblock)
 
@@ -1787,6 +3202,20 @@ def build_parser():
         "sink additionally archives the ticket by close month; other sinks just record it.",
     )
     p_close.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_close.add_argument(
+        "--agent",
+        default="system",
+        help="agent id closing it; must be the active attempt's worker, unless --force "
+        "revokes that attempt (default: system)",
+    )
+    p_close.add_argument(
+        "--reason", default="", help="why it's being closed; recorded with the attempt (optional)"
+    )
+    p_close.add_argument(
+        "--force",
+        action="store_true",
+        help="revoke another agent's active attempt while closing (requires --reason)",
+    )
     _sink_flag(p_close)
     p_close.set_defaults(func=cmd_close)
 
@@ -1804,6 +3233,14 @@ def build_parser():
         help="agent id (or 'system') attributed on the automatic reopen note, e.g. "
         "claude.haiku.001 (default: system)",
     )
+    p_reopen.add_argument(
+        "--reason", default="", help="why it's being reopened; recorded with the attempt (optional)"
+    )
+    p_reopen.add_argument(
+        "--force",
+        action="store_true",
+        help="revoke another agent's active attempt while reopening (requires --reason)",
+    )
     _sink_flag(p_reopen)
     p_reopen.set_defaults(func=cmd_reopen)
 
@@ -1818,6 +3255,17 @@ def build_parser():
         "--reason",
         default="",
         help="why it's being shelved; included in the automatic note (optional)",
+    )
+    p_shelve.add_argument(
+        "--agent",
+        default="system",
+        help="agent id shelving it; must be the active attempt's worker, unless --force "
+        "revokes that attempt (default: system)",
+    )
+    p_shelve.add_argument(
+        "--force",
+        action="store_true",
+        help="revoke another agent's active attempt while shelving (requires --reason)",
     )
     _sink_flag(p_shelve)
     p_shelve.set_defaults(func=cmd_shelve)
@@ -1835,6 +3283,17 @@ def build_parser():
         "--reason",
         default="",
         help="why it's being unshelved; included in the automatic note (optional)",
+    )
+    p_unshelve.add_argument(
+        "--agent",
+        default="system",
+        help="agent id unshelving it; must be the active attempt's worker, unless --force "
+        "revokes that attempt (default: system)",
+    )
+    p_unshelve.add_argument(
+        "--force",
+        action="store_true",
+        help="revoke another agent's active attempt while unshelving (requires --reason)",
     )
     _sink_flag(p_unshelve)
     p_unshelve.set_defaults(func=cmd_unshelve)
@@ -2011,7 +3470,24 @@ def build_parser():
         help="after copying, delete the source tickets -- the destructive half of a "
         "migration, for retiring a store once its contents are verified in the other one. "
         "Refused if any ticket was skipped, because a stale destination copy would then be "
-        "the only copy left; combine with --dry-run to see what it would remove",
+        "the only copy left; combine with --dry-run to see what it would remove. Prunes "
+        "tickets only: coordination history is never deleted",
+    )
+    p_migrate.add_argument(
+        "--coordination",
+        dest="coordination",
+        action="store_true",
+        default=None,
+        help="also move shared-directory coordination history (attempts, claims, receipts, "
+        "intents, events, artifacts) and rebind this project to the destination; default: "
+        "move it iff the source already has coordination state",
+    )
+    p_migrate.add_argument(
+        "--no-coordination",
+        dest="coordination",
+        action="store_false",
+        default=None,
+        help="transfer tickets only, leaving all coordination history in the source store",
     )
     _sink_flag(p_migrate)
     p_migrate.set_defaults(func=cmd_migrate)
@@ -2042,6 +3518,441 @@ def build_parser():
     _json_flag(p_doctor)
     _sink_flag(p_doctor)
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_export = sub.add_parser(
+        "export",
+        help="export coordination history and/or tickets as JSON (read-only)",
+        description="Write a JSON document describing this store -- the shared-directory "
+        "coordination history (a versioned, verifiable bundle), the tickets, or both. "
+        "Read-only: it never creates the store, the .arbite directory or the coordination "
+        "layout, and a store with no coordination state exports a well-formed empty bundle. "
+        "With --out the document is written atomically; without it the document is printed "
+        "to stdout. --json prints a status payload (counts, cursor namespace, "
+        "retained_history, out path) instead of the document.",
+    )
+    p_export.add_argument(
+        "--scope",
+        choices=("coordination", "tickets", "all"),
+        default="coordination",
+        help="what to export: 'coordination' (default) is the shared-directory history "
+        "bundle, 'tickets' the ticket store, 'all' both",
+    )
+    p_export.add_argument(
+        "--out",
+        metavar="FILE",
+        default=None,
+        help="write the document to FILE atomically instead of printing it to stdout",
+    )
+    p_export.add_argument(
+        "--workspace",
+        metavar="ID",
+        default=None,
+        help="restrict the coordination export to one workspace id (default: all)",
+    )
+    p_export.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="record artifact metadata but omit the artifact bytes (marked data_omitted)",
+    )
+    _json_flag(p_export)
+    _sink_flag(p_export)
+    p_export.set_defaults(func=cmd_export)
+
+    p_rebind = sub.add_parser(
+        "rebind",
+        help="switch this project's authoritative coordination store",
+        description="Explicitly change which store a workspace coordinates against, then "
+        "make it the project default. Verifies first, writing nothing until every check "
+        "passes: the currently bound store must be quiescent (no active attempt or file "
+        "claim), the destination must expose a coordination store, its contract version "
+        "must match, and when it is already initialised its coordination doctor must find "
+        "no problems. --dry-run runs every check and reports what would change. There is no "
+        "daemon, retry or automatic takeover.",
+    )
+    p_rebind.add_argument(
+        "--to",
+        dest="to",
+        default=None,
+        choices=SINK_KINDS,
+        metavar="KIND",
+        help=f"the sink kind to bind this workspace to (required): {', '.join(SINK_KINDS)}",
+    )
+    p_rebind.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run every verification and report what would change, writing nothing",
+    )
+    _json_flag(p_rebind)
+    _sink_flag(p_rebind)
+    p_rebind.set_defaults(func=cmd_rebind)
+
+    p_file = sub.add_parser(
+        "file",
+        help="discover, read, claim, write, edit, remove or rename workspace files",
+        description="The shared-directory file surface. list/search are bounded "
+        "discovery (deterministic ordering, explicit pagination/truncation markers, "
+        "no write authority). read serves a file or line range and records a read "
+        "observation; a read takes no lock and never acquires ownership, and a file "
+        "held by another attempt is still served with an explicit busy owner and a "
+        "non-writable receipt (--fail-if-busy refuses instead). probe inspects an "
+        "absent path for a safe create. claim is exclusive whole-file writer "
+        "ownership keyed by a canonical workspace path, acquired all-or-nothing; "
+        "arbite never waits for or steals a claim, and release revokes one file "
+        "token while retaining the work attempt. write replaces a whole file (or "
+        "creates one from an absent-path claim) with version-checked, journalled "
+        "bytes and requires a fresh --read-token for a replacement; edit applies an "
+        "exact old/new batch once, all-or-nothing; remove deletes one file through "
+        "the journal with a fresh --read-token (a directory is refused: there is no "
+        "recursive deletion in v1); rename moves SOURCE to DEST owning BOTH paths "
+        "(the destination must be absent or its version stated with --dest-expected) "
+        "and creates missing in-root parent directories safely. See "
+        ".arbite/planning/shared-directory-coordination.md.",
+    )
+    file_sub = p_file.add_subparsers(dest="file_command", required=True)
+
+    p_file_claim = file_sub.add_parser(
+        "claim",
+        help="claim one or more workspace paths exclusively for a ticket attempt",
+        description="Claim every PATH for the given ticket/attempt, all-or-nothing. On "
+        "contention this returns file_busy with the holder's ticket and attempt; "
+        "arbite never waits for or steals a claim. Re-claiming a path this attempt "
+        "already holds is idempotent, and a not-yet-existing path is a valid creation/"
+        "rename destination claim whose recorded version is ABSENT.",
+    )
+    p_file_claim.add_argument(
+        "paths", nargs="+", metavar="PATH", help="workspace-relative path(s) to claim"
+    )
+    p_file_claim.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_claim.add_argument(
+        "--attempt", required=True, metavar="A", help="active work attempt id"
+    )
+    _json_flag(p_file_claim)
+    _sink_flag(p_file_claim)
+    p_file_claim.set_defaults(func=cmd_file_claim)
+
+    p_file_release = file_sub.add_parser(
+        "release",
+        help="release this attempt's exclusive claims on one or more paths",
+        description="Release the active claims PATH for the given ticket/attempt, "
+        "all-or-nothing. The work attempt is retained; only the file token is revoked, "
+        "so later re-acquisition mints a new generation and requires a fresh read. A "
+        "reason is required and recorded with the release event.",
+    )
+    p_file_release.add_argument(
+        "paths", nargs="+", metavar="PATH", help="workspace-relative path(s) to release"
+    )
+    p_file_release.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_release.add_argument(
+        "--attempt", required=True, metavar="A", help="active work attempt id"
+    )
+    p_file_release.add_argument(
+        "--reason",
+        required=True,
+        metavar="TEXT",
+        help="why the claim is being released (recorded with the release event)",
+    )
+    _json_flag(p_file_release)
+    _sink_flag(p_file_release)
+    p_file_release.set_defaults(func=cmd_file_release)
+
+    p_file_list = file_sub.add_parser(
+        "list",
+        help="list workspace entries under PATH (bounded, deterministic)",
+        description="Enumerate entries under PATH (default: the workspace root) in "
+        "canonical-path order. Output is bounded (--limit, hard cap 2000) with "
+        "--offset paging; protected arbite/.git metadata and symlinks are excluded "
+        "and counted, and the result says so in its markers. Listing is read-only: "
+        "it authorizes no mutation.",
+    )
+    p_file_list.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help="workspace-relative directory (or file) to enumerate (default: the root)",
+    )
+    p_file_list.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="maximum entries to return"
+    )
+    p_file_list.add_argument(
+        "--offset", type=int, default=None, metavar="N", help="entries to skip (paging)"
+    )
+    _json_flag(p_file_list)
+    _sink_flag(p_file_list)
+    p_file_list.set_defaults(func=cmd_file_list)
+
+    p_file_search = file_sub.add_parser(
+        "search",
+        help="search workspace paths and text lines for PATTERN (bounded)",
+        description="Regular-expression text/path discovery under PATH (default: the "
+        "workspace root). A file matches when its path matches or when any decoded "
+        "line matches; binary, non-UTF-8 and oversized files are reported as skipped "
+        "with a reason, never silently omitted. Output is bounded (--limit, hard cap "
+        "500) with --offset paging and explicit truncation markers. Search is "
+        "discovery only: no import tracing, and no write authority.",
+    )
+    p_file_search.add_argument("pattern", metavar="PATTERN", help="regular expression to find")
+    p_file_search.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help="workspace-relative directory to search under (default: the root)",
+    )
+    p_file_search.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="maximum matches to return"
+    )
+    p_file_search.add_argument(
+        "--offset", type=int, default=None, metavar="N", help="matches to skip (paging)"
+    )
+    _json_flag(p_file_search)
+    _sink_flag(p_file_search)
+    p_file_search.set_defaults(func=cmd_file_search)
+
+    p_file_read = file_sub.add_parser(
+        "read",
+        help="serve PATH (or a line range) with a versioned, write-aware receipt",
+        description="Read PATH through the canonical pipeline and record a read "
+        "observation. The whole-file digest is always recorded, even for --lines. A "
+        "read takes no lock and acquires no ownership. Reading a file another attempt "
+        "has claimed still returns the bytes, but with an explicit busy owner and a "
+        "NON-writable receipt; --fail-if-busy refuses instead so no tokens are spent "
+        "on bytes that cannot be written. A write requires a FRESH read after claiming, "
+        "by this same attempt: the returned read_token is that evidence.",
+    )
+    p_file_read.add_argument("path", metavar="PATH", help="workspace-relative file to read")
+    p_file_read.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_read.add_argument(
+        "--attempt", required=True, metavar="A", help="work attempt id the read is for"
+    )
+    p_file_read.add_argument(
+        "--lines",
+        type=_line_range_arg,
+        default=None,
+        metavar="START:END",
+        help="1-based inclusive line range to return (whole-file digest still recorded)",
+    )
+    p_file_read.add_argument(
+        "--fail-if-busy",
+        action="store_true",
+        help="refuse with file_busy (naming the holder) instead of serving bytes from a "
+        "file claimed by another attempt",
+    )
+    _json_flag(p_file_read)
+    _sink_flag(p_file_read)
+    p_file_read.set_defaults(func=cmd_file_read)
+
+    p_file_probe = file_sub.add_parser(
+        "probe",
+        help="inspect PATH for a safe create (absent-path probe)",
+        description="Inspect PATH through the canonical pipeline and report whether it "
+        "is safe to create. A probe records no observation and acquires no ownership: "
+        "a safe create still needs the absent path claimed (observed_version ABSENT) "
+        "before a whole-file write.",
+    )
+    p_file_probe.add_argument("path", metavar="PATH", help="workspace-relative path to probe")
+    p_file_probe.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_probe.add_argument(
+        "--attempt", required=True, metavar="A", help="work attempt id the probe is for"
+    )
+    _json_flag(p_file_probe)
+    _sink_flag(p_file_probe)
+    p_file_probe.set_defaults(func=cmd_file_probe)
+
+    p_file_write = file_sub.add_parser(
+        "write",
+        help="create or replace PATH with a version-checked whole-file payload",
+        description="Replace PATH (or create it from an absent-path claim) with the "
+        "bytes in --input (a file, or '-' for stdin). Replacing an existing file "
+        "REQUIRES --read-token: a read recorded by this attempt after it claimed "
+        "the path. The token's digest, the claim generation and the file's current "
+        "digest are all re-checked inside the operation lock, so a stale or "
+        "mismatched token changes no bytes and returns stale_read; two writes using "
+        "one token cannot both succeed. Creation needs an absent-path claim "
+        "(observed_version ABSENT) and takes no read token. Bytes are recorded as "
+        "content-addressed before/after evidence, an existing file's supported "
+        "permissions are preserved, and a successful write invalidates the old read "
+        "token -- read the file again before the next mutation.",
+    )
+    p_file_write.add_argument("path", metavar="PATH", help="workspace-relative file to write")
+    p_file_write.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_write.add_argument(
+        "--attempt", required=True, metavar="A", help="active work attempt id"
+    )
+    p_file_write.add_argument(
+        "--read-token",
+        default=None,
+        metavar="R",
+        help="read observation authorizing a replacement (required for an existing "
+        "file; omit it to create an absent path)",
+    )
+    p_file_write.add_argument(
+        "--input",
+        required=True,
+        metavar="CONTENT_FILE",
+        help="file holding the whole payload bytes, or '-' to read stdin",
+    )
+    _json_flag(p_file_write)
+    _sink_flag(p_file_write)
+    p_file_write.set_defaults(func=cmd_file_write)
+
+    p_file_edit = file_sub.add_parser(
+        "edit",
+        help="apply an exact old/new edit batch to PATH, all-or-nothing",
+        description="Apply the JSON edit batch in --edits (a file, or '-' for stdin) "
+        "to the existing PATH with the version-checked --read-token this attempt "
+        "recorded after claiming it. Each edit is an object "
+        "{'old': str, 'new': str, 'occurrence': 'unique'|'all'|'first'|'last'|'nth', "
+        "'index': N}; occurrences are matched EXACTLY (no fuzzy/textual approximation, "
+        "no AST edit), 'unique' is the default and requires exactly one match. An "
+        "absent, ambiguous or overlapping selection refuses the WHOLE batch before "
+        "any byte changes: the batch is applied to the validated in-memory version "
+        "and the file is replaced once. Untouched bytes and CRLF/LF newline "
+        "conventions are preserved.",
+    )
+    p_file_edit.add_argument("path", metavar="PATH", help="workspace-relative file to edit")
+    p_file_edit.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_edit.add_argument(
+        "--attempt", required=True, metavar="A", help="active work attempt id"
+    )
+    p_file_edit.add_argument(
+        "--read-token",
+        required=True,
+        metavar="R",
+        help="read observation authorizing this edit (a fresh post-claim read)",
+    )
+    p_file_edit.add_argument(
+        "--edits",
+        required=True,
+        metavar="EDITS_FILE",
+        help="JSON edit batch (list, or object with an 'edits' list), or '-' for stdin",
+    )
+    _json_flag(p_file_edit)
+    _sink_flag(p_file_edit)
+    p_file_edit.set_defaults(func=cmd_file_edit)
+
+    p_file_remove = file_sub.add_parser(
+        "remove",
+        help="delete PATH through the journal, preserving its bytes as evidence",
+        description="Delete PATH with the version-checked --read-token this attempt "
+        "recorded after claiming it; the whole-file digest must still match, so a "
+        "removal races a concurrent writer the same way a replacement write does. "
+        "The deleted bytes are stored content-addressed BEFORE the unlink, so the "
+        "receipt preserves what was deleted (binary bytes included). A directory is "
+        "refused explicitly: arbite v1 has no recursive deletion. A successful "
+        "removal invalidates the read token.",
+    )
+    p_file_remove.add_argument("path", metavar="PATH", help="workspace-relative file to delete")
+    p_file_remove.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_remove.add_argument(
+        "--attempt", required=True, metavar="A", help="active work attempt id"
+    )
+    p_file_remove.add_argument(
+        "--read-token",
+        required=True,
+        metavar="R",
+        help="read observation authorizing this removal (a fresh post-claim read)",
+    )
+    _json_flag(p_file_remove)
+    _sink_flag(p_file_remove)
+    p_file_remove.set_defaults(func=cmd_file_remove)
+
+    p_file_rename = file_sub.add_parser(
+        "rename",
+        help="move SOURCE to DEST, recording both paths and version-checked evidence",
+        description="Move SOURCE to DEST through the journal. The SOURCE needs the "
+        "version-checked --read-token this attempt recorded after claiming it; DEST "
+        "is claimed as part of the call (all-or-nothing, so a DEST held by another "
+        "attempt is file_busy and NEITHER path is touched) and must be absent, or "
+        "its current version must be stated explicitly with --dest-expected to "
+        "authorize replacing it. Missing in-root parent directories of DEST are "
+        "created safely (never through a symlink, never outside the root). The moved "
+        "bytes -- and the bytes an existing DEST had before it was replaced -- are "
+        "stored as evidence, the receipt names BOTH paths and both versions, and a "
+        "rename interrupted between its two paths is completed by recovery rather "
+        "than requiring a shell move.",
+    )
+    p_file_rename.add_argument(
+        "source", metavar="SOURCE", help="workspace-relative file to move"
+    )
+    p_file_rename.add_argument(
+        "destination", metavar="DEST", help="workspace-relative destination path"
+    )
+    p_file_rename.add_argument(
+        "--ticket", required=True, metavar="T", help="ticket id the attempt belongs to"
+    )
+    p_file_rename.add_argument(
+        "--attempt", required=True, metavar="A", help="active work attempt id"
+    )
+    p_file_rename.add_argument(
+        "--read-token",
+        required=True,
+        metavar="R",
+        help="read observation authorizing the move (a fresh post-claim read of SOURCE)",
+    )
+    p_file_rename.add_argument(
+        "--dest-expected",
+        default=None,
+        metavar="VERSION",
+        help="the destination's current whole-file version, required to overwrite an "
+        "existing DEST (omit for an absent destination)",
+    )
+    _json_flag(p_file_rename)
+    _sink_flag(p_file_rename)
+    p_file_rename.set_defaults(func=cmd_file_rename)
+
+    p_changes = sub.add_parser(
+        "changes",
+        help="show a ticket's (or attempt's) recorded change evidence and net changes",
+        description="Read-only, bounded change evidence for T (or for one --attempt). "
+        "Returns MECHANICAL evidence (the ordered file-change operations: write, "
+        "edit, remove, rename -- each with before/after "
+        "digests and artifact references, each artifact marked verifiable only after "
+        "its bytes are read back and hashed) separately from agent-authored ticket "
+        "notes (prose, never used to derive the net change) and from external "
+        "observed/unattributed drift (never assigned to the current agent). The net "
+        "change fold compares the first before-version to the latest after-version per "
+        "path -- so an edit-then-revert reports 'reverted' while every operation stays "
+        "in the ordered history. Output is bounded (--limit, hard cap 2000) with "
+        "--offset paging and an explicit truncation marker. Read observations are a "
+        "separate stream and appear only with --include-reads. No LLM summary is "
+        "required: the mechanical view alone is a file-change manifest.",
+    )
+    p_changes.add_argument("id", metavar="T", help="ticket id to report on")
+    p_changes.add_argument(
+        "--attempt",
+        default=None,
+        metavar="A",
+        help="report one work attempt for the ticket instead of the whole ticket",
+    )
+    p_changes.add_argument(
+        "--include-reads",
+        action="store_true",
+        help="also return the separate read-observation stream (bytes served)",
+    )
+    p_changes.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="maximum operations to return"
+    )
+    p_changes.add_argument(
+        "--offset", type=int, default=None, metavar="N", help="operations to skip (paging)"
+    )
+    _json_flag(p_changes)
+    _sink_flag(p_changes)
+    p_changes.set_defaults(func=cmd_changes)
 
     return parser, dict(sub.choices)
 

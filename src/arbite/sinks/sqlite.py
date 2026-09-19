@@ -41,7 +41,8 @@ from typing import Optional
 from ..errors import Conflict, SinkError, SinkNotInitialised, TicketError, TicketNotFound
 from ..query import TicketQuery, sort_tickets
 from ..schema import FIELD_ORDER, Note, Ticket, parse_notes
-from .base import Expect, Problem, TicketSink, enforce_expect
+from .base import Expect, Problem, TicketSink, enforce_expect, revision_for_insert
+from .coordination_sqlite import SqliteCoordinationStore, ensure_ticket_revision_column
 
 #: Bumped when the DDL changes in a way an existing database cannot satisfy as
 #: it stands. Stored in the database so `doctor` can tell an old store from a
@@ -133,6 +134,14 @@ class SqliteSink(TicketSink):
         # separate processes, so a lock *will* be contended occasionally; waiting
         # briefly is far better than failing a claim that would have succeeded.
         self._timeout = timeout
+        # The coordination tables live in this same database. Constructing the
+        # store touches nothing; `init()` creates the tables and any first use
+        # creates them lazily, so a pre-coordination database just gains them.
+        self._coordination = SqliteCoordinationStore(self._path, timeout=timeout)
+
+    def coordination(self):
+        """This sink's coordination store (see `sinks.coordination_sqlite`)."""
+        return self._coordination
 
     # ------------------------------------------------------------------
     # Lifecycle and connection handling
@@ -157,11 +166,17 @@ class SqliteSink(TicketSink):
                     "SELECT ? WHERE NOT EXISTS (SELECT 1 FROM schema_version)",
                     (SCHEMA_VERSION,),
                 )
+                # The coordination slice adds a nullable revision column rather
+                # than a schema-version bump: an existing v1 database gains it in
+                # place, and `arbite doctor` still sees the version it knows.
+                ensure_ticket_revision_column(conn)
                 conn.commit()
             finally:
                 conn.close()
         except sqlite3.Error as e:
             raise SinkError(f"could not initialise the SQLite sink at {self._path}: {e}")
+        # Coordination storage is part of the same store, created idempotently.
+        self._coordination.init()
 
     def _is_initialised(self, conn) -> bool:
         row = conn.execute(
@@ -197,6 +212,11 @@ class SqliteSink(TicketSink):
                     f"{self._path} is not an arbite database (run 'arbite init')"
                 )
             if write:
+                # A database written before coordination has no revision column;
+                # add it (outside the transaction) so the UPDATE below can always
+                # name it. Idempotent, and cheap enough to re-check per write.
+                ensure_ticket_revision_column(conn)
+                conn.commit()
                 conn.execute("BEGIN IMMEDIATE")
             yield conn
             if write:
@@ -246,7 +266,11 @@ class SqliteSink(TicketSink):
             )
         ]
         values = {name: row[name] for name in STORED_FIELDS}
-        return Ticket(tags=tags, depends_on=deps, **values)
+        # A pre-coordination database has no revision column; the ticket then has
+        # no revision, exactly like a legacy markdown ticket, rather than a
+        # fabricated one.
+        revision = row["revision"] if "revision" in row.keys() else None
+        return Ticket(tags=tags, depends_on=deps, revision=revision, **values)
 
     def _write_children(self, conn, ticket: Ticket) -> None:
         """Rewrite the tag, dependency and note rows for one ticket.
@@ -275,8 +299,9 @@ class SqliteSink(TicketSink):
         )
 
     def _insert_row(self, conn, ticket: Ticket, bucket: Optional[str]) -> None:
-        columns = STORED_FIELDS + ("bucket",)
-        values = [getattr(ticket, name) for name in STORED_FIELDS] + [bucket]
+        ticket.revision = revision_for_insert(ticket.revision)
+        columns = STORED_FIELDS + ("bucket", "revision")
+        values = [getattr(ticket, name) for name in STORED_FIELDS] + [bucket, ticket.revision]
         placeholders = ", ".join("?" for _ in columns)
         try:
             conn.execute(
@@ -329,8 +354,15 @@ class SqliteSink(TicketSink):
             current = self._row_to_ticket(conn, row)
             # The expectation is checked inside the same transaction that writes,
             # which is what makes this a compare-and-swap rather than a race with
-            # a check in front of it.
+            # a check in front of it. `Expect(revision=N)` is enforced here too,
+            # against the row's own revision, so a concurrent edit to an unrelated
+            # field cannot be lost unnoticed.
             enforce_expect(current, expect)
+
+            # Every successful update bumps the stored revision; a caller that
+            # passed no revision expectation still cannot be surprised by a
+            # revision-less record afterwards.
+            ticket.revision = (current.revision or 0) + 1
 
             # A status change returns the ticket to the status workflow, which for
             # a file sink means its file moves into the status folder. Clearing the
@@ -339,8 +371,9 @@ class SqliteSink(TicketSink):
 
             assignments = ", ".join(f"{name} = ?" for name in STORED_FIELDS)
             conn.execute(
-                f"UPDATE tickets SET {assignments}, bucket = ? WHERE id = ?",
-                [getattr(ticket, name) for name in STORED_FIELDS] + [bucket, ticket.id],
+                f"UPDATE tickets SET {assignments}, bucket = ?, revision = ? WHERE id = ?",
+                [getattr(ticket, name) for name in STORED_FIELDS]
+                + [bucket, ticket.revision, ticket.id],
             )
             self._write_children(conn, ticket)
         return ticket

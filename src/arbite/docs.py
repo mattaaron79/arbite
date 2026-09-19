@@ -98,6 +98,19 @@ Use arbite ticketing system for all tasks. See /.arbite/AGENTS.md. Create a tick
 When claiming a ticket, please use an identity format like: "claude.opus-5.001" where the company.model.instance is your best educated guess unless otherwise specified.
 If orchestrating, let subagents know their identity and instance number.
 
+## Shared directory: use arbite for file work
+Read, claim and mutate source files through arbite -- not a shell or editor -- so a competing agent cannot silently overwrite your work:
+```bash
+arbite file list [PATH] --json                        # discover
+arbite file search PATTERN [PATH] --json             # discover
+arbite file claim PATH --ticket T --attempt A        # own the whole file
+arbite file read  PATH --ticket T --attempt A --json # RE-READ; a pre-claim read does not authorize a write
+arbite file write|edit|remove|rename ... --read-token R
+```
+Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a stale or consumed token is refused with `stale_read` and no bytes change.
+Every `arbite file` command needs your active `--attempt` id; get it from `arbite export --scope coordination --no-artifacts` (the `work_attempts` entry with your ticket_id and `state: active`).
+There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: arbite records proxy mutations only, so a generated file written into the source tree is unattributed drift. Mutation evidence and artifacts accumulate and are never garbage-collected. Arbite enforces its own operations and reports observed drift, but it cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
+
 ## Sole command: "Work Next|All <epic>"
 
 If your sole command is "Work Next" or "Work All", you can use the following commands to find the next arbite ticket(s):
@@ -541,11 +554,68 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("arbite reopen tic-a1b2                                  # if it turns out not to be done")
     add("arbite sink info                                        # where do tickets live, and in what")
     add("arbite migrate --to sqlite                              # copy every ticket into another sink")
+    add("")
+    add("arbite file list --json                                 # discover workspace files (no lock)")
+    add("arbite file claim src/app.py --ticket tic-a1b2 --attempt att-...   # own the whole file")
+    add("arbite file read  src/app.py --ticket tic-a1b2 --attempt att-... --json  # re-read -> token")
+    add("arbite file write src/app.py --ticket tic-a1b2 --attempt att-... --read-token R --input p.txt")
+    add("arbite changes tic-a1b2 --json                          # what changed, and is it verifiable")
     add("```")
     add("")
     add(
         "`arbite bug|feature|request|memo|wish <message>` == `arbite raw <type> <message>`: an "
         "identical raw ticket from a shorter command. Any command takes `-h`/`--help`."
+    )
+    add("")
+
+    # -- Shared directory --------------------------------------------------
+    add("## Shared directory: the file proxy")
+    add("")
+    add(
+        "When more than one agent (or an agent and a human) works in this checkout, do source "
+        "discovery, reads and mutations through arbite instead of shell/editor writes: "
+        "`arbite file list|search` to discover, `arbite file read PATH --ticket T --attempt A` to "
+        "read, `arbite file claim PATH... --ticket T --attempt A` to own a whole file, then read "
+        "again -- bytes read *before* you held the claim do not authorize a write -- and mutate "
+        "with `arbite file write|edit|remove|rename`. Re-read after every claim, takeover and "
+        "ticket boundary, and before each mutation: a stale or already-consumed token is refused "
+        "with `stale_read` and no bytes change. Reading a file another attempt holds still returns "
+        "the bytes, but with a `busy` owner and a non-writable receipt (`--fail-if-busy` refuses "
+        "instead); claiming refused work returns structured `file_busy` naming the holder, and "
+        "arbite never waits for or steals a claim. Shell is still fine for tests and builds."
+    )
+    add("")
+    add(
+        "Every `arbite file` command needs your active `--attempt` id. Get it from "
+        "`arbite export --scope coordination --no-artifacts`: its `records.work_attempts` lists one "
+        "entry per attempt -- take the one whose `ticket_id` is yours and whose `state` is "
+        "`active`."
+    )
+    add("")
+    add(
+        "`arbite changes T [--attempt A] [--include-reads] --json` is the evidence view, and keeps "
+        "them apart: mechanical operations (ordered receipts with before/after digests and "
+        "verifiable artifact references), agent-authored ticket notes (prose, never used to derive "
+        "the net change), and observed/unattributed drift (never assigned to the current agent). "
+        "Claiming a ticket records a work attempt; `close`, `release`, `block` and `shelve` end it "
+        "and release its file claims, while `reopen`/`unblock` mint a fresh attempt, so an old "
+        "token is dead. `claim --force --reason <why>` is an explicit administrative takeover, "
+        "never an inference from timestamps."
+    )
+    add("")
+    add(
+        "Arbite starts no runner, daemon, watcher or scheduler and never takes over stale work "
+        "automatically: agents are started manually and may use different providers. A build, "
+        "formatter or code generator that writes into managed source paths is unattributed drift "
+        "-- keep such output in an ignored or out-of-tree directory. Mutation evidence and "
+        "artifacts accumulate and are never garbage-collected yet, so budget disk and keep or "
+        "export history deliberately. Finally, arbite enforces its own operations and reports "
+        "observed drift, but a shell or editor can still write to the same directory and arbite "
+        "cannot prove who made a direct filesystem change: runtime restriction is the caller's job, "
+        "not a property of the store. When a file changes outside the proxy, a later read of it is "
+        "non-writable (`claim_version_mismatch`) and an old token is refused (`stale_read`); the way "
+        "forward is to `arbite file release` the path and `arbite file claim` it again, then read "
+        "and write."
     )
     add("")
 

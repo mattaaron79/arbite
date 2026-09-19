@@ -19,6 +19,8 @@ from typing import Optional
 from ..errors import TicketError
 from .base import (  # noqa: F401  (re-exported: the public face of a sink)
     UNSET,
+    CoordinationStore,
+    CoordinationTransaction,
     Expect,
     Problem,
     SinkInfo,
@@ -28,15 +30,41 @@ from .base import (  # noqa: F401  (re-exported: the public face of a sink)
     filter_tickets,
 )
 from .file import CLOSED_DIR, FLAT_STATUS_DIRS, FileSink
-from .sqlite import SCHEMA_VERSION, SqliteSink
 
 #: The sink used when nothing selects one. Files stay the default because the
 #: project's stated value is a clone-and-go ticket store that git can version.
 DEFAULT_SINK_KIND = "file"
 
-SINK_CLASSES = {"file": FileSink, "sqlite": SqliteSink}
+#: Every sink kind, by name. Deliberately a plain tuple rather than the keys of a
+#: class mapping, because the mapping has to be built lazily: importing the
+#: SQLite sink imports `sqlite3`, and a project on the file sink must not need a
+#: database module at all -- which is also what lets the file sink's coordination
+#: layer prove it does not secretly require SQLite.
+SINK_KINDS = ("file", "sqlite")
 
-SINK_KINDS = tuple(SINK_CLASSES)
+
+def sink_classes() -> dict:
+    """`{kind: sink class}`. Imports the SQLite sink on first use, not on import."""
+    from .sqlite import SqliteSink
+
+    return {"file": FileSink, "sqlite": SqliteSink}
+
+
+def __getattr__(name):
+    """Lazy module attributes kept for compatibility (`SINK_CLASSES`,
+    `SqliteSink`, `SCHEMA_VERSION`) without importing `sqlite3` until one is
+    actually used."""
+    if name == "SINK_CLASSES":
+        return sink_classes()
+    if name == "SqliteSink":
+        from .sqlite import SqliteSink
+
+        return SqliteSink
+    if name == "SCHEMA_VERSION":
+        from .sqlite import SCHEMA_VERSION
+
+        return SCHEMA_VERSION
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 #: Filename for the SQLite sink inside the arbite directory.
 SQLITE_FILENAME = "arbite.db"
@@ -61,13 +89,15 @@ def build_sink(spec: SinkSpec, arbite_dir: Path) -> TicketSink:
     defaults its location to, so a project has exactly one place that says "the
     tickets for this repo live around here"."""
     kind = (spec.kind or DEFAULT_SINK_KIND).strip().lower()
-    if kind not in SINK_CLASSES:
+    if kind not in SINK_KINDS:
         raise TicketError(
             f"unknown sink '{spec.kind}' (valid: {', '.join(SINK_KINDS)})"
         )
     if kind == "file":
         root = Path(spec.root) if spec.root else arbite_dir
         return FileSink(root)
+    from .sqlite import SqliteSink
+
     path = Path(spec.root) if spec.root else arbite_dir / SQLITE_FILENAME
     return SqliteSink(path, **spec.options)
 

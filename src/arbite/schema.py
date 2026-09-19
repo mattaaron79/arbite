@@ -251,6 +251,15 @@ class Ticket:
     updated: str = ""
     closed: Optional[str] = None
     body: str = ""
+    #: Optional store-local revision, deliberately NOT a frontmatter *field*: it
+    #: is kept out of `FIELD_ORDER`, out of `SETTABLE_PROPERTIES` and out of
+    #: `to_dict()`, so `arbite set`, search, docs and `show --json` are unchanged.
+    #: A sink bumps it on every successful `insert`/`update` so two readers that
+    #: edit *different* fields can detect each other's write (a status/assignee CAS
+    #: token cannot see that). `None` means "this store has no revision yet",
+    #: which is how a legacy ticket written before revisions round-trips
+    #: byte-identically.
+    revision: Optional[int] = None
 
     def priority_sort_key(self) -> float:
         """Sort key for urgency: lower number = more urgent. Unset (None)
@@ -275,10 +284,16 @@ class Ticket:
     def to_markdown(self) -> str:
         """The ticket's canonical text form. Identical across sinks: the file
         sink writes exactly this to disk, and `arbite show` prints exactly this
-        regardless of where the ticket is stored."""
+        regardless of where the ticket is stored.
+
+        A `revision:` line is appended only when `revision` is set, so a ticket
+        written before revisions existed -- or rendered with `revision=None` --
+        still round-trips byte-for-byte."""
         data = {}
         for name in FIELD_ORDER:
             data[name] = getattr(self, name)
+        if self.revision is not None:
+            data["revision"] = int(self.revision)
         front = yaml.safe_dump(data, sort_keys=False, default_flow_style=False, allow_unicode=True)
         return f"---\n{front}---\n\n{self.body.strip()}\n"
 
@@ -308,6 +323,15 @@ def parse_ticket(text: str) -> Ticket:
     for k in ("tags", "depends_on"):
         if kwargs.get(k) is None:
             kwargs[k] = []
+    # A hand-edited or non-integer `revision` is treated as "absent" rather than
+    # as corruption: the revision is store bookkeeping, and a ticket whose
+    # frontmatter says `revision: wibble` must still be readable.
+    if "revision" in kwargs and (
+        isinstance(kwargs["revision"], bool) or not isinstance(kwargs["revision"], int)
+    ):
+        kwargs.pop("revision", None)
+    if kwargs.get("revision") is not None and kwargs["revision"] < 1:
+        kwargs.pop("revision", None)
     try:
         return Ticket(body=body, **kwargs)
     except TypeError as e:

@@ -8,11 +8,18 @@ archive in the wrong month).
 
 from __future__ import annotations
 
+import multiprocessing
+import os
+from pathlib import Path
+
 import pytest
 
+from arbite import coordination as coord
+from arbite.coordination_storage import CRASH_AFTER_JOURNAL
 from arbite.errors import Conflict, TicketNotFound
 from arbite.query import TicketQuery
 from arbite.schema import parse_ticket
+from arbite.sinks.coordination_file import FileCoordinationStore
 from arbite.sinks.file import TMP_PREFIX, FileSink, write_atomic
 from helpers import make_ticket
 
@@ -247,3 +254,122 @@ def test_details_describe_the_layout(file_sink, arbite_dir):
     assert details["closed_dir"] == "closed"
     assert "in_progress" in details["status_dirs"]
     assert details["buckets"] == ["wishlist"]
+
+
+# ---------------------------------------------------------------------------
+# coordination-store integrity inspection (C11)
+# ---------------------------------------------------------------------------
+#
+# The write-ahead journal and the derived per-operation event index are the two
+# pieces of state only this sink has, so the crash-injection and index-repair
+# tests belong here rather than in the both-sink conformance suite. They use the
+# documented `crash_point` hook and the existing crash-injection style (a spawned
+# process that exits at a commit boundary), so the leftover state under test is
+# the real thing, not a hand-rolled approximation.
+
+OPERATION_ID = "op-0123456789abcdef"
+
+
+def _a_claim(claim_id: str):
+    now = coord.utc_now()
+    return coord.FileClaim(
+        id=claim_id,
+        workspace_id="ws-0000000000000000",
+        path="src/a.py",
+        ticket_id="tic-a1b2",
+        attempt_id=coord.new_record_id("work_attempt"),
+        generation=1,
+        acquired=now,
+        observed_version=coord.digest_of_text("alpha"),
+    )
+
+
+def _an_event_with_operation(operation_id: str):
+    return coord.Event(
+        id=coord.new_record_id("event"),
+        kind_="operation_recorded",
+        category="operation",
+        timestamp=coord.utc_now(),
+        operation_id=operation_id,
+    )
+
+
+def _crash_with_a_leftover_journal(root: str, claim_id: str) -> None:
+    """Write a journal with the documented hook, then die before applying it."""
+    store = FileCoordinationStore(Path(root), crash_point=CRASH_AFTER_JOURNAL)
+    with store.transaction() as tx:
+        tx.put(_a_claim(claim_id))
+    os._exit(0)  # pragma: no cover - the crash point exits first
+
+
+def test_pending_journals_names_a_crash_leftover_and_replay_applies_it(arbite_dir):
+    coordination_dir = arbite_dir / "coordination"
+    claim_id = coord.new_record_id("file_claim")
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_crash_with_a_leftover_journal, args=(str(coordination_dir), claim_id)
+    )
+    process.start()
+    process.join(60)
+    assert process.exitcode == 97
+
+    store = FileCoordinationStore(coordination_dir)
+
+    # Inspection names the leftover intent without replaying it.
+    pending = store.pending_journals()
+    assert len(pending) == 1
+    assert pending[0].startswith("txn-")
+
+    # The explicit replay applies it forward; the journal is gone afterwards.
+    replayed = store.replay_journals()
+    assert replayed == pending
+    assert store.pending_journals() == []
+
+    with store.transaction(write=False) as tx:
+        stored = tx.get("file_claim", claim_id)
+    assert stored is not None and stored.path == "src/a.py"
+
+
+def test_replay_journals_reports_but_preserves_an_undecodable_journal(arbite_dir):
+    """An undecodable journal is preserved, never guessed at. Replay returns its
+    operation id because it was *present*, and it stays pending afterwards -- that
+    is how a caller tells "encountered" from "applied"."""
+    coordination_dir = arbite_dir / "coordination"
+    journal_dir = coordination_dir / "journal"
+    journal_dir.mkdir(parents=True)
+    bad = journal_dir / "txn-undecodable.json"
+    bad.write_text("this is not a journal\n", encoding="utf-8")
+
+    store = FileCoordinationStore(coordination_dir)
+    assert store.pending_journals() == ["txn-undecodable"]
+
+    assert store.replay_journals() == ["txn-undecodable"]
+    assert store.pending_journals() == ["txn-undecodable"]
+    assert bad.exists()
+
+
+def test_missing_event_operation_index_is_reported_and_rebuilt(file_sink, arbite_dir):
+    store = file_sink.coordination()
+    with store.transaction() as tx:
+        event = tx.append_event(_an_event_with_operation(OPERATION_ID))
+
+    index_path = (
+        arbite_dir / "coordination" / "events_by_operation" / f"{OPERATION_ID}.json"
+    )
+    assert index_path.exists(), "the real append path must have written the index"
+
+    # Losing the DERIVED index is reported, and rebuilt from the stored event.
+    index_path.unlink()
+    assert store.missing_event_operation_indexes() == [OPERATION_ID]
+    assert store.rebuild_event_operation_index(OPERATION_ID) is True
+    assert index_path.exists()
+    assert store.missing_event_operation_indexes() == []
+    assert store.rebuild_event_operation_index(OPERATION_ID) is False  # already there
+
+    # The retry-dedup path works again: a fresh event for the same operation id
+    # resolves to the original instead of appending a second one.
+    with store.transaction() as tx:
+        replayed = tx.append_event(_an_event_with_operation(OPERATION_ID))
+    assert replayed.id == event.id
+    assert replayed.cursor == event.cursor
+    assert [e.id for e in store.event_log()] == [event.id]

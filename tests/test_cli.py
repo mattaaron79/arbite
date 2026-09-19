@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from arbite import config
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
@@ -379,7 +381,10 @@ def test_the_lifecycle_behaves_the_same_in_every_sink(cli, tmp_project, sink_kin
     cli("claim", tid, "--agent", "claude.haiku.001", sink=sink_kind)
     assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["status"] == "in_progress"
     cli("note", tid, "claude.haiku.001", "found it", sink=sink_kind)
-    cli("block", tid, "--reason", "waiting on upstream", sink=sink_kind)
+    # C03: block now acts on the ticket's live work attempt, so it must be the
+    # attempt's own worker doing it (or an explicit --force --reason revocation).
+    # The lifecycle command therefore carries the same --agent as the claim.
+    cli("block", tid, "--agent", "claude.haiku.001", "--reason", "waiting on upstream", sink=sink_kind)
     cli("unblock", tid, "--agent", "claude.haiku.001", sink=sink_kind)
     cli("release", tid, "--agent", "claude.haiku.001", "--reason", "wrong tier", sink=sink_kind)
     cli("shelve", tid, "--reason", "later", sink=sink_kind)
@@ -410,10 +415,18 @@ def test_list_next_claims_in_one_step_and_reports_a_dry_queue(project, cli):
 
 
 def test_claim_refuses_another_agents_ticket_unless_forced(project, cli):
+    """C03 supersession: a forced claim of a ticket with a live work attempt is a
+    *takeover*, and an administrative takeover requires an explicit reason. The
+    old test's bare `--force` is therefore refused; `--force --reason` still
+    succeeds and records the takeover on the ticket."""
     tid = create(cli, "contested")
     cli("claim", tid, "--agent", "claude.haiku.001")
     cli("claim", tid, "--agent", "claude.opus.001", expect=1)
-    cli("claim", tid, "--agent", "claude.opus.001", "--force")
+    # Forced without a reason: refused (administrative overrides retain history).
+    cli("claim", tid, "--agent", "claude.opus.001", "--force", expect=1)
+    assert json.loads(cli("show", tid, "--json").stdout)["assignee"] == "claude.haiku.001"
+    # Forced with a reason: an explicit takeover that interrupts the old attempt.
+    cli("claim", tid, "--agent", "claude.opus.001", "--force", "--reason", "haiku stalled")
     payload = json.loads(cli("show", tid, "--json").stdout)
     assert payload["assignee"] == "claude.opus.001"
     assert "Claim taken over from claude.haiku.001" in payload["body"]
@@ -620,3 +633,722 @@ def test_migrate_prune_dry_run_reports_what_it_would_refuse(project, cli):
     assert "would NOT prune" in out
     assert "--overwrite" in out
     assert (project / ".arbite" / "open" / f"{tid}.md").exists()
+
+
+# --- C03: ticket acquisition and lifecycle policy --------------------------
+
+
+def _legacy_in_progress(cli, sink_kind, assignee="claude.old.001"):
+    """An in_progress ticket with *no* attempt record, as a pre-C03 arbite left it.
+
+    Built with `set status`, which is allowed here precisely because there is no
+    attempt: ownership-bearing fields are only refused while an attempt is live.
+    """
+    tid = create(cli, "legacy in progress", priority=1, sink=sink_kind)
+    cli("set", tid, "status", "in_progress", "assignee", assignee, sink=sink_kind)
+    return tid
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_claim_adopt_takes_over_a_legacy_in_progress_ticket(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    tid = _legacy_in_progress(cli, sink_kind)
+
+    # A normal claim refuses it: adoption is never implicit, and the refusal
+    # names the recovery paths (--adopt / --force --reason).
+    proc = cli("claim", tid, "--agent", "claude.new.001", sink=sink_kind, expect=1)
+    assert "no attempt record" in proc.stderr and "--adopt" in proc.stderr
+
+    cli("claim", tid, "--agent", "claude.new.001", "--adopt", sink=sink_kind)
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["status"] == "in_progress"
+    assert payload["assignee"] == "claude.new.001"
+
+    # Now that an attempt exists, adopting again is refused (use takeover).
+    cli("claim", tid, "--agent", "claude.new.001", "--adopt", sink=sink_kind, expect=1)
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_ownership_is_enforced_and_force_needs_a_reason(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    tid = create(cli, "owned", priority=1, sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.haiku.001", sink=sink_kind)
+
+    # Another agent cannot release the ticket...
+    proc = cli("release", tid, "--agent", "claude.opus.001", sink=sink_kind, expect=1)
+    assert "claude.haiku.001" in proc.stderr
+    # ... and --force without a reason is refused (overrides retain history).
+    proc = cli("release", tid, "--agent", "claude.opus.001", "--force", sink=sink_kind, expect=1)
+    assert "--reason" in proc.stderr
+    # With a reason it is an explicit administrative revocation.
+    cli(
+        "release",
+        tid,
+        "--agent",
+        "claude.opus.001",
+        "--force",
+        "--reason",
+        "owner is gone",
+        sink=sink_kind,
+    )
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["status"] == "open"
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_set_cannot_change_status_or_assignee_while_an_attempt_is_active(
+    cli, tmp_project, sink_kind
+):
+    cli("init", sink=sink_kind)
+    tid = create(cli, "held", priority=1, sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.haiku.001", sink=sink_kind)
+
+    proc = cli("set", tid, "status", "closed", sink=sink_kind, expect=1)
+    assert "arbite close" in proc.stderr
+    proc = cli("set", tid, "assignee", "claude.opus.001", sink=sink_kind, expect=1)
+    assert "assignee" in proc.stderr
+
+    # Other field edits stay allowed while the attempt is active...
+    cli("set", tid, "title", "renamed while working", sink=sink_kind)
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["title"] == "renamed while working"
+    assert payload["status"] == "in_progress"
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_list_next_claim_still_batches_and_reports_a_dry_queue(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    first = create(cli, "one", priority=1, sink=sink_kind)
+    second = create(cli, "two", priority=2, sink=sink_kind)
+    claimed = [
+        t["id"]
+        for t in json.loads(
+            cli(
+                "list", "next", "--count", "2", "--claim", "claude.haiku.001",
+                "--json", sink=sink_kind,
+            ).stdout
+        )
+    ]
+    assert claimed == [first, second]
+    assert json.loads(
+        cli("list", "next", "--claim", "claude.haiku.001", "--json", sink=sink_kind, expect=2).stdout
+    ) == []
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_claim_refuses_an_unready_ticket(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    blocker = create(cli, "blocker", priority=1, sink=sink_kind)
+    dependent = create(cli, "dependent", priority=1, sink=sink_kind)
+    cli("depend", dependent, blocker, sink=sink_kind)
+
+    proc = cli("claim", dependent, "--agent", "claude.haiku.001", sink=sink_kind, expect=1)
+    assert "unmet dependencies" in proc.stderr
+    assert blocker in proc.stderr
+
+
+def test_claim_refuses_a_raw_placeholder_ticket(project, cli):
+    tid = ticket_id(cli("raw", "bug", "something is broken").stdout)
+    proc = cli("claim", tid, "--agent", "claude.haiku.001", expect=1)
+    assert "not 'open'" in proc.stderr
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_reopen_notes_dependents_that_lost_workability(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    blocker = create(cli, "blocker", priority=1, sink=sink_kind)
+    dependent = create(cli, "dependent", priority=1, sink=sink_kind)
+    cli("depend", dependent, blocker, sink=sink_kind)
+    cli("close", blocker, sink=sink_kind)
+
+    proc = cli("reopen", blocker, sink=sink_kind)
+    assert dependent in proc.stderr  # named as no-longer-workable
+
+    # The dependent is untouched by the reopen: no silent status rewrite.
+    payload = json.loads(cli("show", dependent, "--json", sink=sink_kind).stdout)
+    assert payload["status"] == "open"
+    assert payload["assignee"] is None
+
+
+# --- file ownership surface (shared-directory coordination, C04) -----------
+
+
+def active_attempt_id(project: Path, sink_kind: str, ticket: str) -> str:
+    """The active work attempt recorded for `ticket`, read through the real sink."""
+    sink = config.open_sink(sink_kind, project)
+    with sink.coordination().transaction(write=False) as tx:
+        attempts = [
+            attempt
+            for attempt in tx.find("work_attempt", ticket_id=ticket)
+            if attempt.is_active
+        ]
+    assert len(attempts) == 1
+    return attempts[0].id
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_file_claim_and_release_surface(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    tid = create(cli, "File work", sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.opus.001", sink=sink_kind)
+    attempt = active_attempt_id(tmp_project, sink_kind, tid)
+
+    (tmp_project / "src").mkdir()
+    (tmp_project / "src" / "a.py").write_text("alpha\n")
+
+    claimed = json.loads(
+        cli(
+            "file", "claim", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--json", sink=sink_kind,
+        ).stdout
+    )
+    assert claimed["ok"] is True
+    assert claimed["data"]["claimed"][0]["path"] == "src/a.py"
+    assert claimed["data"]["claimed"][0]["generation"] == 1
+    assert claimed["data"]["claimed"][0]["observed_version"].startswith("sha256:")
+
+    # A second attempt cannot take the same path: file_busy, with the holder named.
+    other = create(cli, "Other work", sink=sink_kind)
+    cli("claim", other, "--agent", "claude.haiku.001", sink=sink_kind)
+    other_attempt = active_attempt_id(tmp_project, sink_kind, other)
+    busy = json.loads(
+        cli(
+            "file", "claim", "src/a.py", "--ticket", other, "--attempt", other_attempt,
+            "--json", sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert busy["ok"] is False
+    assert busy["code"] == "file_busy"
+    assert busy["details"]["holder_ticket"] == tid
+    assert busy["details"]["holder_attempt"] == attempt
+
+    # A rejected alias reports the documented unsupported code, not a traceback.
+    bad = json.loads(
+        cli(
+            "file", "claim", "../escape.py", "--ticket", tid, "--attempt", attempt,
+            "--json", sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert bad["code"] == "unsupported"
+
+    # A release requires an attributable reason (argparse refuses the omission).
+    cli(
+        "file", "release", "src/a.py", "--ticket", tid, "--attempt", attempt,
+        sink=sink_kind, expect=2,
+    )
+    released = json.loads(
+        cli(
+            "file", "release", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--reason", "done", "--json", sink=sink_kind,
+        ).stdout
+    )
+    assert released["ok"] is True
+    assert released["data"]["released"][0]["state"] == "released"
+
+
+# --- lifecycle cleanup cascade over the file surface (C09) -----------------
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_lifecycle_commands_release_file_claims(cli, tmp_project, sink_kind):
+    """C09: release/block/shelve/close all release the attempt's file claims.
+
+    Proven end-to-end: a path claimed by the ticket's attempt is `file_busy` for a
+    second attempt, and becomes claimable by that second attempt immediately after
+    the lifecycle command ends the first attempt.
+    """
+    cli("init", sink=sink_kind)
+    (tmp_project / "src").mkdir()
+    commands = (
+        ("release", ["--agent", "claude.haiku.001", "--reason", "yielding"]),
+        ("block", ["--agent", "claude.haiku.001", "--reason", "upstream"]),
+        ("shelve", ["--agent", "claude.haiku.001"]),
+        ("close", ["--agent", "claude.haiku.001"]),
+    )
+    for name, extra in commands:
+        path = f"src/{name}.py"
+        (tmp_project / path).write_text("alpha\n")
+        primary = create(cli, f"primary {name}", sink=sink_kind)
+        other = create(cli, f"other {name}", sink=sink_kind)
+        cli("claim", primary, "--agent", "claude.haiku.001", sink=sink_kind)
+        attempt = active_attempt_id(tmp_project, sink_kind, primary)
+        cli("file", "claim", path, "--ticket", primary, "--attempt", attempt, sink=sink_kind)
+        cli("claim", other, "--agent", "claude.opus.001", sink=sink_kind)
+        other_attempt = active_attempt_id(tmp_project, sink_kind, other)
+        # Busy while the first attempt holds it.
+        cli(
+            "file", "claim", path, "--ticket", other, "--attempt", other_attempt,
+            sink=sink_kind, expect=1,
+        )
+        cli(name, primary, *extra, sink=sink_kind)
+        # The lifecycle command released the claim, so the other attempt takes it.
+        taken = json.loads(
+            cli(
+                "file", "claim", path, "--ticket", other, "--attempt", other_attempt,
+                "--json", sink=sink_kind,
+            ).stdout
+        )
+        assert taken["ok"] is True
+        # A released claim is retained as history, so the reacquisition is a new,
+        # strictly higher generation rather than a reuse of the dead token.
+        assert taken["data"]["claimed"][0]["generation"] == 2
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_takeover_releases_old_claims_and_refuses_the_stale_worker(cli, tmp_project, sink_kind):
+    """C09: takeover revokes the old attempt and its token; a new read is required."""
+    cli("init", sink=sink_kind)
+    (tmp_project / "src").mkdir()
+    (tmp_project / "src" / "a.py").write_text("alpha\n")
+    tid = create(cli, "contested work", sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.haiku.001", sink=sink_kind)
+    old = active_attempt_id(tmp_project, sink_kind, tid)
+    cli("file", "claim", "src/a.py", "--ticket", tid, "--attempt", old, sink=sink_kind)
+    token = json.loads(
+        cli(
+            "file", "read", "src/a.py", "--ticket", tid, "--attempt", old, "--json",
+            sink=sink_kind,
+        ).stdout
+    )["data"]["read_token"]
+
+    cli(
+        "claim", tid, "--agent", "claude.opus.001", "--force", "--reason",
+        "haiku stalled", sink=sink_kind,
+    )
+    # The stale attempt can no longer mutate under its old token.
+    payload = tmp_project / "payload.txt"
+    payload.write_text("after\n")
+    cli(
+        "file", "write", "src/a.py", "--ticket", tid, "--attempt", old,
+        "--read-token", token, "--input", str(payload), sink=sink_kind, expect=1,
+    )
+    assert (tmp_project / "src" / "a.py").read_text() == "alpha\n"
+
+    # The new attempt must claim and re-read before it can write.
+    new = active_attempt_id(tmp_project, sink_kind, tid)
+    assert new != old
+    cli("file", "claim", "src/a.py", "--ticket", tid, "--attempt", new, sink=sink_kind)
+    cli(
+        "file", "write", "src/a.py", "--ticket", tid, "--attempt", new,
+        "--input", str(payload), sink=sink_kind, expect=1,
+    )
+    fresh = json.loads(
+        cli(
+            "file", "read", "src/a.py", "--ticket", tid, "--attempt", new, "--json",
+            sink=sink_kind,
+        ).stdout
+    )["data"]["read_token"]
+    cli(
+        "file", "write", "src/a.py", "--ticket", tid, "--attempt", new,
+        "--read-token", fresh, "--input", str(payload), "--json", sink=sink_kind,
+    )
+    assert (tmp_project / "src" / "a.py").read_text() == "after\n"
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_unblock_resumes_with_a_fresh_attempt(cli, tmp_project, sink_kind):
+    """C09: block ends the attempt and releases claims; unblock starts a new one."""
+    cli("init", sink=sink_kind)
+    (tmp_project / "src").mkdir()
+    (tmp_project / "src" / "a.py").write_text("alpha\n")
+    tid = create(cli, "interrupted work", sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.haiku.001", sink=sink_kind)
+    first = active_attempt_id(tmp_project, sink_kind, tid)
+    cli("file", "claim", "src/a.py", "--ticket", tid, "--attempt", first, sink=sink_kind)
+    cli("block", tid, "--agent", "claude.haiku.001", "--reason", "upstream", sink=sink_kind)
+
+    cli("unblock", tid, "--agent", "claude.haiku.001", sink=sink_kind)
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["status"] == "in_progress"
+    resumed = active_attempt_id(tmp_project, sink_kind, tid)
+    assert resumed != first
+    # The old attempt cannot reclaim; the new attempt can, at generation 1.
+    cli(
+        "file", "claim", "src/a.py", "--ticket", tid, "--attempt", first,
+        sink=sink_kind, expect=1,
+    )
+    cli("file", "claim", "src/a.py", "--ticket", tid, "--attempt", resumed, sink=sink_kind)
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_delete_refuses_a_ticket_with_lifecycle_history(cli, tmp_project, sink_kind):
+    """C09: --force cannot bypass cleanup or silently cascade change history away."""
+    cli("init", sink=sink_kind)
+    tid = create(cli, "worked", sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.haiku.001", sink=sink_kind)
+
+    active = cli("delete", tid, "--force", "--agent", "claude.haiku.001", sink=sink_kind, expect=1)
+    assert "active attempt" in active.stderr
+
+    cli("release", tid, "--agent", "claude.haiku.001", sink=sink_kind)
+    history = cli("delete", tid, "--force", "--agent", "claude.haiku.001", sink=sink_kind, expect=1)
+    assert "change history" in history.stderr
+    # The ticket still exists: the refusal is not a partial delete.
+    cli("show", tid, "--json", sink=sink_kind)
+
+
+# --- discovery and versioned reads (shared-directory coordination, C06) -----
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_file_list_search_read_probe_surface(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    tid = create(cli, "Read work", sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.opus.001", sink=sink_kind)
+    attempt = active_attempt_id(tmp_project, sink_kind, tid)
+
+    (tmp_project / "src").mkdir()
+    (tmp_project / "src" / "a.py").write_text("alpha\nbeta\ngamma\n")
+    (tmp_project / "src" / "b.py").write_text("beta in b\n")
+    (tmp_project / "src" / "bin.dat").write_bytes(b"\x00\x01\x02")
+
+    # list: bounded discovery, protected metadata excluded and reported.
+    listed = json.loads(cli("file", "list", "--json", sink=sink_kind).stdout)
+    assert listed["ok"] is True
+    paths = [entry["path"] for entry in listed["data"]["entries"]]
+    assert "src/a.py" in paths
+    assert all(not path.startswith(".arbite") for path in paths)
+    assert "protected_paths_excluded" in listed["data"]["markers"]
+
+    # search: text/path discovery with a whole-file version on each content hit.
+    searched = json.loads(
+        cli("file", "search", "beta", "--json", sink=sink_kind).stdout
+    )
+    hits = {(match["path"], match["line"]) for match in searched["data"]["matches"]}
+    assert ("src/a.py", 2) in hits
+    assert searched["data"]["matches"][0]["version"].startswith("sha256:")
+
+    # A read before claiming is evidence, not permission.
+    pre = json.loads(
+        cli(
+            "file", "read", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert pre["write_authorizing"] is False
+    assert pre["non_writable_reason"] == "no_own_claim"
+
+    cli(
+        "file", "claim", "src/a.py", "--ticket", tid, "--attempt", attempt,
+        "--json", sink=sink_kind,
+    )
+    fresh = json.loads(
+        cli(
+            "file", "read", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--lines", "2:2", "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert fresh["write_authorizing"] is True
+    assert fresh["text"] == "beta"
+    assert fresh["content_complete"] is False
+    assert fresh["line_range_returned"] == [2, 2]
+    assert fresh["whole_file_digest"].startswith("sha256:")
+
+    # A foreign read serves the bytes but is non-writable and names the holder.
+    other = create(cli, "Other read work", sink=sink_kind)
+    cli("claim", other, "--agent", "claude.haiku.001", sink=sink_kind)
+    other_attempt = active_attempt_id(tmp_project, sink_kind, other)
+    foreign = json.loads(
+        cli(
+            "file", "read", "src/a.py", "--ticket", other, "--attempt", other_attempt,
+            "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert foreign["busy"] is True
+    assert foreign["write_authorizing"] is False
+    assert foreign["text"] == "alpha\nbeta\ngamma\n"  # bytes ARE served
+    assert foreign["busy_owner"]["holder_ticket"] == tid
+    assert foreign["busy_owner"]["holder_attempt"] == attempt
+
+    # fail-if-busy refuses with file_busy instead of spending tokens.
+    busy = json.loads(
+        cli(
+            "file", "read", "src/a.py", "--ticket", other, "--attempt", other_attempt,
+            "--fail-if-busy", "--json", sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert busy["ok"] is False
+    assert busy["code"] == "file_busy"
+    assert busy["details"]["holder_attempt"] == attempt
+
+    # An absent-path probe supports a safe create and owns/records nothing.
+    probe = json.loads(
+        cli(
+            "file", "probe", "src/new.py", "--ticket", tid, "--attempt", attempt,
+            "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert probe["safe_to_create"] is True
+    assert probe["version"] == "<absent>"
+    assert probe["claim_acquired"] is False
+    assert probe["observation_recorded"] is False
+
+    existing = json.loads(
+        cli(
+            "file", "probe", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert existing["exists"] is True
+    assert existing["safe_to_create"] is False
+
+    # Unsupported file types are explicit, never silently truncated.
+    binary = json.loads(
+        cli(
+            "file", "read", "src/bin.dat", "--ticket", tid, "--attempt", attempt,
+            "--json", sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert binary["ok"] is False
+    assert binary["code"] == "unsupported"
+    assert binary["details"]["reason"] == "binary"
+
+    # A malformed line range is a usage error, not a different read.
+    cli(
+        "file", "read", "src/a.py", "--ticket", tid, "--attempt", attempt,
+        "--lines", "3:1", sink=sink_kind, expect=2,
+    )
+
+    # Discovery uses the same canonical path pipeline: traversal is refused.
+    escape = json.loads(
+        cli("file", "list", "../", "--json", sink=sink_kind, expect=1).stdout
+    )
+    assert escape["code"] == "unsupported"
+
+
+# --- version-checked mutations (shared-directory coordination, C07) ---------
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_file_write_and_edit_surface(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    tid = create(cli, "Mutation work", sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.opus.001", sink=sink_kind)
+    attempt = active_attempt_id(tmp_project, sink_kind, tid)
+
+    (tmp_project / "src").mkdir()
+    target = tmp_project / "src" / "a.py"
+    target.write_text("alpha beta gamma\n")
+    cli(
+        "file", "claim", "src/a.py", "--ticket", tid, "--attempt", attempt,
+        "--json", sink=sink_kind,
+    )
+
+    def fresh_token(path="src/a.py"):
+        return json.loads(
+            cli(
+                "file", "read", path, "--ticket", tid, "--attempt", attempt,
+                "--json", sink=sink_kind,
+            ).stdout
+        )["data"]["read_token"]
+
+    token = fresh_token()
+    payload = tmp_project / "payload.txt"
+    payload.write_bytes(b"one two one\n")
+    wrote = json.loads(
+        cli(
+            "file", "write", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--read-token", token, "--input", str(payload), "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert wrote["applied"] is True
+    assert wrote["kind"] == "write"
+    assert wrote["version"] == wrote["after"]["src/a.py"]
+    assert wrote["version"].startswith("sha256:")
+    assert wrote["read_token_invalidated"] is True
+    assert target.read_bytes() == b"one two one\n"
+
+    # Reusing the consumed token changes no bytes and reports stale_read.
+    stale = json.loads(
+        cli(
+            "file", "write", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--read-token", token, "--input", str(payload), "--json",
+            sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert stale["ok"] is False
+    assert stale["code"] == "stale_read"
+    assert target.read_bytes() == b"one two one\n"
+
+    # A replacement with no token at all is refused too.
+    cli(
+        "file", "write", "src/a.py", "--ticket", tid, "--attempt", attempt,
+        "--input", str(payload), sink=sink_kind, expect=1,
+    )
+
+    # An exact edit batch applies once and returns receipt/version data.
+    edits_file = tmp_project / "edits.json"
+    edits_file.write_text(json.dumps({"edits": [{"old": "two", "new": "TWO"}]}))
+    edited = json.loads(
+        cli(
+            "file", "edit", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--read-token", fresh_token(), "--edits", str(edits_file), "--json",
+            sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert edited["applied"] is True and edited["kind"] == "edit"
+    assert target.read_bytes() == b"one TWO one\n"
+
+    # An ambiguous selection refuses the whole batch: no bytes change.
+    ambiguous_file = tmp_project / "ambiguous.json"
+    ambiguous_file.write_text(json.dumps({"edits": [{"old": "one", "new": "ONE"}]}))
+    ambiguous = json.loads(
+        cli(
+            "file", "edit", "src/a.py", "--ticket", tid, "--attempt", attempt,
+            "--read-token", fresh_token(), "--edits", str(ambiguous_file),
+            "--json", sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert ambiguous["code"] == "edit_selection"
+    assert ambiguous["details"]["reason"] == "ambiguous"
+    assert target.read_bytes() == b"one TWO one\n"
+
+    # An absent path is created from its absent-path claim with binary bytes and
+    # no read token (a read token for an absent path cannot authorize a create).
+    cli(
+        "file", "claim", "src/new.py", "--ticket", tid, "--attempt", attempt,
+        "--json", sink=sink_kind,
+    )
+    binary_payload = tmp_project / "payload.bin"
+    binary_payload.write_bytes(b"\x00\xffbinary")
+    created = json.loads(
+        cli(
+            "file", "write", "src/new.py", "--ticket", tid, "--attempt", attempt,
+            "--input", str(binary_payload), "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert created["applied"] is True
+    assert created["before"]["src/new.py"] == "<absent>"
+    assert (tmp_project / "src" / "new.py").read_bytes() == b"\x00\xffbinary"
+
+
+def test_file_write_reads_the_payload_from_stdin(cli, tmp_project):
+    cli("init")
+    tid = create(cli, "stdin work")
+    cli("claim", tid, "--agent", "claude.opus.001")
+    attempt = active_attempt_id(tmp_project, "file", tid)
+    (tmp_project / "src").mkdir()
+    (tmp_project / "src" / "a.py").write_text("alpha\n")
+    cli("file", "claim", "src/a.py", "--ticket", tid, "--attempt", attempt, "--json")
+    token = json.loads(
+        cli(
+            "file", "read", "src/a.py", "--ticket", tid, "--attempt", attempt, "--json"
+        ).stdout
+    )["data"]["read_token"]
+
+    environment = dict(os.environ, PYTHONPATH=str(SRC_DIR))
+    environment.pop("ARBITE_SINK", None)
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "arbite.cli", "file", "write", "src/a.py",
+            "--ticket", tid, "--attempt", attempt, "--read-token", token,
+            "--input", "-", "--json",
+        ],
+        cwd=str(tmp_project),
+        env=environment,
+        input="from stdin\n",
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["data"]["applied"] is True
+    assert (tmp_project / "src" / "a.py").read_bytes() == b"from stdin\n"
+
+
+# --- file removal / rename surface (shared-directory coordination, C08) -----
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_file_remove_and_rename_surface(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    tid = create(cli, "Remove and rename work", sink=sink_kind)
+    cli("claim", tid, "--agent", "claude.opus.001", sink=sink_kind)
+    attempt = active_attempt_id(tmp_project, sink_kind, tid)
+    (tmp_project / "src").mkdir()
+    (tmp_project / "src" / "a.py").write_text("alpha\n")
+    (tmp_project / "src" / "b.py").write_text("beta\n")
+
+    def read_token(path):
+        return json.loads(
+            cli(
+                "file", "read", path, "--ticket", tid, "--attempt", attempt,
+                "--json", sink=sink_kind,
+            ).stdout
+        )["data"]["read_token"]
+
+    # rename owns BOTH paths, safely creates a missing destination parent, and
+    # returns both paths and versions.
+    cli(
+        "file", "claim", "src/a.py", "--ticket", tid, "--attempt", attempt,
+        "--json", sink=sink_kind,
+    )
+    renamed = json.loads(
+        cli(
+            "file", "rename", "src/a.py", "deep/moved.py", "--ticket", tid,
+            "--attempt", attempt, "--read-token", read_token("src/a.py"),
+            "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert renamed["applied"] is True
+    assert renamed["paths"] == ["src/a.py", "deep/moved.py"]
+    assert renamed["source"] == "src/a.py" and renamed["destination"] == "deep/moved.py"
+    assert renamed["created_parents"] == ["deep"]
+    assert (tmp_project / "deep" / "moved.py").read_text() == "alpha\n"
+    assert not (tmp_project / "src" / "a.py").exists()
+
+    # A destination another attempt owns is file_busy: NEITHER path changes.
+    other = create(cli, "Other remove work", sink=sink_kind)
+    cli("claim", other, "--agent", "claude.haiku.001", sink=sink_kind)
+    other_attempt = active_attempt_id(tmp_project, sink_kind, other)
+    cli(
+        "file", "claim", "src/b.py", "--ticket", other, "--attempt", other_attempt,
+        "--json", sink=sink_kind,
+    )
+    busy = json.loads(
+        cli(
+            "file", "rename", "deep/moved.py", "src/b.py", "--ticket", tid,
+            "--attempt", attempt, "--read-token", read_token("deep/moved.py"),
+            "--json", sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert busy["ok"] is False and busy["code"] == "file_busy"
+    assert busy["details"]["holder_attempt"] == other_attempt
+    assert (tmp_project / "deep" / "moved.py").read_text() == "alpha\n"
+    assert (tmp_project / "src" / "b.py").read_text() == "beta\n"
+
+    # Removing a directory is refused explicitly: v1 has no recursive deletion.
+    (tmp_project / "src" / "sub").mkdir()
+    refused = json.loads(
+        cli(
+            "file", "remove", "src/sub", "--ticket", tid, "--attempt", attempt,
+            "--read-token", "unused-token", "--json", sink=sink_kind, expect=1,
+        ).stdout
+    )
+    assert refused["ok"] is False and refused["code"] == "unsupported"
+    assert refused["details"]["reason"] == "recursive_delete_unsupported"
+    assert (tmp_project / "src" / "sub").is_dir()
+
+    # remove deletes through the journal, preserves the bytes, and reports absence.
+    removed = json.loads(
+        cli(
+            "file", "remove", "deep/moved.py", "--ticket", tid, "--attempt", attempt,
+            "--read-token", read_token("deep/moved.py"), "--json", sink=sink_kind,
+        ).stdout
+    )["data"]
+    assert removed["applied"] is True
+    assert removed["after"]["deep/moved.py"] == "<absent>"
+    assert not (tmp_project / "deep" / "moved.py").exists()
+
+    # --read-token is mandatory for a removal.
+    cli(
+        "file", "remove", "src/b.py", "--ticket", tid, "--attempt", attempt,
+        sink=sink_kind, expect=2,
+    )
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_file_surface_has_no_metadata_or_recursive_operations(cli, tmp_project, sink_kind):
+    """Metadata edits and recursive deletion are not implemented, and argparse
+    refuses them rather than letting a caller believe a recorded operation ran."""
+    cli("init", sink=sink_kind)
+    cli("file", "chmod", "src/a.py", sink=sink_kind, expect=2)
+    cli("file", "chown", "src/a.py", "root", sink=sink_kind, expect=2)
+    cli("file", "remove", "src", "--recursive", sink=sink_kind, expect=2)

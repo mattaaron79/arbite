@@ -106,6 +106,12 @@ See AGENTS_EXAMPLE.md, which tells the agent to classify and work raw tickets wh
 - **Safe under concurrency.** Claiming is a compare-and-swap on both sinks; races
   resolve to exactly one winner, and a lost race is reported, not silently
   overwritten.
+- **Coordinates agents in one shared directory.** A file proxy (`arbite file`)
+  gives agents exclusive whole-file claims, version-checked reads and writes,
+  per-ticket change evidence, and attempt-scoped cleanup on close/release/block,
+  so two independently started agents can work one checkout without a successful
+  write silently overwriting a competing one — see
+  [Shared-directory coordination](#shared-directory-coordination-the-file-proxy).
 - **Machine-first interfaces.** JSON output for every read query, distinct exit
   codes for success / error / empty / integrity-problems.
 - **A self-describing command surface.** `arbite init` regenerates
@@ -129,14 +135,21 @@ original rationale):
 - **Scheduling or dispatching work.** arbite answers "what is workable"; getting an
   agent started on it is the caller's job.
 - **A UI, web service, or notifications.** The CLI is the interface.
-- **Enforcing policy beyond data integrity.** arbite refuses to corrupt state and
-  reports drift; it does not police who may do what.
+- **Proving who changed a file outside arbite.** The file proxy enforces its own
+  operations and detects observed drift, and it supplies the hooks a future
+  sandbox could restrict, but a shell, editor or build tool can still write to the
+  same directory and arbite cannot prove who did it — see
+  [the optional external enforcement boundary](#the-optional-external-enforcement-boundary).
 - **A distributed store.** Each sink is a single local store — a directory or a
   database file. Across machines the repo (or the file) is the unit of exchange.
 
-Planned but *not* part of arbite: any claim-on-startup collision detection or
-timestamp-based staleness checks. The claim operation is corruption prevention
-only.
+Deliberately **absent**: any runner, daemon, watcher or scheduler; automatic
+stale-work detection or takeover; worktrees and a merge-back workflow; a central
+database or dashboard; and artifact garbage collection. Agents are started
+manually — possibly by different providers or runtimes — and a stopped worker is
+never inferred from a timestamp: handing over live work is always an explicit
+`arbite claim --force --reason`. See
+[the shared-directory section](#shared-directory-coordination-the-file-proxy).
 
 ---
 
@@ -276,6 +289,158 @@ Three things worth being explicit about, because all are easy to assume wrongly:
 
 ---
 
+## Shared-directory coordination (the file proxy)
+
+Two agents started independently — different providers, different runtimes, no
+shared parent process — can work in one checkout through `arbite` without a
+successful write silently overwriting a competing one. The workspace directory
+*is* the working state: there is no worktree, no merge-back step and no server.
+Both sinks implement the same semantics (the file sink serializes with process
+locks and a journal, the SQLite sink with real transactions), and the file sink
+never requires SQLite.
+
+### The command surface
+
+- **Discovery.** `arbite file list [PATH]` and `arbite file search PATTERN [PATH]`
+  return bounded, deterministically ordered entries with explicit paging and
+  truncation markers. Discovery is not write authority.
+- **Reads.** `arbite file read PATH --ticket T --attempt A [--lines S:E]` records a
+  versioned receipt: the whole-file digest is always recorded, even when only a
+  line range is returned, alongside an explicit `write_authorizing` flag. A read
+  takes no lock and acquires no ownership, and a file held by another attempt is
+  still served — flagged `busy`, naming the holder, and marked non-writable.
+  `--fail-if-busy` refuses with `file_busy` instead of spending tokens on bytes
+  that cannot be written.
+- **Claims.** `arbite file claim PATH... --ticket T --attempt A` acquires
+  exclusive whole-file writer ownership, all-or-nothing and in deterministic
+  order. Contention returns structured `file_busy` naming the holder's ticket and
+  attempt; arbite never waits for or steals a claim. `arbite file release
+  PATH... --reason TEXT` revokes a file token early but keeps the work attempt.
+- **Mutations.** `arbite file write`, `edit`, `remove` and `rename` are journalled
+  and version-checked inside an operation lock. Replacing an existing file
+  requires a *fresh* read token recorded by the same attempt after it claimed the
+  path; a stale, pre-claim, foreign or already-consumed token changes no bytes and
+  returns `stale_read`. `rename` owns both paths, and a destination held by
+  another attempt leaves neither path touched. v1 has no recursive deletion and
+  no metadata editing.
+- **Evidence.** `arbite changes T [--attempt A] [--include-reads] [--json]` keeps
+  three things apart: mechanical operations (ordered receipts with before/after
+  digests and artifact references), agent-authored ticket notes (prose, never used
+  to derive the net change), and observed/unattributed drift (never assigned to
+  the current agent).
+- **Lifecycle.** Claiming a ticket records a **work attempt** (generation, worker,
+  started/last-activity). `close`, `release`, `block` and `shelve` end the attempt
+  and release its file claims in the same operation; `reopen`/`unblock` mint a
+  fresh attempt and never resurrect an old token. `claim --force --reason` is an
+  explicit administrative takeover, not an inference from timestamps.
+- **Administration.** `arbite export` dumps the coordination history (and/or
+  tickets) as one JSON document; `arbite rebind` switches the workspace's
+  authoritative store after verifying it; `arbite migrate --coordination` moves
+  the history between sinks; `arbite doctor` reports orphan claims, invalid
+  generations, missing artifacts, pending intents and binding/revision drift, and
+  `--fix` repairs only the unambiguous cases.
+
+### The agent mandate
+
+Agents are instructed (see [`AGENTS_EXAMPLE.md`](AGENTS_EXAMPLE.md:1) and the
+generated `.arbite/AGENTS.md`) to do source **discovery, reads and mutations**
+through arbite rather than shell or editor writes, and to **re-read through
+arbite after acquiring a claim, after a takeover, and at every ticket boundary** —
+bytes read before a claim do not authorize a write. Shell commands remain fine for
+tests and builds. The enforcement is instruction plus the proxy's own checks: a
+direct shell write bypasses the proxy.
+
+Every `arbite file` command takes `--attempt A`; an agent's active attempt id comes
+from `arbite export --scope coordination --no-artifacts`, which lists
+`records.work_attempts` — take the entry whose `ticket_id` is yours and whose
+`state` is `active`.
+
+### Owner recipe: two agents in one directory
+
+[`scripts/proxy_recipe.py`](scripts/proxy_recipe.py:1) runs the whole flow
+reproducibly in a throwaway workspace and prints a transcript:
+
+```bash
+python3 scripts/proxy_recipe.py --sink file     # ...or --sink sqlite
+```
+
+It creates two tickets, claims one per agent using two separate `arbite`
+processes, has each agent own a different file, races both agents for one
+contested file (one wins, the loser gets a structured `file_busy`), proves a stale
+read is refused without changing bytes, closes the winner's ticket and shows the
+loser can then take the released file, and demonstrates an administrative takeover
+plus an external-tool write that arbite detects and never silently overwrites. The
+same flow is asserted end-to-end by
+[`tests/test_proxy_acceptance.py`](tests/test_proxy_acceptance.py:1) on both
+sinks.
+
+To do it by hand in a disposable copy:
+
+```bash
+mkdir /tmp/two-agents && cd /tmp/two-agents && git init -q .
+arbite init
+arbite create --title "Agent A task" --type chore --tier medium --domain io
+arbite create --title "Agent B task" --type chore --tier medium --domain io
+arbite list next --claim agent.a.001        # one ticket per agent
+arbite list next --claim agent.b.001
+arbite show <ticket> --json                 # then work files as in the mandate
+```
+
+### No runner, daemon or automatic takeover
+
+Arbite starts nothing. There is no worker process, watcher, scheduler, heartbeat
+or stale timer; every command is one-shot and returns promptly. Contention is
+reported, not waited on, and a stopped worker is **never** inferred from an
+elapsed timestamp — only an explicit `claim --force --reason` (or
+`close`/`release`/`block` with `--force --reason`) moves live work. Recovery from
+an interrupted operation happens in the *next* relevant operation or when you run
+`arbite doctor`, never in the background.
+
+### Test and build output
+
+The proxy records the writes it performs. A build, formatter, test run or code
+generator that writes into the tree is **unattributed drift**: arbite can detect
+that bytes changed, but it did not attribute the change to a ticket and cannot say
+who made it. Keep generated output outside managed source paths — a gitignored
+directory, an out-of-tree build directory, or a temp dir — and keep the managed
+source paths to what the proxy owns.
+
+### Evidence growth and retention
+
+Every successful mutation stores its before/after bytes (content-addressed by
+digest) as durable evidence, so an active workspace grows with use. There is **no
+artifact garbage collection** yet: retention and reference rules have not been
+designed, and closing a ticket deliberately does not delete its evidence. Budget
+disk accordingly, and use `arbite export` (optionally `--no-artifacts` to omit
+bytes) to archive or hand off history.
+
+### The optional external enforcement boundary
+
+Honest scope: arbite enforces **its own** operations — claims, generation checks,
+version checks and journalled mutations — and it *detects observed drift* when the
+bytes it recorded are no longer what is on disk. It also supplies the hooks
+(operation receipts, per-attempt ids, workspace binding) a future sandbox or
+runtime restriction could use. It cannot, by itself, prevent or attribute a direct
+filesystem change: an external editor, script or build tool can write to the same
+directory, and arbite cannot prove who did it. Restricting that is the user's
+runtime choice, not a property of the store.
+
+A change the proxy did not make also invalidates the held claim's recorded
+version, so a later read of that path is deliberately non-writable
+(`claim_version_mismatch`) and a write with an old token is refused
+(`stale_read`) with the external bytes intact. The way forward is explicit:
+`arbite file release` the path and `arbite file claim` it again — a new claim
+generation over the current bytes — then read and write.
+
+### Deliberately absent
+
+No runner/daemon/watcher/scheduler, no automatic stale detection or takeover, no
+worktrees or merge workflow, no central database, no dashboard or factory, and no
+artifact GC. The job-board features (worker profiles, reservations, offers) are a
+separate, later epic and are not part of this workflow.
+
+---
+
 ## Design principles
 
 - **Storage is a sink.** One interface ([`sinks/base.py`](src/arbite/sinks/base.py)),
@@ -327,8 +492,11 @@ The package exposes the console script `arbite`, providing:
 | Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
 | Lifecycle | `claim`, `release`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen` |
 | Authoring | `note`, `set`, `depend`, `move` |
-| Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
-| Integrity | `doctor [--fix]` |
+| Proxy discovery/read | `file list`, `file search`, `file read [--lines S:E] [--fail-if-busy]`, `file probe` |
+| Proxy mutation | `file claim`, `file release`, `file write`, `file edit`, `file remove`, `file rename` |
+| Evidence | `changes [--attempt A] [--include-reads]` |
+| Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run] [--coordination\|--no-coordination]`, `rebind --to <sink>`, `export [--scope ...] [--out FILE] [--no-artifacts]` |
+| Integrity | `doctor [--fix]` (tickets plus coordination findings) |
 | Destruction | `delete <id> --force` |
 
 Key behaviours worth calling out:
@@ -353,8 +521,17 @@ Key behaviours worth calling out:
 - **`arbite delete`** destroys a ticket and refuses to do so without `--force`; it
   records a `Deleted by <agent>` note first and prints a receipt. `close` is usually
   what you want.
-- **`arbite doctor`** checks the invariants nothing else enforces and exits `3` when
-  problems remain — see [Integrity checking per sink](#integrity-checking-per-sink).
+- **`arbite file`** is the proxy surface: discover, read, claim and mutate
+  workspace files so a competing agent cannot silently overwrite them. Discovery
+  and reads take no lock; a replacement needs a fresh read after the claim, and a
+  stale token is refused (`stale_read`) without changing bytes.
+- **`arbite changes`** answers "what changed for this ticket, and is it
+  verifiable?" — mechanical operations, agent prose and observed/unattributed
+  drift are reported separately.
+- **`arbite doctor`** checks the invariants nothing else enforces (including
+  coordination findings: orphan claims, invalid generations, missing artifacts,
+  pending intents and binding/revision drift) and exits `3` when problems remain —
+  see [Integrity checking per sink](#integrity-checking-per-sink).
 
 `CLAUDE.md` records a handful of deliberately open judgement calls — validation
 strictness for `domain`/`tags`, the `deps` visualization format, and whether
@@ -590,16 +767,37 @@ src/arbite/
   config.py             locating .arbite/ and resolving which sink to use
   docs.py               renders .arbite/AGENTS.md from the real argparse output
                         and the active sink's capabilities
+  coordination.py       storage-neutral coordination records: workspaces, attempts,
+                        claims, observations, receipts, intents, events, artifacts
+  application.py        the storage-neutral coordination application layer + the
+                        write-authorization guard
+  lifecycle.py          guarded ticket transitions (claims, takeover, cleanup cascade)
+  workspace.py          workspace binding, canonical root, exclusive binding
+  paths.py              canonical in-root path resolution and refusals
+  fileclaims.py         exclusive whole-file claims with generations
+  filereads.py          discovery and versioned reads (non-write-authorizing receipts)
+  filemutations.py      write/edit/remove/rename over the recoverable journal
+  mutation.py           intent/artifact journal and filesystem recovery engine
+  artifacts.py          content-addressed evidence storage
+  locking.py            the coarse local coordination lock (no daemon, no timers)
+  changes.py            the bounded change/evidence query surface
+  coordination_export.py  coordination history export/migration
+  coordination_doctor.py  coordination integrity findings (and unambiguous repairs)
 tests/
   test_sink_conformance.py  one suite, run against every sink
   test_file_sink.py         file-specific: folders, drift, temp files, archives
   test_sqlite_sink.py       sqlite-specific: schema, note index, pushdown parity
   test_cli.py               end-to-end argv, exit codes, --json, migrate round trip
+  test_coordination_*.py    attempts/lifecycle, claims, reads, mutations, journal,
+                            changes, export, migration, doctor (both sinks)
+  test_proxy_acceptance.py  two-process shared-directory acceptance on both sinks
   test_graph.py             dependency-graph semantics, pinned
   test_query.py             query vocabulary semantics, pinned
 scripts/
   seed_demo.py          generates ~2.5 months of realistic seed tickets for either
                         sink (--sink file|sqlite), via the same code paths the CLI uses
+  proxy_recipe.py       the documented disposable-workspace two-agent recipe
+                        (--sink file|sqlite); run it to see the flow end to end
   update-arbite.bat     reinstall the checkout into global pipx (Windows)
   update-arbite.sh      reinstall the checkout into global pipx (Linux/macOS)
 ```
@@ -610,6 +808,16 @@ The core system is implemented: creation, listing and filtering, dependency-orde
 `list next`, raw capture plus triage, the full claim/release/block/unblock/shelve/
 close/reopen lifecycle, notes, `set`/`move`/`depend`, the `doctor` integrity checker,
 the sink abstraction with both the file and SQLite implementations, sink selection
-and `sink info`, `delete`, and `migrate`. `CLAUDE.md` remains the canonical record of
-the design; open judgement calls and any schema change should be raised there before
-implementation.
+and `sink info`, `delete`, and `migrate`.
+
+The shared-directory coordination layer is implemented on top of that: the
+`arbite file` proxy (discovery, versioned reads, exclusive claims, journalled
+write/edit/remove/rename), work attempts with guarded lifecycle cleanup, durable
+change evidence (`arbite changes`), crash-safe recovery with no daemon, and
+coordination-aware `export`/`rebind`/`migrate --coordination`/`doctor`. Both sinks
+carry the same semantics, and the file sink never requires SQLite. Deliberately
+absent, and documented as such above: any runner, daemon, watcher or scheduler,
+automatic stale detection or takeover, worktrees, a central database, a dashboard,
+and artifact garbage collection. `CLAUDE.md` remains the canonical record of the
+original design; open judgement calls and any schema change should be raised there
+before implementation.

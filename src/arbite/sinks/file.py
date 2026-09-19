@@ -37,7 +37,17 @@ from typing import Optional
 from ..errors import Conflict, TicketError, TicketNotFound
 from ..query import TicketQuery
 from ..schema import ID_PATTERN, Ticket, parse_notes, parse_ticket
-from .base import Expect, Problem, TicketSink, enforce_expect, filter_tickets
+from .base import (
+    UNSET,
+    Expect,
+    Problem,
+    TicketSink,
+    enforce_expect,
+    filter_tickets,
+    revision_for_insert,
+)
+from .coordination_file import DIRECTORY_NAME as COORDINATION_DIR
+from .coordination_file import FileCoordinationStore
 
 # Status -> folder, for every status except "closed", which archives by month.
 FLAT_STATUS_DIRS = ("raw", "open", "in_progress", "blocked", "shelved")
@@ -108,6 +118,14 @@ class FileSink(TicketSink):
 
     def __init__(self, root: Path):
         self._root = Path(root)
+        # The coordination store lives in a subdirectory of the root and creates
+        # nothing until it is used. Constructing it here costs a Path and is what
+        # lets the ticket path share the *same* coarse lock as the record store.
+        self._coordination = FileCoordinationStore(self._root / COORDINATION_DIR)
+
+    def coordination(self):
+        """This sink's coordination store (see `sinks.coordination_file`)."""
+        return self._coordination
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -286,12 +304,32 @@ class FileSink(TicketSink):
         dest = self.status_dir(ticket.status, ticket.closed) / f"{ticket.id}.md"
         if dest.exists():
             raise Conflict(f"a ticket file already exists at {dest}")
+        # An explicit incoming revision is preserved rather than reset, so a
+        # migration that copies a ticket between sinks keeps the same bytes; a
+        # brand-new ticket starts at revision 1.
+        ticket.revision = revision_for_insert(ticket.revision)
         write_atomic(ticket.to_markdown(), dest)
         return ticket
 
     def update(self, ticket: Ticket, expect: Optional[Expect] = None) -> Ticket:
+        if expect is not None and expect.revision is not UNSET:
+            # A revision check must span the read, the check and the write: doing
+            # it outside the critical section would be a race with extra steps.
+            # The coarse coordination lock is held for exactly this one update and
+            # then released -- never for a ticket's whole duration. `flock` is
+            # dropped by the OS if this process dies, so no lock can persist.
+            with self._coordination.coarse_lock():
+                return self._update_locked(ticket, expect)
+        return self._update_locked(ticket, expect)
+
+    def _update_locked(self, ticket: Ticket, expect: Optional[Expect]) -> Ticket:
         path, current = self._locate(ticket.id)
         enforce_expect(current, expect)
+        # Revisions are the field-level CAS the status/assignee token cannot be:
+        # two readers editing *different* fields both hold revision N, and the
+        # second write is refused. Every successful update bumps the stored
+        # revision, whether or not the caller checked one.
+        ticket.revision = (current.revision or 0) + 1
 
         # A status change always lands in the status tree, which is what moves a
         # ticket out of a bucket: an unshelved or claimed ticket is back in the
