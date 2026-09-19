@@ -37,6 +37,7 @@ from . import (
     coordination_export,
     docs,
     eligibility,
+    events,
     fileclaims,
     filemutations,
     filereads,
@@ -3292,6 +3293,111 @@ def _run_board(args, sink) -> None:
         sys.exit(EXIT_EMPTY)
 
 
+# --- events and progress (multi-provider job board, B06) --------------------
+
+
+def cmd_events(args):
+    """Read the durable event log once: ordered, filtered, cursor-resumable."""
+    sink = _require_sink(args)
+    try:
+        _run_events(args, sink)
+    except CoordinationError as error:
+        _file_error(args, error)
+
+
+def _event_line(event: dict) -> str:
+    """One human-readable row of the documented event view."""
+    subjects = ",".join(event["subject_ids"]) if event["subject_ids"] else "-"
+    return (f"{event['cursor']:>7}  {event['category']:<11} {event['event_kind']:<22} "
+            f"{event['timestamp']}  {event['id']}  {subjects}")
+
+
+def _run_events(args, sink) -> None:
+    """One page of events, plus the token that resumes after it.
+
+    The cursor token is the only accepted `--after` value beyond `0`, because a
+    bare integer names no store: it could silently read another store's position.
+    Query-only -- nothing here subscribes, watches, polls or delivers."""
+    page = events.query_view(
+        sink,
+        after=args.after,
+        limit=args.limit,
+        categories=args.category,
+        kinds=args.kind,
+        subjects=args.subject,
+    )
+    token = page["next_cursor_token"]
+    if args.json:
+        _print_json(coordination.ok_result({
+            "events": page["events"],
+            "count": page["count"],
+            "limit": page["limit"],
+            "has_more": page["has_more"],
+            "next_cursor": token,
+            "cursor_namespace": page["cursor_namespace"],
+            "filters": page["filters"],
+            "notice": page["notice"],
+        }))
+    elif page["events"]:
+        for event in page["events"]:
+            print(_event_line(event))
+        print(f"{page['count']} event(s)"
+              + (" (more available)" if page["has_more"] else "")
+              + f"; resume with --after {token}")
+    else:
+        print(f"no events after cursor {page['filters']['after_cursor']}; "
+              f"resume with --after {token}")
+    if not page["events"]:
+        # The query ran and matched nothing -- the same "nothing here" signal the
+        # other read-only queries use.
+        sys.exit(EXIT_EMPTY)
+
+
+def _progress_rows(args, sink, service) -> list:
+    """The reservations a progress query reports: one id, or an owner's board."""
+    if args.reservation and args.owner:
+        raise TicketError("pass either a reservation id or --owner OWNER, not both")
+    if args.reservation:
+        return [service.get(args.reservation)]
+    if not args.owner:
+        raise TicketError(
+            "progress needs a reservation id (arbite reserve progress RESERVATION) "
+            "or an owner's whole board (--owner OWNER)"
+        )
+    return service.list(state=args.state, owner=args.owner)
+
+
+def _progress_lines(view: dict) -> list:
+    lines = []
+    for reservation in view["reservations"]:
+        counts = ", ".join(
+            f"{state} {count}" for state, count in reservation["counts"].items() if count
+        )
+        lines.append(
+            f"reservation {reservation['reservation_id']} [{reservation['state']}] "
+            f"owner {reservation['owner']} revision {reservation['revision']} "
+            f"-- {counts or 'no members'}"
+        )
+        for member in reservation["members"]:
+            activity = member["latest_activity"]
+            seen = ("no recorded activity" if activity is None
+                    else f"{activity['timestamp']} {activity['event_kind']}")
+            lines.append(
+                f"  {member['ticket_id']}  {member['classification']:<18} "
+                f"[{member['status']}] worker {member['worker_id'] or '-'}  "
+                f"activity {seen}"
+            )
+            if member["classification"] == "blocked" and member["blocked_by"]:
+                lines.append(f"    blocked by: {member['blocked_by']}")
+            if member["classification"] in ("dependency_waiting", "unavailable"):
+                # The classification already says what the other states mean, so the
+                # structured reasons are printed only where they are the answer.
+                for reason in member["reasons"]:
+                    lines.append(f"    reason [{reason['code']}] {reason['message']}")
+    lines.append(f"  ({events.ACTIVITY_NOTICE})")
+    return lines
+
+
 # --- reservations (multi-provider job board, B02) ---------------------------
 
 
@@ -3368,6 +3474,18 @@ def _run_reserve_command(args, sink) -> None:
 
     if command == "show":
         _emit_reservation(args, service, service.get(args.reservation))
+        return
+
+    if command == "progress":
+        rows = _progress_rows(args, sink, service)
+        view = events.reservation_progress(sink, rows, owner=args.owner)
+        if args.json:
+            _print_json(coordination.ok_result(view))
+        else:
+            for line in _progress_lines(view):
+                print(line)
+        if not view["reservations"]:
+            sys.exit(EXIT_EMPTY)
         return
 
     if command == "list":
@@ -5125,6 +5243,54 @@ def build_parser():
     _sink_flag(p_board)
     p_board.set_defaults(func=cmd_board)
 
+    p_events = sub.add_parser(
+        "events",
+        help="query the durable event log once (ordered, cursor-resumable, read-only)",
+        description="Read the coordination event log once, in cursor order, and print "
+        "the token that resumes after the page. A cursor is store-local: the only "
+        "accepted --after values are a `next_cursor` token a previous query returned "
+        "(e.g. sqlite:/path/.arbite/arbite.db#41) or 0 for the beginning. A malformed "
+        "token fails with invalid_cursor and a token from another store with "
+        "cursor_foreign_store -- neither silently restarts from zero or reads the "
+        "wrong store's position. Filters (--category/--kind/--subject) are applied to "
+        "the whole ordered stream before --limit, and the returned cursor is the last "
+        "event the page consumed, so a filtered stream resumes without skipping or "
+        "re-reading. Each event carries a globally unique stable id: a retry or an "
+        "overlapping query may deliver it again, so consumers deduplicate by id. Only "
+        "committed/reconciled events appear (an interrupted file-sink transaction is "
+        "replayed forward first). Read observations are category 'read' and are "
+        "queried separately from lifecycle/operation traffic. Read-only one-shot: no "
+        "watcher, subscription, polling loop or delivery. Exits 2 when nothing matches.",
+    )
+    p_events.add_argument(
+        "--after", default=None, metavar="CURSOR",
+        help="resume after this cursor: a `next_cursor` token from a previous query "
+        "(namespace#cursor) or 0 for the whole stream from the beginning",
+    )
+    p_events.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help=f"maximum events to return (default {events.DEFAULT_LIMIT}); the page "
+        "reports has_more and a resumable next_cursor",
+    )
+    p_events.add_argument(
+        "--category", action="append", default=None, metavar="C",
+        help="only these event categories (repeatable or comma-separated): "
+        + ", ".join(coordination.EVENT_CATEGORIES),
+    )
+    p_events.add_argument(
+        "--kind", action="append", default=None, metavar="K",
+        help="only these event kinds (repeatable or comma-separated), e.g. "
+        "ticket_claimed, offer_accepted, package_advanced",
+    )
+    p_events.add_argument(
+        "--subject", action="append", default=None, metavar="ID",
+        help="only events naming one of these subjects (ticket, attempt, offer, "
+        "package or reservation id; repeatable)",
+    )
+    _json_flag(p_events)
+    _sink_flag(p_events)
+    p_events.set_defaults(func=cmd_events)
+
     p_reserve = sub.add_parser(
         "reserve",
         help="create, show, list, change or release coordinator reservations",
@@ -5185,6 +5351,32 @@ def build_parser():
     p_r_list.add_argument("--owner", default=None, help="only this owner's reservations")
     p_r_list.add_argument("--ticket", default=None, help="only reservations containing this ticket")
     reserve_common(p_r_list)
+
+    p_r_progress = reserve_sub.add_parser(
+        "progress",
+        help="what a reservation's members are doing now (a read-only observation)",
+        description="Classify every member of a reservation -- completed, blocked, "
+        "active, dependency-waiting, ready or unavailable -- with its current "
+        "worker(s), its latest recorded activity and the structured reasons behind "
+        "the verdict. 'Ready' comes from the same readiness evaluator that backs "
+        "'arbite board', 'list next' and acquisition, so this view cannot disagree "
+        "with what a claim would accept. Readiness is derived from current state "
+        "every time it is asked, so a dependency-completion or close event is only a "
+        "hint to requery -- never a promise that a ticket is now ready. The recorded "
+        "activity timestamp is an observation, not a liveness guarantee: arbite does "
+        "not infer that a worker is alive or dead. Pass a RESERVATION for one "
+        "reservation, or --owner OWNER for that coordinator's whole board "
+        "(--state active|released|all). Nothing is claimed or written. Exits 2 when "
+        "no reservation matches.",
+    )
+    p_r_progress.add_argument("reservation", nargs="?", metavar="RESERVATION",
+                              help="reservation id (rsv-...)")
+    p_r_progress.add_argument("--owner", default=None, metavar="OWNER",
+                              help="report every reservation of this coordinator instead")
+    p_r_progress.add_argument("--state", choices=("active", "released", "all"),
+                              default="active", help="which reservations to include with "
+                              "--owner (default: active)")
+    reserve_common(p_r_progress)
 
     p_r_add = reserve_sub.add_parser(
         "add", help="add members atomically",

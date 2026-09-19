@@ -28,11 +28,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from .. import coordination, graph, schema
 from ..artifacts import DEFAULT_MAX_ARTIFACT_BYTES, DEFAULT_MEDIA_TYPE
-from ..errors import Conflict, TicketError, UnsupportedCoordination
+from ..errors import Conflict, InvalidRecord, TicketError, UnsupportedCoordination
 from ..locking import DEFAULT_OPERATION_LOCK_TIMEOUT, NULL_OPERATION_LOCK, OperationLock
 from ..query import TicketQuery, apply_limit, bucket_matches, resolve_id, sort_tickets
 from ..schema import Ticket
@@ -798,6 +798,76 @@ class CoordinationStore(ABC):
         if after_cursor is not None:
             events = [e for e in events if e.cursor is not None and e.cursor > after_cursor]
         return sorted(events, key=lambda e: (e.cursor is None, e.cursor or 0))
+
+    def query_events(
+        self,
+        *,
+        after_cursor: Optional[int] = None,
+        limit: Optional[int] = None,
+        categories: Optional[Iterable[str]] = None,
+        kinds: Optional[Iterable[str]] = None,
+        subject_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        """One ordered page of this store's durable event stream (planning key B06).
+
+        The public "what happened after cursor N" query, and the only thing the
+        event/progress services call. Returns::
+
+            {"events": [Event, ...],   # ordered by cursor, at most `limit`
+             "next_cursor": int,       # resume *after* this cursor
+             "has_more": bool,         # the page was cut short by `limit`
+             "scanned": int}           # events examined after `after_cursor`
+
+        `next_cursor` is the cursor of the last event the page *consumed*, never
+        merely the last one it returned: with more matching events behind the cut
+        it is the last returned cursor (so nothing is skipped), and otherwise it is
+        the store's newest cursor at read time (so a filter does not re-scan traffic
+        it already walked past). Filters are applied to the whole ordered stream
+        before the limit, so pages of a filtered stream are as resumable as pages of
+        the unfiltered one.
+
+        The read is a short read-only transaction, which is what makes the answer
+        both consistent and honest about finality: the file sink replays a leftover
+        write-ahead journal forward at the start of every transaction (so an
+        interrupted transaction's events are reconciled before they are reported,
+        and a half-applied one is never visible), and SQLite commits atomically, so
+        a half-applied transaction never exists to read. Events whose cursor is
+        unset are not pageable and are omitted -- an unassigned cursor is a doctor
+        finding (`inspect_events`), not a query result.
+        """
+        if limit is not None and int(limit) < 1:
+            raise InvalidRecord(
+                f"an event query limit must be a positive integer, got {limit!r}"
+            )
+        start = 0 if after_cursor is None else int(after_cursor)
+        if not self.is_initialised():
+            # A never-used store answers empty without creating anything.
+            return {"events": [], "next_cursor": start, "has_more": False, "scanned": 0}
+        with self.transaction(write=False) as tx:
+            events = list(tx.find("event"))
+        ordered = sorted(
+            (e for e in events if e.cursor is not None), key=lambda e: e.cursor
+        )
+        newest = ordered[-1].cursor if ordered else 0
+        ordered = [e for e in ordered if e.cursor > start]
+        wanted_categories = set(categories or ())
+        wanted_kinds = set(kinds or ())
+        wanted_subjects = set(subject_ids or ())
+        matching = [
+            e for e in ordered
+            if (not wanted_categories or e.category in wanted_categories)
+            and (not wanted_kinds or e.kind_ in wanted_kinds)
+            and (not wanted_subjects or bool(wanted_subjects & set(e.subject_ids)))
+        ]
+        page = matching if limit is None else matching[: int(limit)]
+        has_more = len(page) < len(matching)
+        next_cursor = page[-1].cursor if has_more else newest
+        return {
+            "events": page,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "scanned": len(ordered),
+        }
 
     # -- event cursors and the namespace registry (planning key C11) ------
     #

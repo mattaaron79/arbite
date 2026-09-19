@@ -150,6 +150,12 @@ class ErrorCode:
     #: `details["reason"]` says why (`members_unavailable`, `cycle`,
     #: `not_controller`, `active_attempt`, `not_live`, ...). Nothing was written.
     PACKAGE_CONFLICT = "package_conflict"
+    #: An event cursor token cannot name a position: it is malformed, or it is a
+    #: bare integer that does not say which store issued it (B06).
+    INVALID_CURSOR = "invalid_cursor"
+    #: An event cursor token was issued by a *different* store. Cursors are
+    #: store-local monotonic integers, so it names no position here (B06).
+    CURSOR_FOREIGN_STORE = "cursor_foreign_store"
 
 
 class CoordinationError(ArbiteError):
@@ -395,3 +401,26 @@ class PackageConflict(CoordinationError):
     was written."""
 
     error_code = ErrorCode.PACKAGE_CONFLICT
+
+
+class InvalidCursor(CoordinationError):
+    """An event cursor token cannot be used to resume a query (B06).
+
+    Raised for a malformed token (no `namespace#cursor` shape, a non-numeric
+    cursor) and for a bare non-zero integer, which is refused because nothing about
+    it says *which* store issued it -- silently reading another store's position is
+    the failure the token exists to prevent. `0` and an omitted cursor mean "from
+    the beginning". Nothing was read or written."""
+
+    error_code = ErrorCode.INVALID_CURSOR
+
+
+class ForeignCursor(InvalidCursor):
+    """An event cursor token was issued by a different store (B06).
+
+    `details` carries this store's `cursor_namespace` and the `token_namespace` the
+    token actually came from, so a caller can tell a genuine cross-store mix-up from
+    a typo. Cursors are store-local, so the only way forward is to query this store
+    from the beginning (`--after 0`) and resume from the token it returns."""
+
+    error_code = ErrorCode.CURSOR_FOREIGN_STORE

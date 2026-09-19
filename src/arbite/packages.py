@@ -281,6 +281,13 @@ def sync_in_transaction(tx, intent, moment: str, statuses: dict) -> None:
     state = progress(package, statuses)
     events = []
     actor = intent.actor
+    # B06: a completion/advance event names the attempt and worker that moved the
+    # package, so an external caller can requery the affected work from the event
+    # alone (a close with no attempt leaves both None, which is the honest answer).
+    ended_attempt = (
+        tx.get("work_attempt", intent.end_attempt_id)
+        if intent.end_attempt_id is not None else None
+    )
 
     attempt = intent.start_attempt
     if attempt is not None:
@@ -317,12 +324,17 @@ def sync_in_transaction(tx, intent, moment: str, statuses: dict) -> None:
             ended_offers = offers.end_package_offers(
                 tx, package.id, how="complete", actor=actor, moment=moment,
                 reason=f"package {package.id} completed")
-            events.append(("package_completed", {"closed": ticket_id,
-                                                 "completed": state["completed"],
-                                                 "ended_offers": ended_offers}))
+            events.append(("package_completed", {
+                "closed": ticket_id,
+                "attempt_id": intent.end_attempt_id,
+                "worker_id": getattr(ended_attempt, "worker_id", None),
+                "completed": state["completed"],
+                "ended_offers": ended_offers}))
         else:
             events.append(("package_advanced", {
                 "closed": ticket_id, "next": state["current"],
+                "attempt_id": intent.end_attempt_id,
+                "worker_id": getattr(ended_attempt, "worker_id", None),
                 "completed": state["completed"], "remaining": state["remaining"],
                 "notice": "the next member is a fresh attempt: claim it, then read files again",
             }))

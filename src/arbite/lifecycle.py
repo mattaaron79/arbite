@@ -1368,6 +1368,7 @@ class TicketLifecycle:
                         payload={
                             "ticket_id": intent.ticket_id,
                             "worker_id": old.worker_id,
+                            "attempt_id": old.id,
                             "generation": old.generation,
                             "reason": old.outcome,
                             "superseded_by": (
@@ -1391,13 +1392,20 @@ class TicketLifecycle:
         if intent.start_attempt is not None:
             attempt = intent.start_attempt
             tx.put(attempt)
+            # B06: an event an external caller can act on names the records that
+            # moved, so the attempt id is in the payload (not only in subject_ids)
+            # and an accepted offer's id rides along with the attempt it started.
+            accepted_offer_id = (intent.offer_acceptance or {}).get("offer_id")
             for event_kind in ("attempt_started", "ticket_claimed"):
                 payload = {
                     "ticket_id": intent.ticket_id,
                     "worker_id": attempt.worker_id,
+                    "attempt_id": attempt.id,
                     "origin": intent.origin,
                     "generation": attempt.generation,
                 }
+                if accepted_offer_id:
+                    payload["offer_id"] = accepted_offer_id
                 if event_kind == "attempt_started":
                     payload["handoff"] = attempt.handoff
                 tx.append_event(
@@ -1455,6 +1463,7 @@ class TicketLifecycle:
                 payload={
                     "ticket_id": attempt.ticket_id,
                     "worker_id": attempt.worker_id,
+                    "attempt_id": attempt.id,
                     "generation": attempt.generation,
                     "outcome": attempt.outcome,
                     "reason": reason,
