@@ -26,6 +26,11 @@ Records introduced here (planning key C01, slice 1 of
   `category` so read-observation traffic can be kept out of ordinary queries.
 - `RecoveryReport` -- what an incomplete operation found on inspection, so a
   failed write is reconciled honestly instead of guessed at.
+- `WorkerProfile` -- an optional, provider-neutral worker declaration (planning
+  key B01, multi-provider job board): configured tier, capability labels,
+  locality, cost class and declared capacity. Operator assertions, not verified
+  identity; never credentials. Eligibility rules over it live in
+  `arbite.eligibility`.
 - `LifecycleIntent` -- the durable journal entry joining a ticket transition to
   its coordination cascade (attempt start/end, claim release, events). The ticket
   store and the coordination store commit separately, so the intent is what lets
@@ -65,6 +70,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from .schema import TIERS
 from .errors import (
     ErrorCode,
     InvalidRecord,
@@ -134,7 +140,7 @@ OPERATION_RESULTS = ["ok", "error"]
 
 #: Event categories. `read` is a separate category so a high-volume read stream
 #: does not flood ordinary lifecycle/operation queries.
-EVENT_CATEGORIES = ["lifecycle", "operation", "claim", "read"]
+EVENT_CATEGORIES = ["lifecycle", "operation", "claim", "read", "worker"]
 
 #: Event kinds. Every event is one of these; `operation_recorded` is the generic
 #: carrier for a receipt, and the rest name the transitions later slices add.
@@ -167,6 +173,12 @@ EVENT_KINDS = [
     "ticket_closed",
     "ticket_reopened",
     "dependency_invalidated",
+    #: Worker-profile administration (planning key B01), category `worker`.
+    #: Check-ins are not events: they only refresh `WorkerProfile.last_checkin`.
+    "worker_registered",
+    "worker_updated",
+    "worker_disabled",
+    "worker_enabled",
 ]
 
 #: Recovery outcomes for an incomplete operation. `applied` and `reverted` are
@@ -194,6 +206,56 @@ LIFECYCLE_INTENT_STATES = ["pending", "completed", "abandoned"]
 #: How a `LifecycleIntent` ends the attempt it names (mirrors `WorkAttempt`).
 LIFECYCLE_END_STATES = ["released", "finished", "interrupted"]
 
+#: Declared execution locality of a worker. `unknown` is a first-class value:
+#: a restricted requirement treats it as unmet, never as a pass.
+WORKER_LOCALITIES = ["local", "remote", "unknown"]
+
+#: Declared cost class of a worker (planning key B01). No pricing catalog and no
+#: currency conversion: an optional `cost_estimate` carries explicit units.
+COST_CLASSES = ["local", "paid", "unknown"]
+
+#: Worker ids are self-declared names (`claude.opus-5.002`), not opaque ids.
+WORKER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$")
+
+#: Capability/tool labels: lowercase tokens compared exactly.
+CAPABILITY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:+/-]{0,63}$")
+
+#: Value shapes that look like credentials. Profiles hold operator assertions and
+#: labels only; a value matching one of these is refused rather than stored.
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(sk|rk|pk)-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?i)\bsk-ant-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|bearer|authorization)\s*[:=]\s*\S+"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}"),
+)
+
+#: A long unbroken alphanumeric run mixing letters and digits reads as a key.
+_OPAQUE_TOKEN = re.compile(r"[A-Za-z0-9+/]{32,}")
+
+
+
+def looks_like_secret(value: Any) -> bool:
+    """True when `value` resembles a credential (API key, token, private key).
+
+    A heuristic guard, not a scanner: it exists so a profile label can never be
+    used as a place to park a key. False positives are refused loudly; the
+    caller can rephrase the label."""
+    if not isinstance(value, str) or not value:
+        return False
+    if any(pattern.search(value) for pattern in _SECRET_PATTERNS):
+        return True
+    return any(
+        re.search(r"[0-9]", run) and re.search(r"[A-Za-z]", run)
+        for run in _OPAQUE_TOKEN.findall(value)
+    )
+
 #: Record kind -> opaque id prefix. The prefix is part of the id so a task can
 #: tell a claim id from an attempt id at a glance without a store lookup.
 ID_PREFIXES = {
@@ -208,6 +270,7 @@ ID_PREFIXES = {
     "event": "evt",
     "recovery_report": "rcv",
     "lifecycle_intent": "lci",
+    "worker_profile": "wkr",
 }
 
 #: Opaque ids are `<prefix>-<16 hex chars>` (8 random bytes). Short enough to
@@ -1057,6 +1120,49 @@ class RecoveryReport(_Record):
         return self.kind_
 
 
+@dataclass
+class WorkerProfile(_Record):
+    """An optional, provider-neutral declaration of one worker (planning key B01).
+
+    `worker_id` is the same self-declared name used for claims and attempts;
+    `id` is the opaque record handle. Every field is an operator assertion, not a
+    verified fact: `tier` is authoritative for acquisition by this worker id (a
+    per-call declaration cannot raise it), while `provider`/`model`/`runtime` are
+    labels that never trigger any provider call. `last_checkin` is declared
+    activity, never liveness. A disabled profile is retained with its history;
+    it stops new acquisitions and revokes nothing already running.
+
+    `cost_estimate`, when present, is `{"amount": number >= 0, "unit": str,
+    "provenance": str}`. No credential is ever stored (`looks_like_secret`).
+    """
+
+    kind = "worker_profile"
+    id_prefix = ID_PREFIXES["worker_profile"]
+
+    id: str
+    worker_id: str
+    tier: str
+    created: str
+    updated: str
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    runtime: Optional[str] = None
+    capabilities: List[str] = field(default_factory=list)
+    locality: str = "unknown"
+    cost_class: str = "unknown"
+    cost_estimate: Optional[Dict[str, Any]] = None
+    capacity: Optional[int] = None
+    enabled: bool = True
+    disabled_at: Optional[str] = None
+    disabled_reason: Optional[str] = None
+    last_checkin: Optional[str] = None
+    contract_version: int = CONTRACT_VERSION
+
+    @property
+    def is_enabled(self) -> bool:
+        return bool(self.enabled)
+
+
 # Record kind -> class, for `record_from_dict`.
 RECORD_CLASSES = {
     cls.kind: cls
@@ -1072,6 +1178,7 @@ RECORD_CLASSES = {
         LifecycleIntent,
         Event,
         RecoveryReport,
+        WorkerProfile,
     )
 }
 
@@ -1361,6 +1468,72 @@ def _validate_recovery_report(record: RecoveryReport) -> list:
     return problems
 
 
+_LABEL_FIELDS = ("provider", "model", "runtime")
+
+
+@_validator("worker_profile")
+def _validate_worker_profile(record: WorkerProfile) -> list:
+    problems = []
+    _check_id(problems, record)
+    _check(problems, isinstance(record.worker_id, str) and bool(WORKER_ID_PATTERN.match(record.worker_id)),
+           f"worker_id {record.worker_id!r} must match {WORKER_ID_PATTERN.pattern}")
+    _check(problems, record.tier in TIERS,
+           f"tier {record.tier!r} is not one of {', '.join(TIERS)}")
+    _check_utc(problems, record.created, "created")
+    _check_utc(problems, record.updated, "updated")
+    for label in _LABEL_FIELDS:
+        value = getattr(record, label)
+        if value is None:
+            continue
+        ok = isinstance(value, str) and value == value.strip() and 0 < len(value) <= 128 \
+            and not any(ord(ch) < 32 for ch in value)
+        _check(problems, ok, f"{label} {value!r} must be a non-empty single-line label of at most 128 chars")
+    capabilities = record.capabilities
+    if not isinstance(capabilities, list):
+        problems.append("capabilities must be a list of labels")
+        capabilities = []
+    for capability in capabilities:
+        _check(problems, isinstance(capability, str) and bool(CAPABILITY_PATTERN.match(capability)),
+               f"capability {capability!r} must match {CAPABILITY_PATTERN.pattern}")
+    _check(problems, len(set(map(str, capabilities))) == len(capabilities),
+           "capabilities must not repeat")
+    _check(problems, record.locality in WORKER_LOCALITIES,
+           f"locality {record.locality!r} is not one of {', '.join(WORKER_LOCALITIES)}")
+    _check(problems, record.cost_class in COST_CLASSES,
+           f"cost_class {record.cost_class!r} is not one of {', '.join(COST_CLASSES)}")
+    estimate = record.cost_estimate
+    if estimate is not None:
+        if not isinstance(estimate, dict):
+            problems.append("cost_estimate must be a mapping or null")
+        else:
+            amount = estimate.get("amount")
+            _check(problems, isinstance(amount, (int, float)) and not isinstance(amount, bool)
+                   and amount >= 0, f"cost_estimate.amount must be a number >= 0, got {amount!r}")
+            for key in ("unit", "provenance"):
+                value = estimate.get(key)
+                _check(problems, isinstance(value, str) and bool(value.strip()),
+                       f"cost_estimate.{key} must be a non-empty string (explicit units/provenance)")
+            extra = sorted(set(estimate) - {"amount", "unit", "provenance"})
+            _check(problems, not extra, f"cost_estimate has unexpected keys: {', '.join(extra)}")
+    if record.capacity is not None:
+        _check(problems, isinstance(record.capacity, int) and not isinstance(record.capacity, bool)
+               and record.capacity >= 1, f"capacity must be an integer >= 1 or null, got {record.capacity!r}")
+    _check(problems, isinstance(record.enabled, bool), "enabled must be a boolean")
+    if record.enabled is False:
+        _check_utc(problems, record.disabled_at, "disabled_at")
+    elif record.enabled is True:
+        _check(problems, record.disabled_at is None, "an enabled profile must not have 'disabled_at'")
+    if record.last_checkin is not None:
+        _check_utc(problems, record.last_checkin, "last_checkin")
+    texts = [getattr(record, label) for label in _LABEL_FIELDS] + list(capabilities)
+    texts.append(record.disabled_reason)
+    if isinstance(estimate, dict):
+        texts.extend([estimate.get("unit"), estimate.get("provenance")])
+    if any(looks_like_secret(text) for text in texts):
+        problems.append("a profile value looks like a credential; profiles never store secrets")
+    return problems
+
+
 def validate_record(record) -> List[str]:
     """Invariant problems for a single record, or `[]` when it is clean.
 
@@ -1394,7 +1567,8 @@ def validate_collection(records) -> List[str]:
 
     - at most one active attempt per ticket (one active attempt per ticket
       initially);
-    - at most one active claim per (workspace, path).
+    - at most one active claim per (workspace, path);
+    - at most one worker profile per worker id.
 
     Duplicate ids and duplicate event cursors are also reported, because both
     make "which record is current" unanswerable.
@@ -1404,6 +1578,7 @@ def validate_collection(records) -> List[str]:
     cursors = {}
     active_attempts = {}
     active_claims = {}
+    profiles = {}
 
     for record in records:
         record_id = getattr(record, "record_id", None)
@@ -1430,6 +1605,15 @@ def validate_collection(records) -> List[str]:
             else:
                 active_attempts[key] = record.id
 
+        if isinstance(record, WorkerProfile):
+            if record.worker_id in profiles:
+                problems.append(
+                    f"worker {record.worker_id!r} has two profiles ({profiles[record.worker_id]} "
+                    f"and {record.id}); one profile per worker id"
+                )
+            else:
+                profiles[record.worker_id] = record.id
+
         if isinstance(record, FileClaim) and record.is_active:
             key = (record.workspace_id, record.path)
             if key in active_claims:
@@ -1452,6 +1636,10 @@ __all__ = [
     "ABSENT",
     "ATTRIBUTION_NOTICE",
     "ATTEMPT_STATES",
+    "COST_CLASSES",
+    "WORKER_LOCALITIES",
+    "WorkerProfile",
+    "looks_like_secret",
     "Artifact",
     "artifact_id_for_digest",
     "CLAIM_STATES",

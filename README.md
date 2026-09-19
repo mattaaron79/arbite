@@ -439,8 +439,35 @@ generation over the current bytes — then read and write.
 
 No runner/daemon/watcher/scheduler, no automatic stale detection or takeover, no
 worktrees or merge workflow, no central database, no dashboard or factory, and no
-artifact GC. The job-board features (worker profiles, reservations, offers) are a
-separate, later epic and are not part of this workflow.
+artifact GC. Of the job-board epic, only passive worker profiles exist so far (see
+[Worker profiles](#worker-profiles-optional)); reservations, offers, continuity
+packages, a board view and event queries are not implemented yet.
+
+### Worker profiles (optional)
+
+`arbite worker register <id> --tier <tier>` records an optional, provider-neutral
+profile for a worker id: configured tier, capability labels, execution locality
+(`local`/`remote`/`unknown`), cost class (`local`/`paid`/`unknown`) with an
+optional estimate that must carry explicit units and provenance, and a declared
+capacity. `worker show|list|update|disable|enable|checkin|check` complete the
+surface, all with `--json`. Nothing is launched or contacted: provider, model and
+runtime are labels, every value is an operator assertion rather than verified
+identity, and credential-like values are refused.
+
+Registration is never required — ad-hoc worker ids keep claiming as before. Once a
+worker id *is* registered, its configured tier is authoritative at acquisition:
+`claim` and `list next --claim` refuse a ticket above it (`worker_ineligible` /
+`tier_insufficient`), `list next --tier` may narrow the search but never exceed
+it (`declared_tier_exceeds_profile`), and `--force` does not bypass it. Changing
+the tier is an explicit `worker update --tier`, recorded as a `worker_updated`
+event with before/after values. `disable` stops new acquisitions while keeping the
+profile, its events and every attempt that names the worker; running attempts are
+not revoked. `last_checkin` is declared activity, never verified liveness, and
+declared capacity is recorded but not yet enforced. `worker check` evaluates a
+worker against a ticket's tier or explicit constraints (`--require-capability`,
+`--local-only`, `--max-cost N --max-cost-unit U`) and lists every unmet or unknown
+constraint with a stable reason code; it writes nothing and does not evaluate
+readiness.
 
 ---
 
@@ -498,6 +525,7 @@ The package exposes the console script `arbite`, providing:
 | Proxy discovery/read | `file list`, `file search`, `file read [--lines S:E] [--fail-if-busy]`, `file probe` |
 | Proxy mutation | `file claim`, `file release`, `file write`, `file edit`, `file remove`, `file rename` |
 | Evidence | `changes [--attempt A] [--include-reads]` |
+| Worker profiles | `worker register\|show\|list\|update\|disable\|enable\|checkin\|check` |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run] [--coordination\|--no-coordination]`, `rebind --to <sink>`, `export [--scope ...] [--out FILE] [--no-artifacts]` |
 | Integrity | `doctor [--fix]` (tickets plus coordination findings) |
 | Destruction | `delete <id> --force` |
@@ -786,6 +814,8 @@ src/arbite/
   changes.py            the bounded change/evidence query surface
   coordination_export.py  coordination history export/migration
   coordination_doctor.py  coordination integrity findings (and unambiguous repairs)
+  workers.py            passive worker profiles (register/update/disable/check-in)
+  eligibility.py        worker eligibility vocabulary and pure evaluation
 tests/
   test_sink_conformance.py  one suite, run against every sink
   test_file_sink.py         file-specific: folders, drift, temp files, archives
@@ -817,7 +847,9 @@ The shared-directory coordination layer is implemented on top of that: the
 `arbite file` proxy (discovery, versioned reads, exclusive claims, journalled
 write/edit/remove/rename), work attempts with guarded lifecycle cleanup, durable
 change evidence (`arbite changes`), crash-safe recovery with no daemon, and
-coordination-aware `export`/`rebind`/`migrate --coordination`/`doctor`. Both sinks
+coordination-aware `export`/`rebind`/`migrate --coordination`/`doctor`. The
+job-board epic has begun with passive worker profiles and eligibility checks at
+acquisition; its reservations, offers and packages are still to come. Both sinks
 carry the same semantics, and the file sink never requires SQLite. Deliberately
 absent, and documented as such above: any runner, daemon, watcher or scheduler,
 automatic stale detection or takeover, worktrees, a central database, a dashboard,

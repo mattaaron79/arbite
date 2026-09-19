@@ -525,6 +525,30 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         )
     add("")
 
+    add("## Worker profiles (optional)")
+    add("")
+    add(
+        "A worker id needs no registration: unregistered (ad-hoc) ids claim work exactly as above. "
+        "An operator may register a passive profile with `arbite worker register <id> --tier <tier> "
+        "[--provider/--model/--runtime LABEL] [--capability CAP] [--locality local|remote|unknown] "
+        "[--cost-class local|paid|unknown] [--cost-amount N --cost-unit U --cost-provenance TEXT] "
+        "[--capacity N]`, then `worker show|list|update|disable|enable|checkin|check`, all with "
+        "`--json`. Registration launches nothing and calls no provider; labels are labels, every "
+        "value is an operator assertion (not verified identity), and credential-like values are "
+        "refused. Once registered, the profile's tier is authoritative for that id: `claim` and "
+        "`list next --claim` refuse tickets above it (`worker_ineligible`, reason "
+        "`tier_insufficient`), `list next --tier` may narrow but never exceed it "
+        "(`declared_tier_exceeds_profile`), `--force` does not bypass it, and a disabled profile "
+        "takes no new work while its history and running attempts are kept. Tier changes happen "
+        "only through `arbite worker update --tier`, recorded as a `worker_updated` event. "
+        "`last_checkin` is the worker's own declaration, never verified liveness; declared "
+        "capacity is recorded but not yet enforced. `arbite worker check <id> [--ticket T] "
+        "[--require-capability CAP] [--local-only] [--max-cost N --max-cost-unit U]` explains "
+        "eligibility with stable reason codes and writes nothing; an unknown value fails an "
+        "explicit constraint. Reservations, offers, packages and a job board are not available yet."
+    )
+    add("")
+
     # -- Workflow ----------------------------------------------------------
     add("## Typical workflow")
     add("")

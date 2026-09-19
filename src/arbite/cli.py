@@ -36,12 +36,14 @@ from . import (
     coordination_doctor,
     coordination_export,
     docs,
+    eligibility,
     fileclaims,
     filemutations,
     filereads,
     graph,
     lifecycle,
     schema,
+    workers,
     workspace,
 )
 from .application import Actor
@@ -759,13 +761,34 @@ def _cmd_list_next(args, sink, every):
     # rather than failing the whole dispatch: each claim is individually atomic,
     # so a partial batch is a correct result, not a broken one.
     ctl = _lifecycle(args, sink, agent=args.claim)
+    # A registered worker is selected through its profile: --tier may narrow the
+    # search but never exceed the configured tier (refused outright), and tickets
+    # the profile cannot take are skipped. acquire() re-checks both.
+    declaration = ctl.worker_declaration(args.claim, declared_tier=args.tier)
+    if not declaration.enabled:
+        eligibility.evaluate(eligibility.Requirements(restricted=False), declaration).require()
+    requirements_for = eligibility.requirements_for_ticket
+    eligible = [
+        t for t in candidates
+        if eligibility.evaluate(requirements_for(t), declaration).eligible
+    ]
+    if len(eligible) < len(candidates):
+        print(
+            f"note: skipped {len(candidates) - len(eligible)} workable ticket(s) above "
+            f"{args.claim}'s configured tier ({declaration.tier})",
+            file=sys.stderr,
+        )
+    candidates = eligible
+    if not candidates:
+        _emit_tickets([], args.json, sink)
+        return
     claimed = []
     errors = []
     for candidate in candidates:
         if len(claimed) == wanted:
             break
         try:
-            result = ctl.acquire(candidate, worker_id=args.claim)
+            result = ctl.acquire(candidate, worker_id=args.claim, declared_tier=args.tier)
         except ArbiteError as e:
             # Lost the race for this one (or it stopped being ready). The next
             # candidate is untouched, so the loop simply moves on to it.
@@ -1976,6 +1999,7 @@ _EXPORT_COORDINATION_COUNT_KEYS = (
     "operation_intents",
     "recovery_reports",
     "lifecycle_intents",
+    "worker_profiles",
     "events",
     "artifacts",
 )
@@ -2835,6 +2859,239 @@ def cmd_changes(args):
     _emit_file_result(args, view.to_dict(), _change_lines(view))
 
 
+# --- worker profiles (multi-provider job board, B01) ------------------------
+
+
+def _worker_store(sink):
+    store = sink.coordination()
+    if store is None:
+        raise UnsupportedCoordination(
+            f"the {getattr(sink, 'kind', '?')} sink has no coordination store, so worker "
+            "profiles cannot be recorded"
+        )
+    return store
+
+
+def _worker_service(args, sink) -> "workers.WorkerProfileService":
+    return workers.WorkerProfileService(
+        _worker_store(sink), actor=getattr(args, "actor", None) or None
+    )
+
+
+def _worker_lines(view: dict) -> list:
+    """Human rendering of one profile view. Availability is labelled declared."""
+    labels = " / ".join(view.get(k) or "-" for k in ("provider", "model", "runtime"))
+    estimate = view.get("cost_estimate")
+    cost = f"class {view['cost_class']}"
+    if estimate:
+        cost += (
+            f", estimate {estimate['amount']} {estimate['unit']} "
+            f"(provenance: {estimate['provenance']})"
+        )
+    capacity = view.get("capacity")
+    lines = [
+        f"worker {view['worker_id']} [{view['state']}] profile {view['id']} "
+        f"revision {view['revision']}",
+        f"  tier: {view['tier']} (configured; authoritative for this worker id)",
+        f"  provider / model / runtime: {labels} (labels only)",
+        f"  capabilities: {', '.join(view['capabilities']) or '(none declared)'}",
+        f"  locality: {view['locality']}",
+        f"  cost: {cost}",
+        f"  capacity: {capacity if capacity is not None else '(undeclared)'} (declared)",
+        f"  last checkin: {view.get('last_checkin') or 'never'} (declared by the worker; "
+        "not verified liveness)",
+        f"  created: {view['created']}  updated: {view['updated']}",
+    ]
+    if view["state"] == "disabled":
+        reason = view.get("disabled_reason") or "no reason recorded"
+        lines.append(f"  disabled: {view.get('disabled_at')} ({reason})")
+    return lines
+
+
+def _emit_worker(args, stored, *, extra=None, headline=None) -> None:
+    view = stored.view()
+    if getattr(args, "json", False):
+        payload = {"profile": view, "liveness_notice": workers.LIVENESS_NOTICE}
+        payload.update(extra or {})
+        _print_json(coordination.ok_result(payload))
+        return
+    if headline:
+        print(headline)
+    for line in _worker_lines(view):
+        print(line)
+
+
+def _worker_profile_fields(args) -> dict:
+    """The update keyword arguments the given flags name (absent flags omitted)."""
+    fields = {}
+    if args.tier is not None:
+        fields["tier"] = args.tier
+    for name in ("provider", "model", "runtime", "locality"):
+        value = getattr(args, name, None)
+        if value is not None:
+            fields[name] = value
+    if args.cost_class is not None:
+        fields["cost_class"] = args.cost_class
+    estimate = workers.build_cost_estimate(args.cost_amount, args.cost_unit, args.cost_provenance)
+    if estimate is not None:
+        fields["cost_estimate"] = estimate
+    if args.capacity is not None:
+        fields["capacity"] = workers.parse_capacity(args.capacity)
+    return fields
+
+
+def cmd_worker(args):
+    """Worker profiles: optional, passive declarations about a worker id.
+
+    Nothing here launches an agent, calls a provider or checks liveness. A
+    registered profile's tier is authoritative at acquisition (`claim`, `list
+    next --claim`); an unregistered (ad-hoc) worker id keeps working as before."""
+    sink = _require_sink(args)
+    try:
+        _run_worker_command(args, sink)
+    except CoordinationError as error:
+        _file_error(args, error)
+
+
+def _run_worker_command(args, sink) -> None:
+    command = args.worker_command
+    service = _worker_service(args, sink)
+
+    if command == "register":
+        fields = _worker_profile_fields(args)
+        fields.pop("tier", None)
+        change = service.register(
+            args.worker,
+            tier=args.tier,
+            capabilities=args.capability,
+            **fields,
+        )
+        _emit_worker(args, change.stored, extra={"changes": change.changes},
+                     headline=f"registered worker {args.worker}")
+        return
+
+    if command == "show":
+        _emit_worker(args, service.get(args.worker))
+        return
+
+    if command == "list":
+        rows = service.list(state=args.state)
+        if args.json:
+            _print_json(coordination.ok_result({
+                "workers": [row.view() for row in rows],
+                "count": len(rows),
+                "liveness_notice": workers.LIVENESS_NOTICE,
+            }))
+        elif rows:
+            print(f"{'WORKER':<28} {'STATE':<9} {'TIER':<9} {'PROVIDER/MODEL':<30} "
+                  "LAST CHECKIN (declared)")
+            for row in rows:
+                view = row.view()
+                labels = "/".join(view.get(k) or "-" for k in ("provider", "model"))
+                print(f"{view['worker_id']:<28} {view['state']:<9} {view['tier']:<9} "
+                      f"{labels:<30} {view.get('last_checkin') or 'never'}")
+        else:
+            print("no worker profiles registered (ad-hoc worker ids need none)")
+        if not rows:
+            sys.exit(EXIT_EMPTY)
+        return
+
+    if command == "update":
+        fields = _worker_profile_fields(args)
+        for name in ("provider", "model", "runtime"):
+            if name in fields and fields[name] == "":
+                fields[name] = None
+        if args.clear_cost_estimate:
+            if "cost_estimate" in fields:
+                raise TicketError("--clear-cost-estimate conflicts with --cost-amount/--cost-unit")
+            fields["cost_estimate"] = None
+        if args.capability:
+            fields["capabilities"] = args.capability
+        change = service.update(
+            args.worker,
+            expect_revision=args.expect_revision,
+            reason=args.reason,
+            add_capabilities=args.add_capability,
+            remove_capabilities=args.remove_capability,
+            **fields,
+        )
+        headline = (
+            f"updated worker {args.worker}: {', '.join(sorted(change.changes))}"
+            if change.changed else f"worker {args.worker} unchanged"
+        )
+        _emit_worker(args, change.stored, extra={"changes": change.changes}, headline=headline)
+        return
+
+    if command in ("disable", "enable"):
+        operation = service.disable if command == "disable" else service.enable
+        change = operation(args.worker, reason=args.reason, expect_revision=args.expect_revision)
+        verb = "disabled" if command == "disable" else "enabled"
+        headline = (
+            f"{verb} worker {args.worker}" if change.changed
+            else f"worker {args.worker} was already {verb}"
+        )
+        _emit_worker(args, change.stored, extra={"changes": change.changes}, headline=headline)
+        return
+
+    if command == "checkin":
+        stored = service.checkin(args.worker)
+        _emit_worker(args, stored, headline=(
+            f"recorded declared check-in for {args.worker} at {stored.profile.last_checkin}"
+        ))
+        return
+
+    if command == "check":
+        _worker_check(args, sink, service)
+        return
+
+    raise TicketError(f"unknown worker command {command!r}")
+
+
+def _worker_check(args, sink, service) -> None:
+    """Evaluate worker constraints only (no readiness, nothing written)."""
+    ticket = sink.get(args.ticket) if args.ticket else None
+    explicit = bool(
+        args.min_tier or args.require_capability or args.local_only
+        or args.max_cost is not None or args.allowed_worker
+    )
+    if args.max_cost is not None and not args.max_cost_unit:
+        raise TicketError("--max-cost needs --max-cost-unit (costs are never unit-less)")
+    if explicit:
+        requirements = eligibility.Requirements(
+            min_tier=args.min_tier or (ticket.tier if ticket is not None
+                                       and ticket.tier in eligibility.TIER_RANK else None),
+            capabilities=tuple(workers.normalise_capabilities(args.require_capability)),
+            local_only=bool(args.local_only),
+            max_cost=(
+                {"amount": args.max_cost, "unit": args.max_cost_unit}
+                if args.max_cost is not None else None
+            ),
+            allowed_workers=tuple(_split_csv(",".join(args.allowed_worker or []))),
+            restricted=not args.unrestricted,
+        )
+    elif ticket is not None:
+        requirements = eligibility.requirements_for_ticket(ticket)
+    else:
+        requirements = eligibility.Requirements(restricted=not args.unrestricted)
+    declaration = service.declaration(args.worker, declared_tier=args.declared_tier)
+    result = eligibility.evaluate(requirements, declaration)
+    if args.json:
+        payload = result.to_dict()
+        payload["ticket_id"] = ticket.id if ticket is not None else None
+        payload["scope"] = "worker constraints only; readiness is checked at acquisition"
+        _print_json(coordination.ok_result(payload))
+        return
+    verdict = "eligible" if result.eligible else "NOT eligible"
+    subject = f" for {ticket.id}" if ticket is not None else ""
+    source = "registered profile" if declaration.registered else "ad-hoc (no profile)"
+    print(f"worker {args.worker} ({source}) is {verdict}{subject}")
+    for reason in result.reasons:
+        print(f"  refused [{reason.code}]: {reason.message}")
+    for note in result.notes:
+        print(f"  note [{note.code}]: {note.message}")
+    print("  (worker constraints only; readiness is checked at acquisition)")
+
+
 def build_parser():
     """Returns (parser, subparsers_by_name). The dict is used by `arbite init` to
     render .arbite/AGENTS.md's command reference straight from these parsers
@@ -3040,7 +3297,8 @@ def build_parser():
         "--tier",
         choices=TIERS,
         help="filter by agent capability tier; with 'next', pass your own tier so you "
-        f"are only offered work you can actually do. {schema.TIER_HELP}",
+        "are only offered work you can actually do (with --claim, a registered worker "
+        f"profile's configured tier caps it). {schema.TIER_HELP}",
     )
     p_list.add_argument("--domain", help="filter by domain")
     p_list.add_argument("--epic", help="filter by epic (the larger initiative a ticket belongs to), e.g. 'mesh-pipeline'")
@@ -3998,6 +4256,167 @@ def build_parser():
     _json_flag(p_file_rename)
     _sink_flag(p_file_rename)
     p_file_rename.set_defaults(func=cmd_file_rename)
+
+    p_worker = sub.add_parser(
+        "worker",
+        help="register, show, list, update, disable or check passive worker profiles",
+        description="Optional, provider-neutral worker profiles for the job board. A "
+        "profile records a worker id's configured tier, capability labels, execution "
+        "locality, cost class (with an optional estimate in explicit units), declared "
+        "capacity and enabled state. Registration launches nothing, calls no provider "
+        "API and verifies nothing: provider/model/runtime are labels, every value is an "
+        "operator assertion, and credentials are refused. A registered profile's tier "
+        "is authoritative when that worker id acquires work (claim, list next --claim): "
+        "a per-call --tier cannot exceed it and a disabled profile cannot take new "
+        "work. Unregistered (ad-hoc) worker ids keep working as before. last_checkin is "
+        "declared activity, never verified liveness. Disable keeps the profile and its "
+        "history; there is no delete. Declared capacity is recorded but not yet "
+        "enforced.",
+    )
+    worker_sub = p_worker.add_subparsers(dest="worker_command", required=True)
+
+    def worker_parser(name, help_text, description):
+        parser_ = worker_sub.add_parser(name, help=help_text, description=description)
+        parser_.add_argument("worker", metavar="WORKER", help="worker id, e.g. claude.opus-5.002")
+        return parser_
+
+    def profile_flags(parser_, *, register):
+        parser_.add_argument(
+            "--tier", choices=TIERS, required=register,
+            help="configured capability tier (authoritative for this worker id)",
+        )
+        for name, what in (
+            ("provider", "provider label, e.g. anthropic, openai, local"),
+            ("model", "model label, e.g. claude-opus-5"),
+            ("runtime", "runtime/harness label, e.g. claude-code"),
+        ):
+            parser_.add_argument(
+                f"--{name}", default=None, metavar="LABEL",
+                help=what + (" (labels only; never used to call a provider)" if register
+                             else "; '' clears it"),
+            )
+        parser_.add_argument(
+            "--capability", action="append", default=None, metavar="CAP",
+            help="capability/tool label (repeatable or comma-separated); on update it "
+            "replaces the whole set",
+        )
+        parser_.add_argument(
+            "--locality", choices=coordination.WORKER_LOCALITIES, default=None,
+            help="declared execution locality (default unknown)",
+        )
+        parser_.add_argument(
+            "--cost-class", choices=coordination.COST_CLASSES, default=None,
+            help="declared cost class (default unknown)",
+        )
+        parser_.add_argument("--cost-amount", default=None, metavar="N",
+                             help="optional estimated cost amount (needs --cost-unit and "
+                             "--cost-provenance)")
+        parser_.add_argument("--cost-unit", default=None, metavar="UNIT",
+                             help="explicit unit for --cost-amount, e.g. USD/ticket")
+        parser_.add_argument("--cost-provenance", default=None, metavar="TEXT",
+                             help="where the estimate comes from, e.g. 'operator guess 2026-09'")
+        parser_.add_argument("--capacity", default=None, metavar="N",
+                             help="declared concurrent-work capacity (integer >= 1"
+                             + ("" if register else ", or 'none' to clear") + "); "
+                             "recorded, not yet enforced")
+        parser_.add_argument("--actor", default=None, metavar="NAME",
+                             help="who is making this change (attribution only)")
+        _json_flag(parser_)
+        _sink_flag(parser_)
+        parser_.set_defaults(func=cmd_worker)
+
+    p_w_register = worker_parser(
+        "register", "register a new worker profile",
+        "Register a profile for WORKER. Refused when WORKER already has one (use update).",
+    )
+    profile_flags(p_w_register, register=True)
+
+    p_w_update = worker_parser(
+        "update", "change a worker profile explicitly",
+        "Change the named fields of WORKER's profile; omitted flags are untouched. The "
+        "change (including any tier change) is recorded as a worker_updated event with "
+        "before/after values. Running attempts are never revoked by a profile change.",
+    )
+    profile_flags(p_w_update, register=False)
+    p_w_update.add_argument("--add-capability", action="append", default=None, metavar="CAP",
+                            help="add capability label(s)")
+    p_w_update.add_argument("--remove-capability", action="append", default=None,
+                            metavar="CAP", help="remove capability label(s)")
+    p_w_update.add_argument("--clear-cost-estimate", action="store_true",
+                            help="remove the cost estimate")
+
+    for name, help_text, description in (
+        ("disable", "disable a worker profile (history is kept)",
+         "Stop WORKER from acquiring new work. The profile, its events and every attempt "
+         "that references the worker id are kept; running attempts are not revoked."),
+        ("enable", "re-enable a disabled worker profile",
+         "Allow WORKER to acquire new work again."),
+    ):
+        parser_ = worker_parser(name, help_text, description)
+        parser_.add_argument("--reason", default=None, metavar="TEXT",
+                             help="why (recorded with the event)")
+        parser_.add_argument("--expect-revision", type=int, default=None, metavar="N",
+                             help="refuse unless the profile is at this revision")
+        parser_.add_argument("--actor", default=None, metavar="NAME",
+                             help="who is making this change (attribution only)")
+        _json_flag(parser_)
+        _sink_flag(parser_)
+        parser_.set_defaults(func=cmd_worker)
+
+    p_w_update.add_argument("--reason", default=None, metavar="TEXT",
+                            help="why (recorded with the event)")
+    p_w_update.add_argument("--expect-revision", type=int, default=None, metavar="N",
+                            help="refuse unless the profile is at this revision")
+
+    for name, help_text, description in (
+        ("show", "show one worker profile", "Show WORKER's profile, revision and state."),
+        ("checkin", "record a declared check-in (not liveness)",
+         "Set WORKER's last_checkin to now. This is the worker's own declaration of "
+         "activity; arbite never infers from it that the worker is running, and records no "
+         "event for it."),
+    ):
+        parser_ = worker_parser(name, help_text, description)
+        _json_flag(parser_)
+        _sink_flag(parser_)
+        parser_.set_defaults(func=cmd_worker)
+
+    p_w_list = worker_sub.add_parser(
+        "list", help="list worker profiles",
+        description="List registered profiles sorted by worker id. Exits 2 when none.",
+    )
+    p_w_list.add_argument("--state", choices=("all", "enabled", "disabled"), default="all",
+                          help="which profiles to list (default all)")
+    _json_flag(p_w_list)
+    _sink_flag(p_w_list)
+    p_w_list.set_defaults(func=cmd_worker)
+
+    p_w_check = worker_parser(
+        "check", "evaluate a worker against worker constraints (writes nothing)",
+        "Evaluate WORKER (registered or ad-hoc) against a ticket's tier (--ticket) or "
+        "explicit constraints, and list every unmet constraint with a stable reason "
+        "code. Explicit constraints are restricted by default: an unknown tier, "
+        "capability set, locality or cost fails. Readiness (status, dependencies, "
+        "active attempts) is not evaluated; acquisition checks it.",
+    )
+    p_w_check.add_argument("--ticket", default=None, metavar="T",
+                           help="use this ticket's tier as the minimum tier")
+    p_w_check.add_argument("--min-tier", choices=TIERS, default=None, help="required minimum tier")
+    p_w_check.add_argument("--require-capability", action="append", default=None, metavar="CAP",
+                           help="required capability label (repeatable or comma-separated)")
+    p_w_check.add_argument("--local-only", action="store_true", help="require local execution")
+    p_w_check.add_argument("--max-cost", type=float, default=None, metavar="N",
+                           help="cost ceiling amount (needs --max-cost-unit)")
+    p_w_check.add_argument("--max-cost-unit", default=None, metavar="UNIT",
+                           help="unit of --max-cost; never converted")
+    p_w_check.add_argument("--allowed-worker", action="append", default=None, metavar="W",
+                           help="restrict to these worker ids (repeatable or comma-separated)")
+    p_w_check.add_argument("--unrestricted", action="store_true",
+                           help="treat unknown worker values as advisory notes instead of failures")
+    p_w_check.add_argument("--declared-tier", choices=TIERS, default=None,
+                           help="a per-call tier declaration (may not exceed a registered profile)")
+    _json_flag(p_w_check)
+    _sink_flag(p_w_check)
+    p_w_check.set_defaults(func=cmd_worker)
 
     p_changes = sub.add_parser(
         "changes",

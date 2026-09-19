@@ -135,7 +135,7 @@ import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from . import coordination, graph, schema
+from . import coordination, eligibility, graph, schema, workers
 from .application import Actor, CoordinationService, require_active_attempt
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
@@ -722,6 +722,7 @@ class TicketLifecycle:
         adopt: bool = False,
         takeover: bool = False,
         reason: Optional[str] = None,
+        declared_tier: Optional[str] = None,
     ) -> AcquisitionResult:
         """Acquire `ticket` for `worker_id`, recording exactly one active attempt.
 
@@ -730,6 +731,11 @@ class TicketLifecycle:
         with compensation) and for the three origins. Readiness is enforced
         *here*, under the operation lock, not by the caller's candidate filter, so
         no acquisition path can bypass it.
+
+        Worker eligibility (B01) is enforced here too, for every origin: a
+        registered worker is evaluated through its profile (configured tier
+        authoritative, disabled refused, `declared_tier` may not exceed it); an
+        ad-hoc worker keeps the legacy behaviour. `--force` does not bypass it.
         """
         # Settle any transition a crash left behind, then re-read from the sink:
         # the caller's copy may be stale, and the compare-and-swap below must
@@ -854,6 +860,8 @@ class TicketLifecycle:
                     "it first"
                 )
 
+        self.require_eligible(current, worker_id, declared_tier=declared_tier)
+
         now = self.now()
         attempt = WorkAttempt(
             id=new_record_id("work_attempt"),
@@ -905,6 +913,22 @@ class TicketLifecycle:
             created_attempt=True,
             took_over=bool((takeover and active is not None) or legacy_takeover),
         )
+
+    def worker_declaration(
+        self, worker_id: str, *, declared_tier: Optional[str] = None
+    ) -> "eligibility.WorkerDeclaration":
+        """What is known about `worker_id` (its profile, else ad hoc)."""
+        return workers.declaration_for(
+            self.coordination.store, worker_id, declared_tier=declared_tier
+        )
+
+    def require_eligible(
+        self, ticket: Ticket, worker_id: str, *, declared_tier: Optional[str] = None
+    ) -> "eligibility.Eligibility":
+        """Raise `WorkerIneligible` unless `worker_id` may acquire `ticket`."""
+        declaration = self.worker_declaration(worker_id, declared_tier=declared_tier)
+        result = eligibility.evaluate(eligibility.requirements_for_ticket(ticket), declaration)
+        return result.require(subject=f"ticket {ticket.id}")
 
     def _handoff_for(
         self,

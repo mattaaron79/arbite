@@ -124,6 +124,10 @@ class ErrorCode:
     EDIT_SELECTION = "edit_selection"
     #: The storage layer itself failed.
     SINK_ERROR = "sink_error"
+    #: A worker does not satisfy a ticket's/offer's worker constraints (or its
+    #: registered profile is disabled). `details["reasons"]` lists each unmet
+    #: constraint with a stable `code`.
+    WORKER_INELIGIBLE = "worker_ineligible"
 
 
 class CoordinationError(ArbiteError):
@@ -309,3 +313,13 @@ class EditSelectionError(CoordinationError):
 
     error_code = ErrorCode.EDIT_SELECTION
     retryable = True
+
+
+class WorkerIneligible(CoordinationError):
+    """A worker may not acquire this work: its profile is disabled, a per-call
+    declaration tried to exceed the configured profile, or a constraint is unmet
+    or unknown. `details` carries `worker_id` and `reasons` (each with a stable
+    `code`); nothing was written. Not retryable as-is: the profile or the
+    requirement has to change first."""
+
+    error_code = ErrorCode.WORKER_INELIGIBLE

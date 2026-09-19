@@ -31,11 +31,12 @@ purely. Its keys are exactly:
 - ``workspace_id`` -- the requested/selected workspace id, or `None`.
 - ``bound_at`` -- the matching `StoreBinding.bound_at` for the selected
   workspace, or `None`.
-- ``records`` -- a mapping of these nine **exact** group keys, always present
+- ``records`` -- a mapping of these ten **exact** group keys, always present
   in a bundle this version writes (possibly empty), each a list of
   ``record.to_dict()``. ``lifecycle_intents`` was added after the first bundles
   were written, so a bundle *without* it still verifies and imports (as if it
-  were empty):
+  were empty); the same holds for ``worker_profiles`` (store-level, exported
+  whatever ``workspace_id`` is selected):
 
   ========================  ==========================
   group key                 record kind
@@ -49,6 +50,7 @@ purely. Its keys are exactly:
   ``operation_intents``     operation_intent
   ``recovery_reports``      recovery_report
   ``lifecycle_intents``     lifecycle_intent
+  ``worker_profiles``       worker_profile
   ========================  ==========================
 
   ``artifact`` records are *not* a record group: their content lives in
@@ -139,7 +141,7 @@ from .sinks.base import Problem
 #: incompatibly; `read_bundle` refuses anything but this value.
 EXPORT_VERSION = 1
 
-#: The eight record groups, in a fixed order, so the bundle shape is stable even
+#: The record groups, in a fixed order, so the bundle shape is stable even
 #: when a group is empty.
 RECORD_GROUPS = (
     "workspaces",
@@ -151,11 +153,12 @@ RECORD_GROUPS = (
     "operation_intents",
     "recovery_reports",
     "lifecycle_intents",
+    "worker_profiles",
 )
 
 #: Record groups added after the first bundles were written: a bundle that lacks
 #: one still verifies, and imports as though the group were empty.
-OPTIONAL_RECORD_GROUPS = ("lifecycle_intents",)
+OPTIONAL_RECORD_GROUPS = ("lifecycle_intents", "worker_profiles")
 
 #: Record kind -> bundle group. The mapping is total over coordination records
 #: except `artifact`, whose content is carried in `artifacts` instead.
@@ -169,6 +172,7 @@ GROUP_FOR_KIND = {
     "operation_intent": "operation_intents",
     "recovery_report": "recovery_reports",
     "lifecycle_intent": "lifecycle_intents",
+    "worker_profile": "worker_profiles",
 }
 
 #: Every top-level key a well-formed bundle must have.
@@ -367,6 +371,8 @@ def export_coordination(sink, *, workspace_id: Optional[str] = None,
                 i for i in raw["lifecycle_intent"]
                 if workspace_id is None or i.workspace_id == workspace_id
             ],
+            # Profiles are store-level, not per workspace: always carried.
+            "worker_profiles": list(raw["worker_profile"]),
         }
 
         exported_operation_ids = {r.id for r in kept["operation_receipts"]}
@@ -704,6 +710,7 @@ def bundle_problems(bundle) -> list:
     intent_ids = {i.get("id") for i in intents}
     report_ids = {r.get("id") for r in reports}
     binding_ids = {b.get("id") for b in bindings}
+    profile_ids = {p.get("id") for p in group("worker_profiles")}
 
     ticket_ids = set()
     for record in attempts + claims + receipts + intents:
@@ -716,7 +723,7 @@ def bundle_problems(bundle) -> list:
 
     known_ids = (
         workspace_ids | attempt_ids | claim_ids | observation_ids
-        | receipt_ids | intent_ids | report_ids | binding_ids
+        | receipt_ids | intent_ids | report_ids | binding_ids | profile_ids
     )
 
     # -- orphan claims --------------------------------------------------
