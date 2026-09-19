@@ -42,6 +42,7 @@ from . import (
     filereads,
     graph,
     lifecycle,
+    reservations,
     schema,
     workers,
     workspace,
@@ -733,6 +734,21 @@ def _cmd_list_next(args, sink, every):
         )
     )
     candidates = [t for t in candidates if graph.is_workable(t, by_id)]
+
+    # Members of an active reservation are only for their owner (B02): a plain
+    # listing has no worker identity, so it leaves them out; --claim W keeps W's.
+    held = reservations.active_reservations(sink.coordination())
+    reserved = [
+        t for t in candidates
+        if t.id in held and not (args.claim and reservations.may_acquire(held[t.id], args.claim))
+    ]
+    if reserved:
+        candidates = [t for t in candidates if t not in reserved]
+        print(
+            f"note: skipped {len(reserved)} workable ticket(s) held by reservations "
+            f"({', '.join(sorted({held[t.id].id for t in reserved}))}); see 'arbite reserve list'",
+            file=sys.stderr,
+        )
 
     if not candidates:
         # "Nothing is ready" and "everything is deadlocked" look identical from
@@ -1510,6 +1526,8 @@ def _set_locked(args, sink, ctl):
             new_assignee=requested_assignee,
             attempt=attempt,
         )
+    else:
+        ctl.refuse_reserved_edit(t, new_status=requested_status, new_assignee=requested_assignee)
 
     expect = _expect_from(t)
     original_status = t.status
@@ -2000,6 +2018,7 @@ _EXPORT_COORDINATION_COUNT_KEYS = (
     "recovery_reports",
     "lifecycle_intents",
     "worker_profiles",
+    "reservations",
     "events",
     "artifacts",
 )
@@ -3090,6 +3109,140 @@ def _worker_check(args, sink, service) -> None:
     for note in result.notes:
         print(f"  note [{note.code}]: {note.message}")
     print("  (worker constraints only; readiness is checked at acquisition)")
+
+
+# --- reservations (multi-provider job board, B02) ---------------------------
+
+
+def _reservation_service(args, sink) -> "reservations.ReservationService":
+    _worker_store(sink)
+    agent = getattr(args, "agent", None)
+    return reservations.ReservationService(_lifecycle(args, sink, agent=agent), actor=agent)
+
+
+def _reservation_lines(view: dict) -> list:
+    source = view.get("source") or {}
+    origin = f"epic {source.get('epic')} (snapshot at {source.get('resolved_at')})" \
+        if source.get("kind") == "epic" else "explicit tickets"
+    lines = [
+        f"reservation {view['id']} [{view['state']}] owner {view['owner']} "
+        f"revision {view['revision']}",
+        f"  members ({len(view['members'])}, from {origin}):",
+    ]
+    for member in view.get("member_status") or []:
+        attempt = member.get("active_attempt")
+        doing = f"  active attempt {attempt['attempt_id']} by {attempt['worker_id']}" if attempt else ""
+        assignee = f" @{member['assignee']}" if member.get("assignee") else ""
+        lines.append(
+            f"    {member['ticket_id']} [{member['status']}]{assignee} "
+            f"{member.get('title') or ''}{doing}".rstrip()
+        )
+    if view.get("note"):
+        lines.append(f"  note: {view['note']}")
+    lines.append(f"  created: {view['created']}  updated: {view['updated']}")
+    if view["state"] == "released":
+        why = view.get("release_reason") or "no reason recorded"
+        lines.append(f"  released: {view['released']} by {view.get('released_by')} ({why})")
+    lines.append(f"  ({reservations.RESERVATION_NOTICE})")
+    return lines
+
+
+def _emit_reservation(args, service, stored, *, extra=None, headline=None) -> None:
+    view = service.view(stored)
+    if getattr(args, "json", False):
+        payload = {"reservation": view, "notice": reservations.RESERVATION_NOTICE}
+        payload.update(extra or {})
+        _print_json(coordination.ok_result(payload))
+        return
+    if headline:
+        print(headline)
+    for line in _reservation_lines(view):
+        print(line)
+
+
+def cmd_reserve(args):
+    """Coordinator reservations: hold an explicit ticket set (or an epic
+    snapshot) so only the owner may acquire its members. Never starts work."""
+    sink = _require_sink(args)
+    try:
+        _run_reserve_command(args, sink)
+    except CoordinationError as error:
+        _file_error(args, error)
+
+
+def _run_reserve_command(args, sink) -> None:
+    command = args.reserve_command
+    service = _reservation_service(args, sink)
+
+    if command == "create":
+        change = service.create(args.agent, tickets=args.tickets, epic=args.epic, note=args.note)
+        stored = change.stored
+        _emit_reservation(
+            args, service, stored,
+            extra={"added": change.added, "excluded": change.excluded},
+            headline=f"reserved {len(change.added)} ticket(s) for {args.agent} as "
+                     f"{stored.reservation.id}",
+        )
+        return
+
+    if command == "show":
+        _emit_reservation(args, service, service.get(args.reservation))
+        return
+
+    if command == "list":
+        ticket = sink.get(args.ticket, unique=True).id if args.ticket else None
+        rows = service.list(state=args.state, owner=args.owner, ticket=ticket)
+        if args.json:
+            _print_json(coordination.ok_result({
+                "reservations": [service.view(row) for row in rows],
+                "count": len(rows),
+                "notice": reservations.RESERVATION_NOTICE,
+            }))
+        elif rows:
+            print(f"{'RESERVATION':<22} {'STATE':<9} {'OWNER':<28} {'REV':>3}  MEMBERS")
+            for row in rows:
+                r = row.reservation
+                print(f"{r.id:<22} {r.state:<9} {r.owner:<28} {row.revision:>3}  "
+                      f"{', '.join(r.members)}")
+        else:
+            print("no reservations match")
+        if not rows:
+            sys.exit(EXIT_EMPTY)
+        return
+
+    if command == "add":
+        change = service.add(
+            args.reservation, agent=args.agent, tickets=args.tickets, epic=args.epic,
+            force=args.force, reason=args.reason, expect_revision=args.expect_revision,
+        )
+        headline = (
+            f"added {', '.join(change.added)} to {args.reservation}" if change.added
+            else f"{args.reservation} unchanged (already members)"
+        )
+        _emit_reservation(args, service, change.stored,
+                          extra={"added": change.added, "excluded": change.excluded},
+                          headline=headline)
+        return
+
+    if command in ("remove", "release"):
+        common = dict(agent=args.agent, interrupt=args.interrupt, force=args.force,
+                      reason=args.reason, expect_revision=args.expect_revision)
+        if command == "remove":
+            change = service.remove(args.reservation, tickets=args.tickets, **common)
+            headline = f"removed {', '.join(change.removed)} from {args.reservation}"
+        else:
+            change = service.release(args.reservation, **common)
+            headline = f"released {args.reservation} ({len(change.removed)} member(s) unreserved)"
+        if change.interrupted:
+            headline += "; interrupted " + ", ".join(
+                f"{i['ticket_id']} ({i['worker_id']})" for i in change.interrupted
+            )
+        _emit_reservation(args, service, change.stored,
+                          extra={"removed": change.removed, "interrupted": change.interrupted},
+                          headline=headline)
+        return
+
+    raise TicketError(f"unknown reserve command {command!r}")
 
 
 def build_parser():
@@ -4417,6 +4570,89 @@ def build_parser():
     _json_flag(p_w_check)
     _sink_flag(p_w_check)
     p_w_check.set_defaults(func=cmd_worker)
+
+    p_reserve = sub.add_parser(
+        "reserve",
+        help="create, show, list, change or release coordinator reservations",
+        description="A reservation holds an explicit set of tickets (or a one-time "
+        "snapshot of an epic's non-closed tickets) for a coordinator. While it is "
+        "active only its owner may acquire a member: claim, list next --claim, "
+        "--adopt, --force and 'set status/assignee' refuse everyone else "
+        "(ticket_reserved). A reservation never starts work, creates attempts or "
+        "sets tickets in_progress. Create/add are all-or-nothing and refuse closed "
+        "tickets, overlap with another active reservation (no nesting), active "
+        "attempts by other workers and tickets assigned to someone else. Tickets "
+        "added to an epic later are not included until 'reserve add'. Remove and "
+        "release refuse while an affected member has an active attempt, unless "
+        "--interrupt --reason ends those attempts (ticket back to open). Offers and "
+        "assignments to other workers come later (B03).",
+    )
+    reserve_sub = p_reserve.add_subparsers(dest="reserve_command", required=True)
+
+    def reserve_common(parser_):
+        _json_flag(parser_)
+        _sink_flag(parser_)
+        parser_.set_defaults(func=cmd_reserve)
+
+    def reserve_change_flags(parser_, *, interrupt):
+        parser_.add_argument("--agent", required=True,
+                             help="who is making the change (must be the owner unless --force)")
+        parser_.add_argument("--force", action="store_true",
+                             help="administrative change by a non-owner (needs --reason)")
+        parser_.add_argument("--reason", default=None, metavar="TEXT",
+                             help="why (recorded with the event)")
+        parser_.add_argument("--expect-revision", type=int, default=None, metavar="N",
+                             help="refuse unless the reservation is at this revision")
+        if interrupt:
+            parser_.add_argument(
+                "--interrupt", action="store_true",
+                help="interrupt active attempts on affected members (needs --reason); "
+                "without it the command refuses while work is active",
+            )
+
+    p_r_create = reserve_sub.add_parser(
+        "create", help="reserve tickets for a coordinator (all-or-nothing)",
+        description="Reserve TICKET... (or --epic E, resolved once) for --agent.",
+    )
+    p_r_create.add_argument("tickets", nargs="*", metavar="TICKET", help="member ticket ids")
+    p_r_create.add_argument("--epic", default=None, help="reserve this epic's non-closed tickets "
+                            "as a one-time snapshot")
+    p_r_create.add_argument("--agent", required=True, help="the coordinator (reservation owner)")
+    p_r_create.add_argument("--note", default=None, help="optional purpose note")
+    reserve_common(p_r_create)
+
+    p_r_show = reserve_sub.add_parser("show", help="show one reservation and its members")
+    p_r_show.add_argument("reservation", metavar="RESERVATION", help="reservation id (rsv-...)")
+    reserve_common(p_r_show)
+
+    p_r_list = reserve_sub.add_parser("list", help="list reservations (exit 2 when none)")
+    p_r_list.add_argument("--state", choices=("active", "released", "all"), default="active")
+    p_r_list.add_argument("--owner", default=None, help="only this owner's reservations")
+    p_r_list.add_argument("--ticket", default=None, help="only reservations containing this ticket")
+    reserve_common(p_r_list)
+
+    p_r_add = reserve_sub.add_parser(
+        "add", help="add members atomically",
+        description="Add TICKET... (or --epic E's current non-closed tickets) to RESERVATION.",
+    )
+    p_r_add.add_argument("reservation", metavar="RESERVATION")
+    p_r_add.add_argument("tickets", nargs="*", metavar="TICKET")
+    p_r_add.add_argument("--epic", default=None, help="add this epic's current non-closed tickets")
+    reserve_change_flags(p_r_add, interrupt=False)
+    reserve_common(p_r_add)
+
+    p_r_remove = reserve_sub.add_parser("remove", help="remove members atomically")
+    p_r_remove.add_argument("reservation", metavar="RESERVATION")
+    p_r_remove.add_argument("tickets", nargs="+", metavar="TICKET")
+    reserve_change_flags(p_r_remove, interrupt=True)
+    reserve_common(p_r_remove)
+
+    p_r_release = reserve_sub.add_parser(
+        "release", help="release a reservation (members return to ad-hoc availability)",
+    )
+    p_r_release.add_argument("reservation", metavar="RESERVATION")
+    reserve_change_flags(p_r_release, interrupt=True)
+    reserve_common(p_r_release)
 
     p_changes = sub.add_parser(
         "changes",

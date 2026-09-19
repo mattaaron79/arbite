@@ -439,8 +439,9 @@ generation over the current bytes — then read and write.
 
 No runner/daemon/watcher/scheduler, no automatic stale detection or takeover, no
 worktrees or merge workflow, no central database, no dashboard or factory, and no
-artifact GC. Of the job-board epic, only passive worker profiles exist so far (see
-[Worker profiles](#worker-profiles-optional)); reservations, offers, continuity
+artifact GC. Of the job-board epic, passive worker profiles (see
+[Worker profiles](#worker-profiles-optional)) and coordinator reservations (see
+[Reservations](#reservations-coordinators)) exist so far; offers, continuity
 packages, a board view and event queries are not implemented yet.
 
 ### Worker profiles (optional)
@@ -468,6 +469,30 @@ worker against a ticket's tier or explicit constraints (`--require-capability`,
 `--local-only`, `--max-cost N --max-cost-unit U`) and lists every unmet or unknown
 constraint with a stable reason code; it writes nothing and does not evaluate
 readiness.
+
+### Reservations (coordinators)
+
+`arbite reserve create T1 T2 ... --agent <coordinator>` holds an explicit ticket
+set for a coordinator; `--epic E` instead snapshots the epic's non-closed tickets
+once (tickets added to the epic later are not members until `reserve add`). A
+reservation is ownership of *who may acquire*, not execution: it creates no
+attempt and never sets a ticket `in_progress`. While it is active only the owner
+may acquire a member — `claim`, `list next --claim`, `--adopt`, `--force` and
+`set status in_progress` / `set assignee` refuse everyone else with
+`ticket_reserved`, and a plain `list next` leaves reserved tickets out. Offers and
+direct assignments that let other workers pick up reserved tickets are not
+implemented yet.
+
+Create and `reserve add` are all-or-nothing: one closed, unknown, already-reserved
+(no overlap, so no nesting), otherwise-assigned ticket, or one with another
+worker's active attempt refuses the whole request (`reservation_conflict`, with a
+per-ticket reason). All reservation writes take the same operation lock as
+acquisition, so reserve-vs-claim has one serial outcome. `reserve add|remove|release`
+need `--agent <owner>` (or `--force --reason`) and accept `--expect-revision`;
+`remove`/`release` refuse while an affected member has an active attempt unless
+`--interrupt --reason` ends it (ticket back to open). Released reservations are
+kept as history (`reserve list --state all`), recorded as `reservation` category
+events, and carried by `export`/`migrate --coordination`.
 
 ---
 
@@ -526,6 +551,7 @@ The package exposes the console script `arbite`, providing:
 | Proxy mutation | `file claim`, `file release`, `file write`, `file edit`, `file remove`, `file rename` |
 | Evidence | `changes [--attempt A] [--include-reads]` |
 | Worker profiles | `worker register\|show\|list\|update\|disable\|enable\|checkin\|check` |
+| Reservations | `reserve create\|show\|list\|add\|remove\|release` |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run] [--coordination\|--no-coordination]`, `rebind --to <sink>`, `export [--scope ...] [--out FILE] [--no-artifacts]` |
 | Integrity | `doctor [--fix]` (tickets plus coordination findings) |
 | Destruction | `delete <id> --force` |
@@ -816,6 +842,7 @@ src/arbite/
   coordination_doctor.py  coordination integrity findings (and unambiguous repairs)
   workers.py            passive worker profiles (register/update/disable/check-in)
   eligibility.py        worker eligibility vocabulary and pure evaluation
+  reservations.py       coordinator reservations over explicit ticket sets
 tests/
   test_sink_conformance.py  one suite, run against every sink
   test_file_sink.py         file-specific: folders, drift, temp files, archives
@@ -848,8 +875,8 @@ The shared-directory coordination layer is implemented on top of that: the
 write/edit/remove/rename), work attempts with guarded lifecycle cleanup, durable
 change evidence (`arbite changes`), crash-safe recovery with no daemon, and
 coordination-aware `export`/`rebind`/`migrate --coordination`/`doctor`. The
-job-board epic has begun with passive worker profiles and eligibility checks at
-acquisition; its reservations, offers and packages are still to come. Both sinks
+job-board epic has begun with passive worker profiles, eligibility checks at
+acquisition and coordinator reservations; its offers and packages are still to come. Both sinks
 carry the same semantics, and the file sink never requires SQLite. Deliberately
 absent, and documented as such above: any runner, daemon, watcher or scheduler,
 automatic stale detection or takeover, worktrees, a central database, a dashboard,

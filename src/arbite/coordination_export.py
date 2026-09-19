@@ -31,12 +31,12 @@ purely. Its keys are exactly:
 - ``workspace_id`` -- the requested/selected workspace id, or `None`.
 - ``bound_at`` -- the matching `StoreBinding.bound_at` for the selected
   workspace, or `None`.
-- ``records`` -- a mapping of these ten **exact** group keys, always present
+- ``records`` -- a mapping of these eleven **exact** group keys, always present
   in a bundle this version writes (possibly empty), each a list of
   ``record.to_dict()``. ``lifecycle_intents`` was added after the first bundles
   were written, so a bundle *without* it still verifies and imports (as if it
-  were empty); the same holds for ``worker_profiles`` (store-level, exported
-  whatever ``workspace_id`` is selected):
+  were empty); the same holds for ``worker_profiles`` and ``reservations``
+  (store-level, exported whatever ``workspace_id`` is selected):
 
   ========================  ==========================
   group key                 record kind
@@ -51,6 +51,7 @@ purely. Its keys are exactly:
   ``recovery_reports``      recovery_report
   ``lifecycle_intents``     lifecycle_intent
   ``worker_profiles``       worker_profile
+  ``reservations``          reservation
   ========================  ==========================
 
   ``artifact`` records are *not* a record group: their content lives in
@@ -154,11 +155,12 @@ RECORD_GROUPS = (
     "recovery_reports",
     "lifecycle_intents",
     "worker_profiles",
+    "reservations",
 )
 
 #: Record groups added after the first bundles were written: a bundle that lacks
 #: one still verifies, and imports as though the group were empty.
-OPTIONAL_RECORD_GROUPS = ("lifecycle_intents", "worker_profiles")
+OPTIONAL_RECORD_GROUPS = ("lifecycle_intents", "worker_profiles", "reservations")
 
 #: Record kind -> bundle group. The mapping is total over coordination records
 #: except `artifact`, whose content is carried in `artifacts` instead.
@@ -173,6 +175,7 @@ GROUP_FOR_KIND = {
     "recovery_report": "recovery_reports",
     "lifecycle_intent": "lifecycle_intents",
     "worker_profile": "worker_profiles",
+    "reservation": "reservations",
 }
 
 #: Every top-level key a well-formed bundle must have.
@@ -373,6 +376,8 @@ def export_coordination(sink, *, workspace_id: Optional[str] = None,
             ],
             # Profiles are store-level, not per workspace: always carried.
             "worker_profiles": list(raw["worker_profile"]),
+            # Reservations are store-level (they name tickets): always carried.
+            "reservations": list(raw["reservation"]),
         }
 
         exported_operation_ids = {r.id for r in kept["operation_receipts"]}
@@ -711,6 +716,7 @@ def bundle_problems(bundle) -> list:
     report_ids = {r.get("id") for r in reports}
     binding_ids = {b.get("id") for b in bindings}
     profile_ids = {p.get("id") for p in group("worker_profiles")}
+    profile_ids |= {r.get("id") for r in group("reservations")}
 
     ticket_ids = set()
     for record in attempts + claims + receipts + intents:

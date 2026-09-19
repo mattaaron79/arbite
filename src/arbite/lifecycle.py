@@ -135,7 +135,7 @@ import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from . import coordination, eligibility, graph, schema, workers
+from . import coordination, eligibility, errors, graph, reservations, schema, workers
 from .application import Actor, CoordinationService, require_active_attempt
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
@@ -629,6 +629,13 @@ class TicketLifecycle:
         the ticket row is removed (`arbite close` archives it instead). `--force`
         overrides neither rule; there is no backdoor through force.
         """
+        reservation = reservations.reservation_for(self.coordination.store, ticket.id)
+        if reservation is not None:
+            raise TicketError(
+                f"ticket {ticket.id} is a member of active reservation {reservation.id} "
+                f"(owner {reservation.owner}); remove it from the reservation (arbite "
+                "reserve remove) or release the reservation before deleting it"
+            )
         active = self.active_attempt(ticket.id)
         if active is not None:
             raise TicketError(
@@ -736,6 +743,9 @@ class TicketLifecycle:
         registered worker is evaluated through its profile (configured tier
         authoritative, disabled refused, `declared_tier` may not exceed it); an
         ad-hoc worker keeps the legacy behaviour. `--force` does not bypass it.
+
+        Reservations (B02) are enforced here too: a member of an active
+        reservation may be acquired only by its owner (`reservations.may_acquire`).
         """
         # Settle any transition a crash left behind, then re-read from the sink:
         # the caller's copy may be stale, and the compare-and-swap below must
@@ -748,6 +758,10 @@ class TicketLifecycle:
         for attempt in attempts:
             if attempt.is_active and (active is None or attempt.generation > active.generation):
                 active = attempt
+
+        # A reservation (B02) restricts who may acquire, for every origin:
+        # neither --adopt nor --force lets a non-owner past it.
+        reservations.require_acquirable(self.coordination.store, current.id, worker_id)
 
         if adopt and takeover:
             raise TicketError(
@@ -1508,6 +1522,44 @@ class TicketLifecycle:
                 f"(worker {attempt.worker_id}); refusing 'set assignee={new_assignee}' -- "
                 f"use 'arbite release {ticket.id}' / 'arbite claim {ticket.id} --force "
                 "--reason <why>' so ownership changes through the lifecycle, not a field edit"
+            )
+
+
+    def refuse_reserved_edit(
+        self,
+        ticket: Ticket,
+        *,
+        new_status: Optional[str],
+        new_assignee: Optional[str],
+    ) -> None:
+        """Refuse a `set` that would hand a reserved ticket to someone (B02).
+
+        With no attempt, `set status=in_progress` / `set assignee=X` are legacy
+        field edits; on a member of an active reservation they would bypass the
+        reservation, so `in_progress` is refused (use `arbite claim`) and an
+        assignee other than the owner (or clearing it) is refused."""
+        reservation = reservations.reservation_for(self.coordination.store, ticket.id)
+        if reservation is None:
+            return
+        details = {
+            "ticket_id": ticket.id,
+            "reservation_id": reservation.id,
+            "owner": reservation.owner,
+        }
+        if new_status == "in_progress" and ticket.status != "in_progress":
+            raise errors.TicketReserved(
+                f"ticket {ticket.id} is reserved by {reservation.owner!r} (reservation "
+                f"{reservation.id}); refusing 'set status=in_progress' -- acquire it with "
+                f"'arbite claim {ticket.id} --agent {reservation.owner}' so an attempt is "
+                "recorded",
+                details=dict(details, field="status", value=new_status),
+            )
+        if new_assignee and new_assignee != ticket.assignee and new_assignee != reservation.owner:
+            raise errors.TicketReserved(
+                f"ticket {ticket.id} is reserved by {reservation.owner!r} (reservation "
+                f"{reservation.id}); refusing 'set assignee={new_assignee}' -- only the "
+                "reservation owner may hold it",
+                details=dict(details, field="assignee", value=new_assignee),
             )
 
 

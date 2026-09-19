@@ -128,6 +128,12 @@ class ErrorCode:
     #: registered profile is disabled). `details["reasons"]` lists each unmet
     #: constraint with a stable `code`.
     WORKER_INELIGIBLE = "worker_ineligible"
+    #: The ticket is a member of an active reservation that does not grant this
+    #: worker acquisition (B02). `details` names the reservation and its owner.
+    TICKET_RESERVED = "ticket_reserved"
+    #: A reservation operation was refused; `details["reason"]` says why
+    #: (`members_unavailable`, `active_attempts`, `not_owner`, `not_active`, ...).
+    RESERVATION_CONFLICT = "reservation_conflict"
 
 
 class CoordinationError(ArbiteError):
@@ -323,3 +329,21 @@ class WorkerIneligible(CoordinationError):
     requirement has to change first."""
 
     error_code = ErrorCode.WORKER_INELIGIBLE
+
+
+class TicketReserved(CoordinationError):
+    """A ticket is held by another coordinator's active reservation, so this
+    worker may not acquire (or `set`) it. Nothing was written. Not retryable
+    as-is: pick other work, or the owner must release/remove the ticket."""
+
+    error_code = ErrorCode.TICKET_RESERVED
+
+
+class ReservationConflict(CoordinationError):
+    """A reservation create/membership/release operation was refused as a whole.
+
+    `details["reason"]` is a stable code and, for member problems,
+    `details["conflicts"]` lists each ticket with its own `reason`. Nothing was
+    written: reservation changes are all-or-nothing."""
+
+    error_code = ErrorCode.RESERVATION_CONFLICT

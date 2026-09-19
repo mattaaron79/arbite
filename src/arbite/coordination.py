@@ -31,6 +31,9 @@ Records introduced here (planning key C01, slice 1 of
   locality, cost class and declared capacity. Operator assertions, not verified
   identity; never credentials. Eligibility rules over it live in
   `arbite.eligibility`.
+- `Reservation` -- a coordinator's hold over an explicit set of ticket ids
+  (planning key B02). It restricts who may *acquire* its members; it never
+  creates an attempt or moves a ticket. Operations live in `arbite.reservations`.
 - `LifecycleIntent` -- the durable journal entry joining a ticket transition to
   its coordination cascade (attempt start/end, claim release, events). The ticket
   store and the coordination store commit separately, so the intent is what lets
@@ -140,7 +143,7 @@ OPERATION_RESULTS = ["ok", "error"]
 
 #: Event categories. `read` is a separate category so a high-volume read stream
 #: does not flood ordinary lifecycle/operation queries.
-EVENT_CATEGORIES = ["lifecycle", "operation", "claim", "read", "worker"]
+EVENT_CATEGORIES = ["lifecycle", "operation", "claim", "read", "worker", "reservation"]
 
 #: Event kinds. Every event is one of these; `operation_recorded` is the generic
 #: carrier for a receipt, and the rest name the transitions later slices add.
@@ -179,6 +182,11 @@ EVENT_KINDS = [
     "worker_updated",
     "worker_disabled",
     "worker_enabled",
+    #: Reservation administration (planning key B02), category `reservation`.
+    "reservation_created",
+    "reservation_members_added",
+    "reservation_members_removed",
+    "reservation_released",
 ]
 
 #: Recovery outcomes for an incomplete operation. `applied` and `reverted` are
@@ -213,6 +221,14 @@ WORKER_LOCALITIES = ["local", "remote", "unknown"]
 #: Declared cost class of a worker (planning key B01). No pricing catalog and no
 #: currency conversion: an optional `cost_estimate` carries explicit units.
 COST_CLASSES = ["local", "paid", "unknown"]
+
+#: Reservation states (planning key B02). A released reservation is kept as
+#: history; it restricts nothing.
+RESERVATION_STATES = ["active", "released"]
+
+#: How a reservation's membership was resolved at creation: an explicit ticket
+#: list, or a one-time snapshot of an epic (later epic tickets are not included).
+RESERVATION_SOURCES = ["tickets", "epic"]
 
 #: Worker ids are self-declared names (`claude.opus-5.002`), not opaque ids.
 WORKER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$")
@@ -271,6 +287,7 @@ ID_PREFIXES = {
     "recovery_report": "rcv",
     "lifecycle_intent": "lci",
     "worker_profile": "wkr",
+    "reservation": "rsv",
 }
 
 #: Opaque ids are `<prefix>-<16 hex chars>` (8 random bytes). Short enough to
@@ -1163,6 +1180,40 @@ class WorkerProfile(_Record):
         return bool(self.enabled)
 
 
+@dataclass
+class Reservation(_Record):
+    """A coordinator's hold over an explicit set of tickets (planning key B02).
+
+    `owner` is the coordinator's self-declared worker id; `members` are ticket
+    ids, fixed until an explicit add/remove. While `active`, only the owner (and,
+    later, workers an offer/assignment names) may acquire a member; the
+    reservation itself never starts an attempt or sets `in_progress`. `source`
+    records how membership was resolved at creation (`{"kind": "tickets"}` or
+    `{"kind": "epic", "epic": ..., "excluded": [...]}`); an epic is resolved
+    once. Released reservations are retained as history.
+    """
+
+    kind = "reservation"
+    id_prefix = ID_PREFIXES["reservation"]
+
+    id: str
+    owner: str
+    members: List[str]
+    created: str
+    updated: str
+    state: str = "active"
+    source: Dict[str, Any] = field(default_factory=lambda: {"kind": "tickets"})
+    note: Optional[str] = None
+    released: Optional[str] = None
+    released_by: Optional[str] = None
+    release_reason: Optional[str] = None
+    contract_version: int = CONTRACT_VERSION
+
+    @property
+    def is_active(self) -> bool:
+        return self.state == "active"
+
+
 # Record kind -> class, for `record_from_dict`.
 RECORD_CLASSES = {
     cls.kind: cls
@@ -1179,6 +1230,7 @@ RECORD_CLASSES = {
         Event,
         RecoveryReport,
         WorkerProfile,
+        Reservation,
     )
 }
 
@@ -1534,6 +1586,40 @@ def _validate_worker_profile(record: WorkerProfile) -> list:
     return problems
 
 
+@_validator("reservation")
+def _validate_reservation(record: Reservation) -> list:
+    problems = []
+    _check_id(problems, record)
+    _check(problems, isinstance(record.owner, str) and bool(WORKER_ID_PATTERN.match(record.owner)),
+           f"owner {record.owner!r} must match {WORKER_ID_PATTERN.pattern}")
+    members = record.members
+    if not isinstance(members, list):
+        problems.append("members must be a list of ticket ids")
+        members = []
+    _check(problems, all(isinstance(m, str) and m.strip() == m and m for m in members),
+           "members must be non-empty ticket id strings")
+    _check(problems, len(set(map(str, members))) == len(members), "members must not repeat")
+    _check(problems, record.state in RESERVATION_STATES,
+           f"state {record.state!r} is not one of {', '.join(RESERVATION_STATES)}")
+    if record.state == "active":
+        _check(problems, bool(members), "an active reservation must have at least one member")
+        _check(problems, record.released is None, "an active reservation must not have 'released'")
+    elif record.state == "released":
+        _check_utc(problems, record.released, "released")
+    _check_utc(problems, record.created, "created")
+    _check_utc(problems, record.updated, "updated")
+    source = record.source
+    _check(problems, isinstance(source, dict) and source.get("kind") in RESERVATION_SOURCES,
+           f"source must be a mapping whose kind is one of {', '.join(RESERVATION_SOURCES)}")
+    if isinstance(source, dict) and source.get("kind") == "epic":
+        _check(problems, isinstance(source.get("epic"), str) and bool(source.get("epic")),
+               "an epic source must name its epic")
+    if record.note is not None:
+        _check(problems, isinstance(record.note, str) and len(record.note) <= 500,
+               "note must be a string of at most 500 chars")
+    return problems
+
+
 def validate_record(record) -> List[str]:
     """Invariant problems for a single record, or `[]` when it is clean.
 
@@ -1568,7 +1654,8 @@ def validate_collection(records) -> List[str]:
     - at most one active attempt per ticket (one active attempt per ticket
       initially);
     - at most one active claim per (workspace, path);
-    - at most one worker profile per worker id.
+    - at most one worker profile per worker id;
+    - a ticket is a member of at most one active reservation (no nesting).
 
     Duplicate ids and duplicate event cursors are also reported, because both
     make "which record is current" unanswerable.
@@ -1579,6 +1666,7 @@ def validate_collection(records) -> List[str]:
     active_attempts = {}
     active_claims = {}
     profiles = {}
+    reserved = {}
 
     for record in records:
         record_id = getattr(record, "record_id", None)
@@ -1614,6 +1702,16 @@ def validate_collection(records) -> List[str]:
             else:
                 profiles[record.worker_id] = record.id
 
+        if isinstance(record, Reservation) and record.is_active:
+            for member in record.members:
+                if member in reserved:
+                    problems.append(
+                        f"ticket {member} is a member of two active reservations "
+                        f"({reserved[member]} and {record.id}); reservations do not overlap"
+                    )
+                else:
+                    reserved[member] = record.id
+
         if isinstance(record, FileClaim) and record.is_active:
             key = (record.workspace_id, record.path)
             if key in active_claims:
@@ -1639,6 +1737,9 @@ __all__ = [
     "COST_CLASSES",
     "WORKER_LOCALITIES",
     "WorkerProfile",
+    "Reservation",
+    "RESERVATION_SOURCES",
+    "RESERVATION_STATES",
     "looks_like_secret",
     "Artifact",
     "artifact_id_for_digest",

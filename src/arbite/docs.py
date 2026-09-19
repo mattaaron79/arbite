@@ -545,7 +545,30 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "capacity is recorded but not yet enforced. `arbite worker check <id> [--ticket T] "
         "[--require-capability CAP] [--local-only] [--max-cost N --max-cost-unit U]` explains "
         "eligibility with stable reason codes and writes nothing; an unknown value fails an "
-        "explicit constraint. Reservations, offers, packages and a job board are not available yet."
+        "explicit constraint. Offers, packages and a job board are not available yet."
+    )
+    add("")
+
+    add("## Reservations (coordinators)")
+    add("")
+    add(
+        "A coordinator can hold a set of tickets with `arbite reserve create T1 T2 ... --agent "
+        "<coordinator>` (or `--epic E`, which snapshots the epic's non-closed tickets once; "
+        "tickets added to the epic later are not included until `arbite reserve add`). While the "
+        "reservation is active only its owner may acquire a member: `claim`, `list next --claim`, "
+        "`--adopt`, `--force` and `set status in_progress` / `set assignee` refuse everyone else "
+        "with `ticket_reserved`, and plain `list next` leaves reserved tickets out (noted on "
+        "stderr). If you are refused, pick other work -- do not retry the same ticket. A "
+        "reservation never starts work: it creates no attempt and leaves the ticket's status "
+        "alone. Create/add are all-or-nothing (`reservation_conflict`, `details.conflicts[]` "
+        "per ticket: `closed`, `not_found`, `already_reserved` -- no overlap or nesting -- "
+        "`active_attempt_elsewhere`, `assigned_elsewhere`). `reserve add|remove|release` need "
+        "`--agent <owner>` (or `--force --reason` for an administrative change) and accept "
+        "`--expect-revision N`. `remove`/`release` refuse while an affected member has an active "
+        "attempt (`active_attempts`) unless `--interrupt --reason` ends those attempts and "
+        "returns the tickets to open; releasing a quiescent reservation returns its open "
+        "members to ad-hoc availability. `reserve show|list [--state] [--owner] [--ticket]` "
+        "report members with their current status and active attempt. All take `--json`."
     )
     add("")
 
