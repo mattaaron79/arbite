@@ -540,6 +540,11 @@ class ReservationService:
             if offer.is_live:
                 for ticket in offer.tickets:
                     offered.setdefault(ticket, offer)
+        packaged = {}
+        for package in tx.find("package"):
+            if package.is_live:
+                for ticket in package.tickets:
+                    packaged.setdefault(ticket, package)
         conflicts = []
         for ticket_id, ticket in snapshots.items():
             other = held.get(ticket_id)
@@ -568,6 +573,16 @@ class ReservationService:
                 conflicts.append({
                     "ticket_id": ticket_id, "reason": "offered_elsewhere",
                     "offer_id": offer.id, "publisher": offer.publisher, "state": offer.state,
+                })
+            elif ticket_id in packaged and (packaged[ticket_id].bound_worker or
+                                            packaged[ticket_id].created_by) != owner:
+                # A bound package's worker needs no reservation grant (B04), so
+                # reserving its members would promise control it cannot give.
+                package = packaged[ticket_id]
+                conflicts.append({
+                    "ticket_id": ticket_id, "reason": "packaged_elsewhere",
+                    "package_id": package.id, "created_by": package.created_by,
+                    "bound_worker": package.bound_worker,
                 })
         if conflicts:
             raise self._unavailable(conflicts)

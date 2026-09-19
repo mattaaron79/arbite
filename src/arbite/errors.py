@@ -141,6 +141,15 @@ class ErrorCode:
     #: A field edit or delete would bypass a live offer/assignment on the ticket
     #: (B03). `details` names the offer; acquire it with `arbite offer claim`.
     TICKET_OFFERED = "ticket_offered"
+    #: The ticket is a member of a live continuity package (B04) that does not
+    #: let this worker acquire it now: `details["reason"]` is `package_order`
+    #: (an earlier member is not closed) or `bound_elsewhere` (another worker is
+    #: bound), or a field edit/delete would bypass the package.
+    TICKET_PACKAGED = "ticket_packaged"
+    #: A package operation (create/handoff/note) was refused as a whole;
+    #: `details["reason"]` says why (`members_unavailable`, `cycle`,
+    #: `not_controller`, `active_attempt`, `not_live`, ...). Nothing was written.
+    PACKAGE_CONFLICT = "package_conflict"
 
 
 class CoordinationError(ArbiteError):
@@ -369,3 +378,20 @@ class TicketOffered(CoordinationError):
     Nothing was written; acquire through the offer or withdraw it first."""
 
     error_code = ErrorCode.TICKET_OFFERED
+
+
+class TicketPackaged(CoordinationError):
+    """A ticket is a member of a live continuity package (B04) and this worker
+    may not acquire or edit it now (a later member, or bound to another worker).
+    Nothing was written. Not retryable as-is: finish the earlier member, or the
+    package needs an explicit `arbite package handoff`."""
+
+    error_code = ErrorCode.TICKET_PACKAGED
+
+
+class PackageConflict(CoordinationError):
+    """A package operation was refused as a whole (B04). `details["reason"]` is a
+    stable code (and `details["conflicts"]` lists per-member problems); nothing
+    was written."""
+
+    error_code = ErrorCode.PACKAGE_CONFLICT

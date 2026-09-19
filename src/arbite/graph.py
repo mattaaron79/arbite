@@ -54,21 +54,27 @@ def find_cycles(by_id: dict) -> list:
     """Every depends_on cycle among the given tickets, each as a list of ids in
     cycle order. Iterative DFS with an explicit stack, so a pathological
     dependency graph can't exhaust the recursion limit."""
+    return find_cycles_in({tid: list(t.depends_on) for tid, t in by_id.items()})
+
+
+def find_cycles_in(edges: dict) -> list:
+    """Every cycle in `{node: [prerequisite, ...]}`, each as a list of nodes in
+    cycle order. Prerequisites that are not keys are ignored."""
     WHITE, GREY, BLACK = 0, 1, 2
-    color = {tid: WHITE for tid in by_id}
+    color = {tid: WHITE for tid in edges}
     cycles = []
     seen_keys = set()
-    for start in sorted(by_id):
+    for start in sorted(edges):
         if color[start] != WHITE:
             continue
         color[start] = GREY
-        stack = [(start, iter(by_id[start].depends_on))]
+        stack = [(start, iter(edges[start]))]
         chain = [start]
         while stack:
             node, deps = stack[-1]
             descended = False
             for dep in deps:
-                if dep not in by_id:
+                if dep not in edges:
                     continue
                 if color[dep] == GREY:
                     cycle = chain[chain.index(dep):]
@@ -79,7 +85,7 @@ def find_cycles(by_id: dict) -> list:
                     continue
                 if color[dep] == WHITE:
                     color[dep] = GREY
-                    stack.append((dep, iter(by_id[dep].depends_on)))
+                    stack.append((dep, iter(edges[dep])))
                     chain.append(dep)
                     descended = True
                     break
@@ -88,6 +94,27 @@ def find_cycles(by_id: dict) -> list:
                 stack.pop()
                 chain.pop()
     return cycles
+
+
+def scheduling_edges(by_id: dict, orders=()) -> dict:
+    """`depends_on` plus package order edges (B04): in each ordered package,
+    every member waits for its predecessor, whether or not a dependency says so."""
+    edges = {tid: list(t.depends_on) for tid, t in by_id.items()}
+    for order in orders:
+        for before, after in zip(order, order[1:]):
+            if after in edges and before not in edges[after]:
+                edges[after].append(before)
+    return edges
+
+
+def combined_cycles(by_id: dict, orders=()) -> list:
+    """Unsatisfiable cycles (no member closed) in the combined dependency +
+    package-order graph."""
+    return [
+        cycle
+        for cycle in find_cycles_in(scheduling_edges(by_id, orders))
+        if all(by_id[tid].status != "closed" for tid in cycle)
+    ]
 
 
 def live_cycles(by_id: dict) -> list:

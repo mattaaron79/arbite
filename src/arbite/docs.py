@@ -545,7 +545,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "capacity is recorded but not yet enforced. `arbite worker check <id> [--ticket T] "
         "[--require-capability CAP] [--local-only] [--max-cost N --max-cost-unit U]` explains "
         "eligibility with stable reason codes and writes nothing; an unknown value fails an "
-        "explicit constraint. Offers are below; packages and a job board are not available yet."
+        "explicit constraint. Offers and continuity packages are below; a unified job board is "
+        "not available yet."
     )
     add("")
 
@@ -597,6 +598,35 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "ticket cancels it (the owner may "
         "publish again). Releasing or removing reservation members withdraws their published "
         "offers. `offer show OFFER [--worker W]` explains eligibility. All take `--json`."
+    )
+    add("")
+
+    # -- Continuity packages -----------------------------------------------
+    add("## Continuity packages")
+    add("")
+    add(
+        "A package is the contract 'A then B by the same worker'. "
+        "`arbite package create T1 T2 [...] --agent <coordinator>` bundles two or more open "
+        "tickets in order; package order is a scheduling edge, so only the current member (the "
+        "first one not closed) can be acquired, and only the current member is ever offered by "
+        "`list next` -- a bound package's only to its bound worker. Creation is all-or-nothing "
+        "(`package_conflict`): a member that is closed, assigned, active, offered, reserved by "
+        "someone else or already in another package is refused, and package order plus ticket "
+        "dependencies may not form a cycle (reason `cycle`); dependencies outside the package "
+        "are reported as external prerequisites. Acquiring the first member -- directly with "
+        "`arbite claim`, or by accepting `arbite offer publish/assign --package PKG` -- binds "
+        "every remaining member to that worker id in the same transaction. Each member is its "
+        "own attempt, file claims are released when a member closes, and the next member needs "
+        "fresh reads; same worker id is continuity identity, not the same model session. A "
+        "blocked member stops the package until it is explicitly resolved, nothing advances "
+        "merely because execution stopped, and nothing times out. Use `arbite package note PKG "
+        "TEXT --agent <worker>` to leave durable continuity notes for a resumed session, and "
+        "`arbite package handoff PKG --reason TEXT (--to W | --release) [--interrupt] [--note "
+        "TEXT]` to rebind or release the *remaining* members (completed members stay completed; "
+        "a rebind also checks the package offer's hard requirements against the new worker, and "
+        "`--force` skips that). `arbite package show|list [--state] [--ticket] [--worker]` "
+        "report progress, the current member, external prerequisites and the next action. All "
+        "take `--json`."
     )
     add("")
 

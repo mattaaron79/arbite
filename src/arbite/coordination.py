@@ -37,6 +37,9 @@ Records introduced here (planning key C01, slice 1 of
 - `Offer` -- a public offer or direct assignment over a ticket (planning key
   B03). Accepting it happens inside ticket acquisition; operations live in
   `arbite.offers`.
+- `Package` -- an ordered same-worker continuity package over tickets (planning
+  key B04): one worker, members in order, each with its own attempt. Operations
+  live in `arbite.packages`.
 - `LifecycleIntent` -- the durable journal entry joining a ticket transition to
   its coordination cascade (attempt start/end, claim release, events). The ticket
   store and the coordination store commit separately, so the intent is what lets
@@ -146,7 +149,9 @@ OPERATION_RESULTS = ["ok", "error"]
 
 #: Event categories. `read` is a separate category so a high-volume read stream
 #: does not flood ordinary lifecycle/operation queries.
-EVENT_CATEGORIES = ["lifecycle", "operation", "claim", "read", "worker", "reservation", "offer"]
+EVENT_CATEGORIES = [
+    "lifecycle", "operation", "claim", "read", "worker", "reservation", "offer", "package",
+]
 
 #: Event kinds. Every event is one of these; `operation_recorded` is the generic
 #: carrier for a receipt, and the rest name the transitions later slices add.
@@ -198,6 +203,16 @@ EVENT_KINDS = [
     "offer_accepted",
     "offer_completed",
     "offer_cancelled",
+    #: Continuity packages (planning key B04), category `package`. Bind/start/
+    #: advance/complete commit with the ticket transition that caused them.
+    "package_created",
+    "package_bound",
+    "package_member_started",
+    "package_advanced",
+    "package_completed",
+    "package_rebound",
+    "package_released",
+    "package_noted",
 ]
 
 #: Recovery outcomes for an incomplete operation. `applied` and `reverted` are
@@ -253,9 +268,21 @@ OFFER_LIVE_STATES = ["published", "accepted"]
 #: the named `allowed_workers` may (a direct assignment).
 OFFER_MODES = ["public", "assigned"]
 
-#: What an offer covers. Only single tickets today; B04 adds ordered packages
-#: (`tickets` already holds an ordered list for that reason).
-OFFER_TARGET_KINDS = ["ticket"]
+#: What an offer covers: one ticket, or an ordered continuity package (B04;
+#: `tickets` then lists the package members in order and `package_id` names it).
+OFFER_TARGET_KINDS = ["ticket", "package"]
+
+#: Package states (planning key B04). `open`: not yet bound (its first ready
+#: member may be acquired, which binds the acquirer). `bound`: every remaining
+#: member belongs to `bound_worker`, in order. `completed` (every member closed)
+#: and `released` (explicit handoff released the remaining members) are history.
+PACKAGE_STATES = ["open", "bound", "completed", "released"]
+
+#: Package states that still restrict acquisition of their members.
+PACKAGE_LIVE_STATES = ["open", "bound"]
+
+#: Continuity policies. Only "the same worker does every member, in order".
+PACKAGE_POLICIES = ["same_worker"]
 
 #: Requirement keys an offer may carry (hard constraints, see `eligibility`).
 OFFER_REQUIREMENT_KEYS = ("min_tier", "capabilities", "local_only", "max_cost")
@@ -322,6 +349,7 @@ ID_PREFIXES = {
     "worker_profile": "wkr",
     "reservation": "rsv",
     "offer": "off",
+    "package": "pkg",
 }
 
 #: Opaque ids are `<prefix>-<16 hex chars>` (8 random bytes). Short enough to
@@ -1293,6 +1321,8 @@ class Offer(_Record):
     ended_at: Optional[str] = None
     ended_by: Optional[str] = None
     end_reason: Optional[str] = None
+    #: B04: the package a `target_kind="package"` offer covers.
+    package_id: Optional[str] = None
     contract_version: int = CONTRACT_VERSION
 
     @property
@@ -1302,6 +1332,48 @@ class Offer(_Record):
     @property
     def is_published(self) -> bool:
         return self.state == "published"
+
+
+@dataclass
+class Package(_Record):
+    """An ordered same-worker continuity package (planning key B04).
+
+    `tickets` is the member order; the order is a scheduling edge (member N+1
+    is never acquired before member N is closed) even when no `depends_on`
+    duplicates it. `bound_worker` is continuity *identity* -- the same worker
+    id, not a promise of the same model session: each member gets its own
+    attempt and file claims are released between members. `current` caches the
+    first member that is not closed (derived again from ticket status whenever
+    it matters). `handoffs` records explicit rebind/release decisions with their
+    reason; `notes` are durable notes for a resumed session. At most one live
+    (`open`/`bound`) package per ticket.
+    """
+
+    kind = "package"
+    id_prefix = ID_PREFIXES["package"]
+
+    id: str
+    tickets: List[str]
+    created_by: str
+    created: str
+    updated: str
+    policy: str = "same_worker"
+    state: str = "open"
+    bound_worker: Optional[str] = None
+    bound_at: Optional[str] = None
+    current: Optional[str] = None
+    reservation_id: Optional[str] = None
+    note: Optional[str] = None
+    handoffs: List[Dict[str, Any]] = field(default_factory=list)
+    notes: List[Dict[str, Any]] = field(default_factory=list)
+    outcome: Optional[str] = None
+    ended_at: Optional[str] = None
+    ended_by: Optional[str] = None
+    contract_version: int = CONTRACT_VERSION
+
+    @property
+    def is_live(self) -> bool:
+        return self.state in PACKAGE_LIVE_STATES
 
 
 # Record kind -> class, for `record_from_dict`.
@@ -1322,6 +1394,7 @@ RECORD_CLASSES = {
         WorkerProfile,
         Reservation,
         Offer,
+        Package,
     )
 }
 
@@ -1733,6 +1806,12 @@ def _validate_offer(record: Offer) -> list:
            f"target_kind {record.target_kind!r} is not one of {', '.join(OFFER_TARGET_KINDS)}")
     if record.target_kind == "ticket":
         _check(problems, len(tickets) == 1, "a ticket offer names exactly one ticket")
+        _check(problems, record.package_id is None, "a ticket offer has no package_id")
+    elif record.target_kind == "package":
+        _check(problems, len(tickets) >= 2, "a package offer names the package's (2+) members")
+        _check(problems, id_for_kind(record.package_id, "package"),
+               f"target_kind 'package' requires a package_id ({record.package_id!r} is not a "
+               "package id)")
     _check(problems, record.mode in OFFER_MODES,
            f"mode {record.mode!r} is not one of {', '.join(OFFER_MODES)}")
     _check(problems, isinstance(record.publisher, str) and bool(WORKER_ID_PATTERN.match(record.publisher)),
@@ -1795,6 +1874,51 @@ def _validate_offer(record: Offer) -> list:
     return problems
 
 
+@_validator("package")
+def _validate_package(record: Package) -> list:
+    problems = []
+    _check_id(problems, record)
+    tickets = record.tickets
+    if not isinstance(tickets, list):
+        problems.append("tickets must be an ordered list of ticket ids")
+        tickets = []
+    _check(problems, all(isinstance(t, str) and t and t.strip() == t for t in tickets),
+           "tickets must be non-empty ticket id strings")
+    _check(problems, len(tickets) >= 2, "a package orders at least two tickets")
+    _check(problems, len(set(map(str, tickets))) == len(tickets), "tickets must not repeat")
+    _check(problems, isinstance(record.created_by, str) and bool(WORKER_ID_PATTERN.match(record.created_by)),
+           f"created_by {record.created_by!r} must match {WORKER_ID_PATTERN.pattern}")
+    _check(problems, record.policy in PACKAGE_POLICIES,
+           f"policy {record.policy!r} is not one of {', '.join(PACKAGE_POLICIES)}")
+    _check(problems, record.state in PACKAGE_STATES,
+           f"state {record.state!r} is not one of {', '.join(PACKAGE_STATES)}")
+    if record.state == "bound":
+        _check(problems, isinstance(record.bound_worker, str) and bool(WORKER_ID_PATTERN.match(record.bound_worker)),
+               "a bound package names its bound_worker")
+        _check_utc(problems, record.bound_at, "bound_at")
+    elif record.state == "open":
+        _check(problems, record.bound_worker is None, "an open package has no bound_worker")
+    if record.state in ("completed", "released"):
+        _check_utc(problems, record.ended_at, "ended_at")
+    else:
+        _check(problems, record.ended_at is None, f"a {record.state} package must not have 'ended_at'")
+    _check(problems, record.current is None or record.current in tickets,
+           "current must be one of the package's tickets")
+    if record.reservation_id is not None:
+        _check(problems, id_for_kind(record.reservation_id, "reservation"),
+               f"reservation_id {record.reservation_id!r} is not a reservation id")
+    for label in ("handoffs", "notes"):
+        entries = getattr(record, label)
+        _check(problems, isinstance(entries, list) and all(isinstance(e, dict) for e in entries),
+               f"{label} must be a list of mappings")
+    _check_utc(problems, record.created, "created")
+    _check_utc(problems, record.updated, "updated")
+    if record.note is not None:
+        _check(problems, isinstance(record.note, str) and len(record.note) <= 500,
+               "note must be a string of at most 500 chars")
+    return problems
+
+
 def validate_record(record) -> List[str]:
     """Invariant problems for a single record, or `[]` when it is clean.
 
@@ -1831,7 +1955,8 @@ def validate_collection(records) -> List[str]:
     - at most one active claim per (workspace, path);
     - at most one worker profile per worker id;
     - a ticket is a member of at most one active reservation (no nesting);
-    - a ticket is the target of at most one live (published/accepted) offer.
+    - a ticket is the target of at most one live (published/accepted) offer;
+    - a ticket is a member of at most one live (open/bound) package.
 
     Duplicate ids and duplicate event cursors are also reported, because both
     make "which record is current" unanswerable.
@@ -1844,6 +1969,7 @@ def validate_collection(records) -> List[str]:
     profiles = {}
     reserved = {}
     offered = {}
+    packaged = {}
 
     for record in records:
         record_id = getattr(record, "record_id", None)
@@ -1899,6 +2025,16 @@ def validate_collection(records) -> List[str]:
                 else:
                     offered[ticket] = record.id
 
+        if isinstance(record, Package) and record.is_live:
+            for ticket in record.tickets:
+                if ticket in packaged:
+                    problems.append(
+                        f"ticket {ticket} is a member of two live packages ({packaged[ticket]} "
+                        f"and {record.id}); one package membership per ticket"
+                    )
+                else:
+                    packaged[ticket] = record.id
+
         if isinstance(record, FileClaim) and record.is_active:
             key = (record.workspace_id, record.path)
             if key in active_claims:
@@ -1926,6 +2062,10 @@ __all__ = [
     "WorkerProfile",
     "Reservation",
     "Offer",
+    "Package",
+    "PACKAGE_LIVE_STATES",
+    "PACKAGE_POLICIES",
+    "PACKAGE_STATES",
     "OFFER_LIVE_STATES",
     "OFFER_MODES",
     "OFFER_PREFERENCE_KEYS",

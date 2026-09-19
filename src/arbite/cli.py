@@ -43,6 +43,7 @@ from . import (
     graph,
     lifecycle,
     offers,
+    packages,
     reservations,
     schema,
     workers,
@@ -746,9 +747,26 @@ def _cmd_list_next(args, sink, every):
     picker = None
     if args.claim:
         picker = workers.declaration_for(store, args.claim, declared_tier=args.tier)
+    # Continuity packages (B04): only a package's current member surfaces, and
+    # a bound package's only for its bound worker.
+    packaged = packages.live_packages(store)
+    status_of = lambda tid: by_id[tid].status if tid in by_id else None  # noqa: E731
+    by_package = [
+        t for t in candidates if not packages.may_pick(t.id, args.claim, packaged, status_of)
+    ]
+    if by_package:
+        candidates = [t for t in candidates if t not in by_package]
+        print(
+            f"note: skipped {len(by_package)} workable ticket(s) in continuity packages "
+            f"({', '.join(sorted({packaged[t.id].package.id for t in by_package}))}): later "
+            "members wait for earlier ones and bound members belong to their worker; see "
+            "'arbite package list'",
+            file=sys.stderr,
+        )
     excluded = [
         t for t in candidates
         if not offers.may_pick(t.id, args.claim, picker, published=offered, held=held)
+        and not (t.id in packaged and packaged[t.id].package.state == "bound")
     ]
     if excluded:
         candidates = [t for t in candidates if t not in excluded]
@@ -3369,6 +3387,7 @@ def _run_offer_command(args, sink) -> None:
     if command in ("publish", "assign"):
         change = service.publish(
             args.ticket,
+            package=args.package,
             agent=args.agent,
             mode="assigned" if command == "assign" else "public",
             allowed_workers=args.worker if command == "assign" else (),
@@ -3386,8 +3405,10 @@ def _run_offer_command(args, sink) -> None:
             extra["assignee_eligibility"] = [
                 service.view(change.stored, worker=w)["eligibility"] for w in offer.allowed_workers
             ]
-        what = (f"assigned {offer.tickets[0]} to {', '.join(offer.allowed_workers)}"
-                if command == "assign" else f"published {offer.tickets[0]}")
+        target = (f"package {offer.package_id} ({' -> '.join(offer.tickets)})"
+                  if offer.target_kind == "package" else offer.tickets[0])
+        what = (f"assigned {target} to {', '.join(offer.allowed_workers)}"
+                if command == "assign" else f"published {target}")
         _emit_offer(args, service, change.stored, extra=extra,
                     headline=f"{what} as offer {offer.id}")
         if command == "assign" and not args.json:
@@ -3418,7 +3439,8 @@ def _run_offer_command(args, sink) -> None:
                 who = ", ".join(o.allowed_workers) if o.mode == "assigned" else "any eligible"
                 if o.accepted_by:
                     who = f"accepted by {o.accepted_by}"
-                print(f"{o.id:<22} {o.state:<10} {o.mode:<9} {o.tickets[0]:<10} "
+                target = o.package_id if o.target_kind == "package" else o.tickets[0]
+                print(f"{o.id:<22} {o.state:<10} {o.mode:<9} {target:<10} "
                       f"{row.revision:>3}  {who}")
         else:
             print("no offers match")
@@ -3459,6 +3481,155 @@ def _run_offer_command(args, sink) -> None:
         return
 
     raise TicketError(f"unknown offer command {command!r}")
+
+
+# --- continuity packages (multi-provider job board, B04) --------------------
+
+
+def _package_service(args, sink) -> "packages.PackageService":
+    _worker_store(sink)
+    agent = getattr(args, "agent", None)
+    return packages.PackageService(_lifecycle(args, sink, agent=agent), actor=agent)
+
+
+def _package_lines(view: dict) -> list:
+    bound = f"bound to {view['bound_worker']}" if view.get("bound_worker") else "unbound"
+    lines = [
+        f"package {view['id']} [{view['state']}] {bound} revision {view['revision']}",
+        f"  created by {view['created_by']}"
+        + (f"  reservation: {view['reservation_id']}" if view.get("reservation_id") else "")
+        + (f"  offer: {view['offer_id']} ({view['offer_state']})" if view.get("offer_id") else ""),
+    ]
+    for member in view["members"]:
+        marker = "->" if member["current"] else "  "
+        assignee = f" @{member['assignee']}" if member.get("assignee") else ""
+        lines.append(f"  {marker} {member['position']}. {member['ticket_id']} [{member['status']}]"
+                     f"{assignee} {member.get('title') or ''}".rstrip())
+        last = member.get("latest_attempt")
+        if last:
+            lines.append(f"       last attempt {last['attempt_id']} {last['worker_id']} "
+                         f"[{last['state']}]" + (f" {last['outcome']}" if last.get("outcome") else ""))
+    for prereq in view.get("external_prerequisites") or []:
+        state = "met" if prereq["met"] else ("unmet" if prereq["blocks"] else prereq["status"])
+        lines.append(f"  prerequisite: {prereq['member']} needs {prereq['depends_on']} "
+                     f"[{prereq['status']}] ({state})")
+    for cycle in view.get("cycles") or []:
+        lines.append("  CYCLE: " + " -> ".join(cycle + [cycle[0]]))
+    for entry in view.get("handoffs") or []:
+        if entry.get("action") == "create":
+            continue
+        target = f" -> {entry['to_worker']}" if entry.get("to_worker") else ""
+        lines.append(f"  handoff {entry['at']} {entry['action']} {entry.get('from_worker')}"
+                     f"{target} by {entry['by']}: {entry.get('reason')}")
+    for note in (view.get("notes") or [])[-5:]:
+        lines.append(f"  note {note['at']} {note['by']}: {note['text']}")
+    if view.get("outcome"):
+        lines.append(f"  outcome: {view['outcome']}")
+    lines.append(f"  next: {view['next_action']}")
+    lines.append(f"  ({packages.PACKAGE_NOTICE})")
+    return lines
+
+
+def _emit_package(args, service, stored, *, extra=None, headline=None) -> None:
+    view = service.view(stored)
+    if getattr(args, "json", False):
+        payload = {"package": view, "notice": packages.PACKAGE_NOTICE}
+        payload.update(extra or {})
+        _print_json(coordination.ok_result(payload))
+        return
+    if headline:
+        print(headline)
+    for line in _package_lines(view):
+        print(line)
+
+
+def cmd_package(args):
+    """Ordered same-worker continuity packages: one worker does the members in
+    order, each as its own attempt, until done or explicitly handed off."""
+    sink = _require_sink(args)
+    try:
+        _run_package_command(args, sink)
+    except CoordinationError as error:
+        _file_error(args, error)
+
+
+def _run_package_command(args, sink) -> None:
+    command = args.package_command
+    service = _package_service(args, sink)
+
+    if command == "create":
+        change = service.create(args.tickets, agent=args.agent, note=args.note,
+                                force=args.force, reason=args.reason)
+        pkg = change.stored.package
+        _emit_package(args, service, change.stored,
+                      headline=f"created package {pkg.id}: {' -> '.join(pkg.tickets)}")
+        return
+
+    if command == "show":
+        _emit_package(args, service, service.get(args.package))
+        return
+
+    if command == "list":
+        ticket = sink.get(args.ticket, unique=True).id if args.ticket else None
+        rows = service.list(state=args.state, ticket=ticket, worker=args.worker)
+        if args.json:
+            _print_json(coordination.ok_result({
+                "packages": [service.view(row) for row in rows],
+                "count": len(rows),
+                "notice": packages.PACKAGE_NOTICE,
+            }))
+        elif rows:
+            print(f"{'PACKAGE':<22} {'STATE':<9} {'REV':>3}  {'BOUND':<20} MEMBERS")
+            for row in rows:
+                p = row.package
+                print(f"{p.id:<22} {p.state:<9} {row.revision:>3}  {p.bound_worker or '-':<20} "
+                      + " -> ".join(p.tickets))
+        else:
+            print("no packages match")
+        if not rows:
+            sys.exit(EXIT_EMPTY)
+        return
+
+    if command == "claim":
+        result = service.claim(args.package, worker_id=args.agent, declared_tier=args.tier)
+        if args.json:
+            _print_json(coordination.ok_result({
+                "package": service.view(service.get(args.package)),
+                "ticket_id": result.ticket.id,
+                "attempt_id": result.attempt.id,
+                "worker_id": args.agent,
+                "offer_id": result.offer_id,
+                "notice": packages.PACKAGE_NOTICE,
+            }))
+            return
+        print(f"claimed {result.ticket.id} for {args.agent} (package {args.package}, attempt "
+              f"{result.attempt.id}) -> {sink.location(result.ticket.id)}")
+        return
+
+    if command == "note":
+        change = service.note(args.package, agent=args.agent, text=args.text,
+                              force=args.force, reason=args.reason)
+        _emit_package(args, service, change.stored, headline=f"noted on {args.package}")
+        return
+
+    if command == "handoff":
+        change = service.handoff(
+            args.package, agent=args.agent, reason=args.reason, to=args.to,
+            release=args.release, note=args.note, interrupt=args.interrupt, force=args.force,
+            expect_revision=args.expect_revision,
+        )
+        pkg = change.stored.package
+        headline = (f"released package {pkg.id}" if pkg.state == "released"
+                    else f"rebound package {pkg.id} to {pkg.bound_worker}")
+        if change.interrupted:
+            headline += "; interrupted " + ", ".join(
+                f"{i['ticket_id']} ({i['worker_id']})" for i in change.interrupted)
+        _emit_package(args, service, change.stored, headline=headline,
+                      extra={"interrupted": change.interrupted,
+                             "ended_offers": change.ended_offers})
+        return
+
+    raise TicketError(f"unknown package command {command!r}")
 
 
 def build_parser():
@@ -4895,7 +5066,10 @@ def build_parser():
         parser_.set_defaults(func=cmd_offer)
 
     def offer_publish_flags(parser_):
-        parser_.add_argument("ticket", metavar="TICKET", help="the open ticket to offer")
+        parser_.add_argument("ticket", metavar="TICKET", nargs="?", default=None,
+                             help="the open ticket to offer (or --package)")
+        parser_.add_argument("--package", default=None, metavar="PKG",
+                             help="offer a whole open continuity package instead of one ticket")
         parser_.add_argument("--agent", required=True,
                              help="publisher (the reservation owner for a reserved ticket)")
         parser_.add_argument("--min-tier", choices=TIERS, default=None,
@@ -4978,6 +5152,97 @@ def build_parser():
     p_o_claim.add_argument("--tier", choices=TIERS, default=None,
                            help="per-call declared tier (may not exceed a registered profile)")
     offer_common(p_o_claim)
+
+    p_package = sub.add_parser(
+        "package",
+        help="ordered same-worker continuity packages (create/show/list/claim/note/handoff)",
+        description="A package is the contract 'A then B by the same worker'. Package order "
+        "is a scheduling edge: only the current member (the first one not closed) can be "
+        "acquired, by any path (claim, list next --claim, --force, --adopt, set). Acquiring "
+        "the first member -- directly or by accepting 'offer publish/assign --package' -- binds "
+        "every remaining member to that worker; each member is its own attempt (file claims are "
+        "released on close; read files again). Blocked members do not advance the package. "
+        "Only an explicit 'package handoff --reason' rebinds (--to W) or releases (--release) "
+        "the remaining members; completed members stay completed; nothing times out.",
+    )
+    package_sub = p_package.add_subparsers(dest="package_command", required=True)
+
+    def package_common(parser_):
+        _json_flag(parser_)
+        _sink_flag(parser_)
+        parser_.set_defaults(func=cmd_package)
+
+    p_pk_create = package_sub.add_parser(
+        "create", help="create a package over 2+ open tickets, in order",
+        description="All-or-nothing: refused (package_conflict) when a member is not open, "
+        "assigned, active, offered, reserved by someone else or already in a package, or when "
+        "package order plus dependencies would form a cycle. Dependencies outside the package "
+        "are reported as external prerequisites.",
+    )
+    p_pk_create.add_argument("tickets", nargs="+", metavar="TICKET", help="members, in order")
+    p_pk_create.add_argument("--agent", required=True, help="creator (coordinator) id")
+    p_pk_create.add_argument("--note", default=None, help="optional note")
+    p_pk_create.add_argument("--force", action="store_true",
+                             help="package members reserved by someone else (needs --reason)")
+    p_pk_create.add_argument("--reason", default=None, metavar="TEXT", help="why (recorded)")
+    package_common(p_pk_create)
+
+    p_pk_show = package_sub.add_parser("show", help="show one package and its progress")
+    p_pk_show.add_argument("package", metavar="PKG", help="package id (pkg-...)")
+    package_common(p_pk_show)
+
+    p_pk_list = package_sub.add_parser("list", help="list packages (exit 2 when none)")
+    p_pk_list.add_argument("--state", choices=packages.STATE_FILTERS, default="live",
+                           help="open/bound/completed/released, live (open+bound, default) or all")
+    p_pk_list.add_argument("--ticket", default=None, help="only packages containing this ticket")
+    p_pk_list.add_argument("--worker", default=None, metavar="W", help="only packages bound to W")
+    package_common(p_pk_list)
+
+    p_pk_claim = package_sub.add_parser(
+        "claim", help="claim the package's current member (binds an open package)",
+    )
+    p_pk_claim.add_argument("package", metavar="PKG")
+    p_pk_claim.add_argument("--agent", required=True, help="the worker")
+    p_pk_claim.add_argument("--tier", choices=TIERS, default=None,
+                            help="per-call declared tier (may not exceed a registered profile)")
+    package_common(p_pk_claim)
+
+    p_pk_note = package_sub.add_parser(
+        "note", help="record a durable continuity note for a resumed session",
+    )
+    p_pk_note.add_argument("package", metavar="PKG")
+    p_pk_note.add_argument("text", metavar="TEXT")
+    p_pk_note.add_argument("--agent", required=True,
+                           help="bound worker, creator or reservation owner (else --force)")
+    p_pk_note.add_argument("--force", action="store_true", help="needs --reason")
+    p_pk_note.add_argument("--reason", default=None, metavar="TEXT")
+    package_common(p_pk_note)
+
+    p_pk_handoff = package_sub.add_parser(
+        "handoff", help="explicitly rebind (--to W) or release (--release) remaining members",
+        description="Requires --reason. Completed members stay completed. An active attempt "
+        "on a member is refused (package_conflict, reason active_attempt) unless --interrupt. "
+        "A blocked member held by the old worker keeps its status but loses its assignee. The "
+        "package's offer is cancelled/withdrawn. Rebinding checks the package offer's "
+        "requirements against the new worker (--force skips that).",
+    )
+    p_pk_handoff.add_argument("package", metavar="PKG")
+    p_pk_handoff.add_argument("--agent", required=True,
+                              help="bound worker, creator or reservation owner (else --force)")
+    p_pk_handoff.add_argument("--reason", default=None, metavar="TEXT", help="why (required)")
+    target = p_pk_handoff.add_mutually_exclusive_group(required=True)
+    target.add_argument("--to", default=None, metavar="W", help="rebind to this worker")
+    target.add_argument("--release", action="store_true",
+                        help="release the remaining members to ordinary availability")
+    p_pk_handoff.add_argument("--note", default=None,
+                              help="durable handoff note for whoever continues")
+    p_pk_handoff.add_argument("--interrupt", action="store_true",
+                              help="interrupt an active attempt on a member")
+    p_pk_handoff.add_argument("--force", action="store_true",
+                              help="administrative handoff by someone else (needs --reason)")
+    p_pk_handoff.add_argument("--expect-revision", type=int, default=None, metavar="N",
+                              help="refuse unless the package is at this revision")
+    package_common(p_pk_handoff)
 
     p_changes = sub.add_parser(
         "changes",

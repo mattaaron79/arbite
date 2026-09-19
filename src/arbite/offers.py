@@ -38,9 +38,13 @@ Rules (see `.arbite/planning/multi-provider-job-board.md`):
 - **Reservation release withdraws.** Releasing (or removing members from) a
   reservation withdraws its published offers in the same transaction that
   writes the reservation (`withdraw_in_transaction`).
-
-Package offers (B04) will reuse `Offer.tickets` (ordered) and `target_kind`;
-only single-ticket offers exist today.
+- **Package offers (B04).** `target_kind="package"` offers a whole continuity
+  package (`package_id`; `tickets` = its members in order). Accepting it is
+  acquiring the package's first ready member, which also binds the package to
+  the worker (`packages.sync_in_transaction`). The offer then stays `accepted`
+  while the package is bound, completes when the last member closes, and is
+  cancelled by an explicit package handoff -- never by one member's transition.
+  A package member cannot get a single-ticket offer of its own.
 """
 
 from __future__ import annotations
@@ -48,7 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
-from . import eligibility, reservations, workers
+from . import eligibility, packages, reservations, workers
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
     OFFER_STATES,
@@ -129,21 +133,26 @@ def live_offer_for(store, ticket_id: str) -> Optional[StoredOffer]:
     return live_offers(store).get(ticket_id)
 
 
-def requirements_of(offer: Offer) -> eligibility.Requirements:
-    """The offer's hard constraints, evaluated restricted (unknowns fail)."""
+def requirements_of(offer: Offer, *, include_workers: bool = True) -> eligibility.Requirements:
+    """The offer's hard constraints, evaluated restricted (unknowns fail).
+
+    `include_workers=False` drops the direct-assignment list. A package rebind
+    uses it: the assignment names who the *current* binding admits, and changing
+    that binding is exactly what a rebind does, so only the offer's hard
+    requirements (tier/capability/locality/cost) may veto a new worker."""
     req = offer.requirements or {}
     return eligibility.Requirements(
         min_tier=req.get("min_tier"),
         capabilities=tuple(req.get("capabilities") or ()),
         local_only=bool(req.get("local_only")),
         max_cost=dict(req["max_cost"]) if req.get("max_cost") else None,
-        allowed_workers=tuple(offer.allowed_workers or ()),
+        allowed_workers=tuple(offer.allowed_workers or ()) if include_workers else (),
         restricted=True,
     )
 
 
-def evaluate(offer: Offer, declaration) -> eligibility.Eligibility:
-    return eligibility.evaluate(requirements_of(offer), declaration)
+def evaluate(offer: Offer, declaration, *, include_workers: bool = True) -> eligibility.Eligibility:
+    return eligibility.evaluate(requirements_of(offer, include_workers=include_workers), declaration)
 
 
 def _ineligible(offer: Offer, ticket_id: str, result) -> WorkerIneligible:
@@ -191,6 +200,7 @@ def acquisition_grant(
     *,
     offer_id: Optional[str] = None,
     declared_tier: Optional[str] = None,
+    statuses=None,
 ) -> Optional[StoredOffer]:
     """Decide whether `worker_id` may acquire `ticket_id` given offers and
     reservations. Returns the published offer the acquisition accepts, or None
@@ -198,7 +208,19 @@ def acquisition_grant(
 
     Called by `TicketLifecycle.acquire` under the operation lock, for every
     origin. `offer_id` (from `arbite offer claim`) must name the ticket's
-    published offer."""
+    published offer.
+
+    A live continuity package (B04) is consulted first: only its current member
+    is acquirable, and only by its bound worker once bound (`statuses` maps
+    ticket id -> status for the order check). A bound worker continuing its
+    package needs no further offer or reservation grant."""
+    package = packages.live_package_for(store, ticket_id)
+    if package is not None:
+        refusal = packages.acquisition_refusal(package.package, ticket_id, worker_id, statuses)
+        if refusal is not None:
+            raise refusal
+        if package.package.state == "bound" and offer_id is None:
+            return None
     live = live_offer_for(store, ticket_id)
     if offer_id is not None:
         if live is None or live.offer.id != offer_id:
@@ -335,6 +357,23 @@ def withdraw_in_transaction(tx, ticket_ids: Iterable[str], *, actor, reason, mom
     return sorted(withdrawn)
 
 
+def end_package_offers(tx, package_id: str, *, how: str, actor, moment, reason) -> List[str]:
+    """End the live offers of `package_id` inside `tx`: `how="complete"`
+    completes an accepted offer (and cancels a published one); `how="release"`
+    (handoff) cancels an accepted offer and withdraws a published one."""
+    ended = []
+    for offer in tx.find("offer"):
+        if offer.package_id != package_id or not offer.is_live:
+            continue
+        if how == "complete":
+            state = "completed" if offer.state == "accepted" else "cancelled"
+        else:
+            state = "cancelled" if offer.state == "accepted" else "withdrawn"
+        _end(tx, offer, state, moment, actor=actor, reason=reason)
+        ended.append(offer.id)
+    return sorted(ended)
+
+
 def sync_in_transaction(tx, intent, moment: str) -> None:
     """Advance offers for a lifecycle transition, inside its cascade `tx`.
 
@@ -347,6 +386,10 @@ def sync_in_transaction(tx, intent, moment: str) -> None:
     why = intent.reason
     for offer in tx.find("offer"):
         if not offer.is_live or ticket_id not in offer.tickets:
+            continue
+        if offer.target_kind == "package":
+            # Package offers follow the package, not a member's transition
+            # (`end_package_offers`, called by the package cascade/handoff).
             continue
         if offer.state == "accepted":
             if intent.target_status == "closed":
@@ -527,9 +570,10 @@ class OfferService:
 
     def publish(
         self,
-        ticket: str,
+        ticket: Optional[str],
         *,
         agent: str,
+        package: Optional[str] = None,
         mode: str = "public",
         allowed_workers: Iterable[str] = (),
         requirements: Optional[dict] = None,
@@ -552,8 +596,21 @@ class OfferService:
         if mode == "public" and allowed:
             raise InvalidRecord("a public offer has no allowed workers; use 'offer assign'")
         requirements = dict(requirements or {})
+        if bool(ticket) == bool(package):
+            raise InvalidRecord("offer exactly one target: a TICKET or --package PKG")
         with self.lifecycle.locked():
+            if package:
+                return self._publish_package(
+                    package, agent=agent, mode=mode, allowed=allowed, requirements=requirements,
+                    preferences=preferences, note=note, force=force, reason=reason)
             current = self.tickets.get(ticket, unique=True)
+            member = packages.live_package_for(self.store, current.id)
+            if member is not None:
+                raise OfferConflict(
+                    f"ticket {current.id} is a member of package {member.package.id}; offer the "
+                    f"whole package (--package {member.package.id}) instead of one member",
+                    details={"reason": "package_member", "ticket_id": current.id,
+                             "package_id": member.package.id})
             reservation = reservations.reservation_for(self.store, current.id)
             forced = False
             if reservation is not None and agent != reservation.owner:
@@ -610,6 +667,71 @@ class OfferService:
                 ))
         return OfferChange(StoredOffer(offer, 1), event)
 
+    def _publish_package(self, package_id, *, agent, mode, allowed, requirements,
+                         preferences, note, force, reason) -> "OfferChange":
+        """Publish/assign a whole open package: its members in order, one
+        offer. Every reserved member needs its owner (or `force` + reason)."""
+        stored = packages.PackageService(self.lifecycle).get(package_id)
+        pkg = stored.package
+        if pkg.state != "open":
+            raise OfferConflict(
+                f"package {pkg.id} is {pkg.state}; only an open (unbound) package can be offered"
+                + (f" -- it is bound to {pkg.bound_worker}; use 'arbite package handoff' to "
+                   "rebind or release it" if pkg.state == "bound" else ""),
+                details={"reason": "package_unavailable", "package_id": pkg.id,
+                         "state": pkg.state, "bound_worker": pkg.bound_worker})
+        held = reservations.active_reservations(self.store)
+        forced = False
+        owners = sorted({held[t].owner for t in pkg.tickets if t in held})
+        if any(owner != agent for owner in owners):
+            if not (force and _clean(reason)):
+                hint = " (--force needs a non-empty --reason)" if force else ""
+                raise OfferConflict(
+                    f"package {pkg.id} has members reserved by {', '.join(owners)}; only the "
+                    f"owner may offer or assign it{hint}",
+                    details={"reason": "not_owner", "package_id": pkg.id, "owners": owners,
+                             "agent": agent})
+            forced = True
+        remaining = []
+        for ticket_id in pkg.tickets:
+            ticket = self.tickets.get(ticket_id, unique=True)
+            if ticket.status != "closed":
+                self._require_offerable(ticket)
+                remaining.append(ticket_id)
+        reservation = next((held[t] for t in pkg.tickets if t in held), None)
+        with self.store.transaction() as tx:
+            live = _live_in(tx)
+            existing = next((live[t] for t in pkg.tickets if t in live), None)
+            if existing is not None:
+                raise OfferConflict(
+                    f"package {pkg.id} already has {existing.offer.state} offer "
+                    f"{existing.offer.id} over a member; withdraw it first",
+                    details={"reason": "already_offered", "package_id": pkg.id,
+                             "offer_id": existing.offer.id, "state": existing.offer.state})
+            moment = self.now()
+            offer = Offer(
+                id=new_record_id("offer"), tickets=list(pkg.tickets), mode=mode,
+                publisher=agent, created=moment, updated=moment, target_kind="package",
+                package_id=pkg.id,
+                reservation_id=reservation.id if reservation is not None else None,
+                requirements=requirements, allowed_workers=allowed,
+                preferences=dict(preferences or {}), note=_clean(note),
+                provenance={"published_by": agent, "actor": self.actor,
+                            "reservation_owner": reservation.owner if reservation else None,
+                            "forced": forced, "reason": _clean(reason)},
+            )
+            problems = offer.validate()
+            if problems:
+                raise InvalidRecord(f"invalid offer: {'; '.join(problems)}",
+                                    details={"problems": problems})
+            tx.put(offer, expect_revision=0)
+            event = tx.append_event(_offer_event(
+                "offer_published", offer, 1, moment, actor=agent, reason=_clean(reason),
+                extra={"requirements": dict(requirements), "preferences": dict(offer.preferences),
+                       "forced": forced, "package_id": pkg.id, "remaining": remaining},
+            ))
+        return OfferChange(StoredOffer(offer, 1), event)
+
     def withdraw(
         self,
         offer_id: str,
@@ -628,6 +750,14 @@ class OfferService:
             offer = stored.offer
             check_revision("offer", offer.id, expect_revision, stored.revision)
             self._require_controller(offer, agent, force, reason)
+            if offer.state == "accepted" and offer.target_kind == "package":
+                raise OfferConflict(
+                    f"offer {offer.id} was accepted: package {offer.package_id} is bound to "
+                    f"{offer.accepted_by}; use 'arbite package handoff {offer.package_id} "
+                    "--reason <why> (--to W | --release)' to rebind or release its remaining work",
+                    details={"reason": "accepted", "offer_id": offer.id,
+                             "package_id": offer.package_id, "accepted_by": offer.accepted_by},
+                )
             if offer.state == "accepted":
                 return self._withdraw_accepted(stored, agent=agent, reason=reason,
                                                interrupt=interrupt)
@@ -650,7 +780,20 @@ class OfferService:
         `(AcquisitionResult, StoredOffer)`."""
         with self.lifecycle.locked():
             stored = self.get(offer_id)
-            ticket = self.tickets.get(stored.offer.tickets[0], unique=True)
+            if stored.offer.target_kind == "package":
+                # The package's current member; a package offer the worker has
+                # already accepted continues with its next member.
+                service = packages.PackageService(self.lifecycle)
+                pkg = service.get(stored.offer.package_id).package
+                if stored.offer.state == "accepted" and pkg.bound_worker == worker_id:
+                    result = service.claim(pkg.id, worker_id=worker_id,
+                                           declared_tier=declared_tier)
+                    return result, self.get(offer_id)
+                statuses = {t: self.tickets.get(t, unique=True).status for t in pkg.tickets}
+                current = packages.progress(pkg, statuses)["current"] or pkg.tickets[0]
+                ticket = self.tickets.get(current, unique=True)
+            else:
+                ticket = self.tickets.get(stored.offer.tickets[0], unique=True)
             result = self.lifecycle.acquire(
                 ticket, worker_id=worker_id, declared_tier=declared_tier, offer_id=offer_id
             )
@@ -747,6 +890,7 @@ __all__ = [
     "build_preferences",
     "build_requirements",
     "edit_refusal",
+    "end_package_offers",
     "evaluate",
     "live_offer_for",
     "live_offers",

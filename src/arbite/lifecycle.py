@@ -135,7 +135,7 @@ import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from . import coordination, eligibility, errors, graph, offers, reservations, schema, workers
+from . import coordination, eligibility, errors, graph, offers, packages, reservations, schema, workers
 from .application import Actor, CoordinationService, require_active_attempt
 from .coordination import (
     EVENT_PAYLOAD_VERSION,
@@ -657,6 +657,15 @@ class TicketLifecycle:
                 details={"ticket_id": ticket.id, "offer_id": live.offer.id,
                          "state": live.offer.state},
             )
+        package = packages.live_package_for(self.coordination.store, ticket.id)
+        if package is not None:
+            raise errors.TicketPackaged(
+                f"ticket {ticket.id} is a member of {package.package.state} package "
+                f"{package.package.id}; release the package (arbite package handoff --release) "
+                "or close the ticket instead of deleting it",
+                details={"reason": "package_edit", "ticket_id": ticket.id,
+                         "package_id": package.package.id},
+            )
         reservation = reservations.reservation_for(self.coordination.store, ticket.id)
         if reservation is not None:
             raise TicketError(
@@ -796,9 +805,12 @@ class TicketLifecycle:
 
         # A published offer (B03) or else a reservation (B02) restricts who may
         # acquire, for every origin: neither --adopt nor --force gets past it.
+        # A live continuity package (B04) is checked first inside the grant:
+        # only its current member, and only by its bound worker once bound.
         grant = offers.acquisition_grant(
             self.coordination.store, current.id, worker_id,
             offer_id=offer_id, declared_tier=declared_tier,
+            statuses={tid: t.status for tid, t in by_id.items()},
         )
 
         if adopt and takeover:
@@ -1304,15 +1316,30 @@ class TicketLifecycle:
                 if found is not None and found.is_active:
                     anchor = found
                     break
+        # Package members' statuses are read from the ticket sink *before* the
+        # coordination transaction opens (the ticket write already landed).
+        statuses = self._package_statuses(intent)
         if anchor is not None:
             context = self.coordination.guarded(kind, attempt=anchor, ticket_id=intent.ticket_id)
         else:
             context = _PlainTransaction(self.coordination.store.transaction())
         with context as op:
-            self._cascade(op.transaction, intent)
+            self._cascade(op.transaction, intent, statuses)
         return None
 
-    def _cascade(self, tx, intent: LifecycleIntent) -> None:
+    def _package_statuses(self, intent: LifecycleIntent) -> dict:
+        stored = packages.live_package_for(self.coordination.store, intent.ticket_id)
+        if stored is None:
+            return {}
+        statuses = {}
+        for member in stored.package.tickets:
+            try:
+                statuses[member] = self.tickets.get(member, unique=True).status
+            except Exception:
+                statuses[member] = None
+        return statuses
+
+    def _cascade(self, tx, intent: LifecycleIntent, statuses: Optional[dict] = None) -> None:
         moment = self.now()
         reason = intent.reason
         if intent.start_attempt is not None:
@@ -1411,6 +1438,9 @@ class TicketLifecycle:
         # worker lets go) and an acquisition's offer is accepted here, atomically
         # with the attempt stored above.
         offers.sync_in_transaction(tx, intent, moment)
+        # A continuity package binds on its first acquisition and advances (or
+        # completes, with its offer) when its current member closes.
+        packages.sync_in_transaction(tx, intent, moment, statuses or {})
 
         intent.state = "completed"
         intent.updated = moment
@@ -1587,6 +1617,8 @@ class TicketLifecycle:
         field edits; on a member of an active reservation they would bypass the
         reservation, so `in_progress` is refused (use `arbite claim`) and an
         assignee other than the owner (or clearing it) is refused."""
+        packages.edit_refusal(self.coordination.store, ticket,
+                              new_status=new_status, new_assignee=new_assignee)
         offers.edit_refusal(self.coordination.store, ticket,
                             new_status=new_status, new_assignee=new_assignee)
         reservation = reservations.reservation_for(self.coordination.store, ticket.id)
