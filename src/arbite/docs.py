@@ -1,4 +1,5 @@
-"""Renders .arbite/AGENTS.md: a self-describing reference doc written by `arbite init`.
+"""Renders the agent guide `arbite init` writes: a short .arbite/AGENTS.md
+quickstart and the full .arbite/REFERENCE.md.
 
 Two jobs, one file: it explains the workflow, and it carries the command
 reference. Kept in the package rather than hand-maintained per repo so it can't
@@ -91,31 +92,31 @@ ARBITE_INSTRUCTIONS_BLOCK = """\
 # Arbite Ticketing System
 
 ## Ticketing
-Use arbite ticketing system for all tasks. See /.arbite/AGENTS.md. Create a ticket if required and claim the ticket before starting work.
+Use arbite ticketing system for all tasks. Read `.arbite/AGENTS.md` (the short quickstart) before your first arbite command; `.arbite/REFERENCE.md` is the full reference -- read only the section you need. Create a ticket if required and claim the ticket before starting work.
 
-# Agent Identiy
+# Agent Identity
 
 When claiming a ticket, please use an identity format like: "claude.opus-5.001" where the company.model.instance is your best educated guess unless otherwise specified.
 If orchestrating, let subagents know their identity and instance number.
 
 ## Shared directory: use arbite for file work
-Read, claim and mutate source files through arbite -- not a shell or editor -- so a competing agent cannot silently overwrite your work:
+Claim and mutate source files through arbite -- not a shell or editor -- so a competing agent cannot silently overwrite your work:
 ```bash
-arbite file list [PATH] --json                        # discover
-arbite file search PATTERN [PATH] --json             # discover
-arbite file claim PATH --ticket T --attempt A        # own the whole file
-arbite file read  PATH --ticket T --attempt A --json # RE-READ; a pre-claim read does not authorize a write
-arbite file write|edit|remove|rename ... --read-token R
+arbite claim T --agent ME                                           # prints your attempt id A
+arbite file claim PATH [PATH ...] --ticket T --attempt A            # own every file of the task at once
+arbite file read PATH --ticket T --attempt A --version-only --json  # read token R, no content served
+arbite file read PATH --ticket T --attempt A --lines 40:90           # look at only what you need
+arbite file edit PATH --ticket T --attempt A --read-token R --edits -    # stdin: [{"old": "...", "new": "..."}]
+arbite file write PATH --ticket T --attempt A [--read-token R] --input - # new (claimed-absent) file: no token
 ```
-Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a token is single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. A binary file takes `arbite file read PATH ... --version-only`, which returns a token without serving content.
-Every `arbite file` command needs your active `--attempt` id; get it from `arbite export --scope coordination --no-artifacts` (the `work_attempts` entry with your ticket_id and `state: active`).
-There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: arbite records proxy mutations only, so a generated file written into the source tree is unattributed drift. Mutation evidence and artifacts accumulate and are never garbage-collected. Arbite enforces its own operations and reports observed drift, but it cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
+A read token proves the file is unchanged since you took it, not that you read it. Take a fresh one after every claim and before each mutation: tokens are single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. Lost the attempt id? `arbite show T --json` reports `active_attempt.id`.
+There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: a generated file written into the source tree is unattributed drift. Mutation evidence is never garbage-collected. Arbite cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
 
 ## Sole command: "Work Next|All <epic>"
 
 If your sole command is "Work Next" or "Work All", you can use the following commands to find the next arbite ticket(s):
 ```bash
-arbite list next   # Show next workable ticket
+arbite list next [--epic <epic>]   # Show next workable ticket
 arbite list --topo --status open [--epic <epic>]
 ```
 
@@ -148,27 +149,38 @@ Do not fill the codebase with comments containing history, musings, or overly wo
 
 
 def install_instructions(path: Path) -> str:
-    """Put the arbite instructions block into the agent doc at `path`.
+    """Put the current arbite instructions block into the agent doc at `path`.
 
     Returns what it did, so `arbite init` can report it:
 
     - 'created'  -- the file did not exist; it is written with the block alone;
     - 'prepended' -- the file existed without the block; the block is prepended and
       the existing contents are preserved below it;
-    - 'present'  -- the file already carries the block, so it is left untouched.
+    - 'updated'  -- the text between the markers differed from the current block and
+      was replaced; everything outside the markers is preserved;
+    - 'present'  -- the file already carries the current block, so it is untouched;
+    - 'unmatched' -- only one marker, or END before BEGIN: left alone rather than
+      guessing where the block ends.
 
-    Idempotent by demarkation: re-running `arbite init` must never stack a second
-    copy, whatever else the file contains."""
+    Idempotent by demarkation: re-running `arbite init` never stacks a second copy."""
     if not path.exists():
         path.write_text(ARBITE_INSTRUCTIONS_BLOCK + "\n", encoding="utf-8")
         return "created"
     existing = path.read_text(encoding="utf-8")
-    if ARBITE_INSTRUCTIONS_BEGIN in existing or ARBITE_INSTRUCTIONS_END in existing:
+    begin = existing.find(ARBITE_INSTRUCTIONS_BEGIN)
+    end = existing.find(ARBITE_INSTRUCTIONS_END)
+    if begin == -1 and end == -1:
+        path.write_text(
+            ARBITE_INSTRUCTIONS_BLOCK + "\n\n" + existing.lstrip("\n"), encoding="utf-8"
+        )
+        return "prepended"
+    if begin == -1 or end == -1 or end < begin:
+        return "unmatched"
+    end += len(ARBITE_INSTRUCTIONS_END)
+    if existing[begin:end] == ARBITE_INSTRUCTIONS_BLOCK:
         return "present"
-    path.write_text(
-        ARBITE_INSTRUCTIONS_BLOCK + "\n\n" + existing.lstrip("\n"), encoding="utf-8"
-    )
-    return "prepended"
+    path.write_text(existing[:begin] + ARBITE_INSTRUCTIONS_BLOCK + existing[end:], encoding="utf-8")
+    return "updated"
 
 # Per-field descriptions for the frontmatter table, keyed by field name.
 # Interpolating the vocabulary constants keeps the doc honest about what the
@@ -338,13 +350,13 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     lines: list[str] = []
     add = lines.append
 
-    add("# arbite -- agent guide")
+    add("# arbite -- full reference")
     add("")
     add(
         f"_Auto-generated by `arbite init` (arbite {__version__}) on {date.today().isoformat()}: "
         "every `arbite init` run here rewrites it, so edit the package's docs template rather than "
-        "this file. Not auto-discovered -- point your project's CLAUDE.md at it explicitly (e.g. a "
-        "line 'read .arbite/AGENTS.md')._"
+        "this file. Start with the short `.arbite/AGENTS.md` quickstart; this file is the full "
+        "reference, meant to be read one section at a time._"
     )
     add("")
 
@@ -781,7 +793,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("")
     add("arbite file list --json                                 # discover workspace files (no lock)")
     add("arbite file claim src/app.py --ticket tic-a1b2 --attempt att-...   # own the whole file")
-    add("arbite file read  src/app.py --ticket tic-a1b2 --attempt att-... --json  # re-read -> token")
+    add("arbite file read  src/app.py --ticket tic-a1b2 --attempt att-... --version-only --json  # token")
+    add("arbite file edit  src/app.py --ticket tic-a1b2 --attempt att-... --read-token R --edits -")
     add("arbite file write src/app.py --ticket tic-a1b2 --attempt att-... --read-token R --input p.txt")
     add("arbite changes tic-a1b2 --json                          # what changed, and is it verifiable")
     add("```")
@@ -800,9 +813,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "discovery, reads and mutations through arbite instead of shell/editor writes: "
         "`arbite file list|search` to discover, `arbite file read PATH --ticket T --attempt A` to "
         "read, `arbite file claim PATH... --ticket T --attempt A` to own a whole file, then read "
-        "again -- bytes read *before* you held the claim do not authorize a write -- and mutate "
-        "with `arbite file write|edit|remove|rename`. Re-read after every claim, takeover and "
-        "ticket boundary, and before each mutation: a token is consumed by the mutation it "
+        "again -- a read token taken *before* you held the claim does not authorize a write -- "
+        "and mutate with `arbite file write|edit|remove|rename`. A read token is a freshness "
+        "receipt (the file was at version X under your claim), not proof that its content was "
+        "read, so `--version-only` or a `--lines START:END` read is enough to obtain one. "
+        "Re-read after every claim, takeover and ticket boundary, and before each mutation: a "
+        "token is consumed by the mutation it "
         "authorizes (even one that writes identical bytes), and a stale or already-consumed token "
         "is refused with `stale_read` and no bytes change. A binary file cannot be served as text; "
         "`arbite file read PATH ... --version-only` records its version and returns the token a "
@@ -813,10 +829,11 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     )
     add("")
     add(
-        "Every `arbite file` command needs your active `--attempt` id. Get it from "
-        "`arbite export --scope coordination --no-artifacts`: its `records.work_attempts` lists one "
-        "entry per attempt -- take the one whose `ticket_id` is yours and whose `state` is "
-        "`active`."
+        "Every `arbite file` command needs your active `--attempt` id. `claim`, `list next "
+        "--claim`, `offer claim` and `package claim` print it (`attempt_id` in `--json`), and "
+        "`arbite show T --json` reports it as `active_attempt.id`. It is deliberately never "
+        "inferred: after a takeover, the old id is what makes the previous worker's file commands "
+        "fail instead of acting under the new attempt."
     )
     add("")
     add(
@@ -1067,3 +1084,153 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     # Last line of defence: no escape code may reach the file, whatever the
     # running argparse version decided to colourise.
     return _ANSI_RE.sub("", "\n".join(lines)) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# The quickstart: .arbite/AGENTS.md
+# ---------------------------------------------------------------------------
+
+#: Upper bound on the rendered quickstart, enforced by the test suite: the file is
+#: read at the start of every task, so growth belongs in REFERENCE.md instead.
+QUICKSTART_MAX_CHARS = 9000
+
+#: Where to look next: (topic, REFERENCE.md section heading).
+_REFERENCE_INDEX = (
+    ("ticket fields, tier vs priority vs domain", "Ticket fields (YAML frontmatter)"),
+    ("resuming work, agent scratchpads", "Agent identity and resuming work"),
+    ("the file proxy in depth: busy files, drift, evidence", "Shared directory: the file proxy"),
+    ("batches, exit codes, race-free claiming", "Conventions (scripts and agent loops)"),
+    ("raw tickets, wishes, classification, doctor", "Triage: raw tickets, wishes, filing, scaffolding"),
+    ("worker profiles, capacity", "Worker profiles (optional)"),
+    ("why a ticket is not ready for you", "Job board and readiness"),
+    ("coordinating other agents", "Reservations (coordinators)"),
+    ("offers and direct assignments", "Offers and direct assignments"),
+    ("'A then B by the same worker'", "Continuity packages"),
+    ("event log for external callers", "Events and progress (external callers)"),
+    ("moving stores, export, integrity checks", "Transfers, export and the doctor"),
+    ("every command's flags", "Commands"),
+)
+
+
+def render_quickstart(active_info=None, stale_info=None) -> str:
+    """Render the short guide an agent reads first; REFERENCE.md holds the rest.
+
+    Sink-aware in the two places a wrong statement would mislead an agent: how
+    status is stored, and a second store that nothing selects."""
+    primary = active_info if active_info is not None else stale_info
+    status_is_location = bool(getattr(primary, "status_is_location", False))
+    mismatch = active_info is not None and stale_info is not None
+
+    lines: list[str] = []
+    add = lines.append
+    add("# arbite -- quickstart")
+    add("")
+    add(
+        f"_Auto-generated by `arbite init` (arbite {__version__}) on {date.today().isoformat()}; "
+        "edit the package's docs template, not this file. This is the short guide. The full "
+        "reference is `.arbite/REFERENCE.md`: read only the section you need (index at the "
+        "bottom). `arbite <command> -h` prints any command's flags._"
+    )
+    add("")
+    if mismatch:
+        add(
+            f"> **Warning: this project holds a second ticket store that nothing selects** "
+            f"({getattr(stale_info, 'ticket_count', 0)} ticket(s) in a "
+            f"`{getattr(stale_info, 'kind', None)}` store at `{getattr(stale_info, 'root', None)}`). "
+            "Plain commands read the other one. **The wrong store looks exactly like an empty "
+            "one**: if a command reports no tickets, run `arbite sink info --json` and check its "
+            "`kind` field before concluding the queue is empty. See REFERENCE.md, 'Where tickets "
+            "live (the sink)'."
+        )
+        add("")
+
+    add("## Work a ticket")
+    add("")
+    add(
+        "Your id is `company.model.instance` (e.g. `claude.opus-5.001`). Claim only tickets at or "
+        f"below your capability tier ({TIER_VALUES}); `priority` is urgency, lower first. "
+        + (
+            "A ticket's folder is its status and the source of truth. "
+            if status_is_location
+            else "`status` is a field and the source of truth. "
+        )
+        + "Your memory is a hint: `arbite list --assignee <you>` shows what you really hold."
+    )
+    add("")
+    add("```bash")
+    add("arbite list next --tier <tier> --claim <you> --json  # pick + claim in one race-free step")
+    add("arbite claim tic-a1b2 --agent <you>                  # or claim a named ticket")
+    add("arbite show tic-a1b2 --json                          # the ticket; active_attempt.id = --attempt")
+    add('arbite note tic-a1b2 <you> "what changed and why"    # progress; never edit the ticket body')
+    add("arbite close tic-a1b2 --agent <you>                  # done")
+    add('arbite release tic-a1b2 --agent <you> --reason "wrong tier"   # stop part-way; back to open')
+    add('arbite block tic-a1b2 --agent <you> --reason "waiting on tic-c3d4"')
+    add("arbite create --title T --type bug --tier medium --domain io [--epic E] [--priority 5]")
+    add('arbite raw feature "an idea to classify later"       # quick capture, not workable yet')
+    add("```")
+    add("")
+    add(
+        "Every acquisition prints your **attempt id** (`attempt att-...`, or `attempt_id` in "
+        "`--json`); file commands need it. Lost it? `arbite show T --json` -> `active_attempt.id`. "
+        "`close`, `release`, `block` and `shelve` end the attempt and release its file claims."
+    )
+    add("")
+
+    add("## Edit files through arbite")
+    add("")
+    add(
+        "In a shared checkout, change source files through the proxy, not a shell or editor, so "
+        "no agent silently overwrites another's work. A **read token** is a freshness receipt "
+        "(\"the file was at version X\"), not proof you read it: get one cheaply with "
+        "`--version-only`, and look at code with `--lines START:END` rather than whole-file reads."
+    )
+    add("")
+    add("```bash")
+    add("T=tic-a1b2 A=att-...   # A: the attempt id your claim printed")
+    add("arbite file claim src/a.py src/b.py --ticket $T --attempt $A   # every file of the task, once")
+    add("arbite file read src/a.py --ticket $T --attempt $A --version-only --json   # -> data.read_token")
+    add("arbite file read src/a.py --ticket $T --attempt $A --lines 120:180        # see only what you need")
+    add("arbite file edit src/a.py --ticket $T --attempt $A --read-token R --edits - <<'EOF'")
+    add('[{"old": "exact text, unique in the file", "new": "replacement"},')
+    add(' {"old": "a second unique anchor", "new": "its replacement"}]')
+    add("EOF")
+    add("arbite file write src/new.py --ticket $T --attempt $A --input -   # new file (claimed absent): no token")
+    add("```")
+    add("")
+    add(
+        "- One token per mutation: re-read (version-only is enough) before the next change to the "
+        "same file. Put all of a file's changes in one `--edits` batch.\n"
+        "- A batch is all-or-nothing: an `old` that is missing or not unique refuses the whole "
+        "batch, nothing changes, and the token stays usable.\n"
+        "- `stale_read`: the token is stale or used; read again. `claim_version_mismatch`: the "
+        "file changed outside arbite; `arbite file release` it, claim it again, then read. "
+        "`file_busy`: another attempt holds it; pick other work, never wait or steal.\n"
+        "- A whole-file `write` replacing an existing file needs a token too; `remove` and "
+        "`rename` also exist (`arbite file -h`).\n"
+        "- Shell is fine for tests and builds, but keep their output out of source paths "
+        "(it shows up as unattributed drift). `arbite changes T --json` shows what a ticket "
+        "changed."
+    )
+    add("")
+
+    add("## When arbite says no")
+    add("")
+    add(
+        "- Exit codes: `0` ok, `1` error or refusal, `2` ran fine but nothing matched (e.g. no "
+        "workable ticket), `3` `arbite doctor` found problems. Parse `--json`, not tables.\n"
+        "- A claim refused as reserved, offered to someone else, out of package order or above "
+        "your tier will not succeed on retry: pick other work. Over your declared capacity, "
+        "finish or release something first. "
+        "`arbite board --worker <you>` explains every ticket's status for you.\n"
+        "- Nothing times out and nothing reassigns stale work: only "
+        "`arbite claim T --agent <you> --force --reason <why>` takes over a live attempt.\n"
+        "- Ticket ids accept any unique substring (`f6` -> `tic-f607`)."
+    )
+    add("")
+
+    add("## Where to look next (`.arbite/REFERENCE.md`)")
+    add("")
+    for topic, heading in _REFERENCE_INDEX:
+        add(f"- {topic}: '{heading}'")
+    add("")
+    return "\n".join(lines)

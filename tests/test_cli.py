@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from arbite import config
+from arbite import config, docs
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
@@ -82,9 +82,26 @@ def test_init_creates_the_file_layout_and_a_folder_aware_guide(cli, tmp_project)
     assert "file sink ready" in output
     for name in ("raw", "open", "in_progress", "blocked", "shelved", "closed", "wishlist", "planning"):
         assert (tmp_project / ".arbite" / name).is_dir(), name
-    guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    guide = (tmp_project / ".arbite" / "REFERENCE.md").read_text()
     assert "folder is the source of truth" in guide
     assert "## Where tickets live (the sink)" in guide
+    quickstart = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    assert "A ticket's folder is its status" in quickstart
+    assert ".arbite/REFERENCE.md" in quickstart
+
+
+def test_the_quickstart_stays_short_and_indexes_real_reference_sections(cli, tmp_project):
+    """AGENTS.md is read at the start of every task: it has a hard size budget, and
+    every section it sends a reader to must exist in REFERENCE.md."""
+    cli("init")
+    quickstart = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    reference = (tmp_project / ".arbite" / "REFERENCE.md").read_text()
+    assert len(quickstart) <= docs.QUICKSTART_MAX_CHARS, len(quickstart)
+    for _, heading in docs._REFERENCE_INDEX:
+        assert f"## {heading}" in reference, heading
+    for needle in ("--version-only", "active_attempt.id", "--edits -", "stale_read", "file_busy"):
+        assert needle in quickstart, needle
+    assert "arbite export --scope coordination" not in quickstart + reference
 
 
 def test_init_leaves_agent_docs_alone_without_the_flags(cli, tmp_project):
@@ -108,6 +125,21 @@ def test_init_agents_doc_creates_then_leaves_the_block_alone(cli, tmp_project):
     again = cli("init", "--agents-doc").stdout
     assert "already contains the arbite instructions block" in again
     assert (tmp_project / "AGENTS.md").read_text() == doc
+
+
+def test_init_refreshes_an_outdated_block_between_its_markers(cli, tmp_project):
+    """Template fixes reach existing projects: only the marked block is replaced,
+    and a file whose markers do not pair up is left alone."""
+    stale = "<!-- BEGIN ARBITE INSTRUCTIONS -->\nold advice\n<!-- END ARBITE INSTRUCTIONS -->"
+    (tmp_project / "CLAUDE.md").write_text("# Mine above\n\n" + stale + "\n\nMine below.\n")
+    assert "refreshed the arbite instructions block" in cli("init", "--claude-doc").stdout
+    doc = (tmp_project / "CLAUDE.md").read_text()
+    assert doc == "# Mine above\n\n" + docs.ARBITE_INSTRUCTIONS_BLOCK + "\n\nMine below.\n"
+
+    broken = "<!-- END ARBITE INSTRUCTIONS -->\nkeep\n<!-- BEGIN ARBITE INSTRUCTIONS -->\n"
+    (tmp_project / "AGENTS.md").write_text(broken)
+    assert "do not pair up" in cli("init", "--agents-doc").stdout
+    assert (tmp_project / "AGENTS.md").read_text() == broken
 
 
 def test_init_claude_doc_prepends_without_clobbering_the_file(cli, tmp_project):
@@ -198,7 +230,9 @@ def test_the_guide_names_the_store_a_plain_command_will_read(cli, tmp_project):
     (tmp_project / "arbite.yaml").unlink()  # the selection goes; the tickets stay
 
     cli("init")  # re-renders the guide from the sink plain commands will read
-    guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    assert "second ticket store that nothing selects" in (
+        tmp_project / ".arbite" / "AGENTS.md").read_text()
+    guide = (tmp_project / ".arbite" / "REFERENCE.md").read_text()
     assert "holds a second ticket store that nothing selects" in guide
     assert "1 ticket(s) in a `sqlite` store" in guide
     assert "also present, but not selected: `sqlite`" in guide
@@ -210,7 +244,7 @@ def test_the_guide_names_the_store_a_plain_command_will_read(cli, tmp_project):
     # prose go away.
     (tmp_project / "arbite.yaml").write_text("sink: sqlite\n")
     cli("init")
-    guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    guide = (tmp_project / ".arbite" / "REFERENCE.md").read_text()
     assert "nothing selects" not in guide
     assert "- active sink: `sqlite`" in guide
     assert "folder is the source of truth" not in guide
@@ -518,7 +552,7 @@ def test_migrate_round_trips_file_to_sqlite_and_back_byte_identically(project, c
         return {
             str(path.relative_to(project)): path.read_bytes()
             for path in sorted((project / ".arbite").rglob("*.md"))
-            if path.name != "AGENTS.md" and "agents" not in path.parts
+            if path.name not in ("AGENTS.md", "REFERENCE.md") and "agents" not in path.parts
         }
 
     before = snapshot()

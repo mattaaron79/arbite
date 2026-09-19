@@ -163,7 +163,7 @@ def workspace(tmp_path: Path) -> Path:
 def test_agent_guidance_mandates_the_proxy(workspace):
     cli = Cli(workspace, "file")
     cli.run("init")
-    guide = (workspace / ".arbite" / "AGENTS.md").read_text()
+    guide = (workspace / ".arbite" / "REFERENCE.md").read_text()
     for needle in (
         "Shared directory: the file proxy",
         "arbite file claim",
@@ -184,7 +184,7 @@ def test_installed_instructions_match_the_example_and_mandate_proxy_use():
     block = docs.ARBITE_INSTRUCTIONS_BLOCK
     for needle in (
         "Shared directory: use arbite for file work",
-        "a pre-claim read does not authorize a write",
+        "Take a fresh one after every claim and before each mutation",
         "stale_read",
         "no runner, daemon, watcher or scheduler",
         "unattributed drift",

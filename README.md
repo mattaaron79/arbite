@@ -114,10 +114,12 @@ See AGENTS_EXAMPLE.md, which tells the agent to classify and work raw tickets wh
   [Shared-directory coordination](#shared-directory-coordination-the-file-proxy).
 - **Machine-first interfaces.** JSON output for every read query, distinct exit
   codes for success / error / empty / integrity-problems.
-- **A self-describing command surface.** `arbite init` regenerates
-  [`docs.py`](src/arbite/docs.py)-rendered `.arbite/AGENTS.md` straight from
-  argparse's own `--help`, and words it for the sink actually in use, so the
-  agent-facing docs cannot drift from the CLI *or* lie about the storage.
+- **A self-describing command surface.** `arbite init` regenerates the
+  [`docs.py`](src/arbite/docs.py)-rendered guide: a short `.arbite/AGENTS.md`
+  quickstart (size-capped by a test) and the full `.arbite/REFERENCE.md`, whose
+  command section comes straight from argparse's own `--help`. Both are worded for
+  the sink actually in use, so the agent-facing docs cannot drift from the CLI *or*
+  lie about the storage.
 - **A dependency graph, not just a list.** Tickets can declare structural
   `depends_on` links, and `arbite list next` returns work in topological order.
 - **Recoverable history.** Plain files plus git; no proprietary format to migrate.
@@ -349,14 +351,16 @@ Agents are instructed (see [`AGENTS_EXAMPLE.md`](AGENTS_EXAMPLE.md:1) and the
 generated `.arbite/AGENTS.md`) to do source **discovery, reads and mutations**
 through arbite rather than shell or editor writes, and to **re-read through
 arbite after acquiring a claim, after a takeover, and at every ticket boundary** —
-bytes read before a claim do not authorize a write. Shell commands remain fine for
+a read token taken before a claim does not authorize a write. A read token is a
+freshness receipt, not proof the content was read, so `--version-only` (or a
+`--lines` range) is enough to obtain one. Shell commands remain fine for
 tests and builds. The enforcement is instruction plus the proxy's own checks: a
 direct shell write bypasses the proxy.
 
-Every `arbite file` command takes `--attempt A`; an agent's active attempt id comes
-from `arbite export --scope coordination --no-artifacts`, which lists
-`records.work_attempts` — take the entry whose `ticket_id` is yours and whose
-`state` is `active`.
+Every `arbite file` command takes `--attempt A`. Acquisition prints it (`claim`,
+`list next --claim`, `offer claim` and `package claim`; `attempt_id` in `--json`),
+and `arbite show T --json` reports it as `active_attempt.id`. It is never inferred:
+after a takeover the old id is what refuses the previous worker's file commands.
 
 ### Owner recipe: two agents in one directory
 
@@ -673,14 +677,13 @@ arbite offer publish --package <pkg> --agent coord.lead --min-tier medium --requ
 # 5. Bob cannot take Alice's assignment, so he accepts the sequence instead:
 #    that starts member one and binds both members to him.
 arbite claim <direct> --agent openai.gpt.002                 # exit 1: directly assigned
-arbite offer claim <offer> --agent openai.gpt.002            # -> claimed <member-one>
+arbite offer claim <offer> --agent openai.gpt.002            # -> claimed <member-one> (..., attempt <att-one>)
 
 # 6. Alice cannot steal Bob's second member -- plain or with --force (exit 1).
 arbite claim <member-two> --agent claude.opus.001
 
-# 7. Bob works member one through the proxy. Attempt ids come from the export.
-arbite export --scope coordination --no-artifacts            # records.work_attempts:
-                                                            # ticket_id <member-one>, state active
+# 7. Bob works member one through the proxy, with the attempt id step 5 printed
+#    (or: arbite show <member-one> --json -> active_attempt.id).
 arbite file claim src/step_one.py --ticket <member-one> --attempt <att-one>
 printf 'step = 1\n' | arbite file write src/step_one.py --ticket <member-one> --attempt <att-one> --input -
 arbite file read src/step_one.py --ticket <member-one> --attempt <att-one> --json   # -> read_token
@@ -878,7 +881,8 @@ strictness for `domain`/`tags`, the `deps` visualization format, and whether
   agents/
     claude.haiku.001.md
     ...
-  AGENTS.md        generated command reference
+  AGENTS.md        generated quickstart (read first)
+  REFERENCE.md     generated full reference and command list
 ```
 
 - `raw/`, `open/`, `in_progress/`, `blocked/`, `shelved/` are **status folders**.
@@ -891,9 +895,11 @@ strictness for `domain`/`tags`, the `deps` visualization format, and whether
 - `agents/` holds one scratchpad file per known agent identity (no required schema),
   pre-created from the `agents:` list in `arbite.yaml` / `.arbite.yaml`. Scratchpads
   stay files whichever sink is active: they are harness-facing state, not tickets.
-- `AGENTS.md` is regenerated on every `arbite init`. It is **not auto-discovered** —
-  a project that wants agents to find arbite must point at it explicitly (e.g. a line
-  in its own `CLAUDE.md` like "read `.arbite/AGENTS.md`").
+- `AGENTS.md` and `REFERENCE.md` are regenerated on every `arbite init`. They are
+  **not auto-discovered** — a project that wants agents to find arbite points at the
+  quickstart explicitly, e.g. with `arbite init --claude-doc` / `--agents-doc`, which
+  install (and on later runs refresh) a marked instructions block in the project's
+  own `CLAUDE.md` / `AGENTS.md`; text outside the markers is never touched.
 
 A SQLite-sink project has the same `.arbite/agents/` directories and `AGENTS.md`,
 with `arbite.db` in place of the status folders.

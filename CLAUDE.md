@@ -2,31 +2,31 @@
 # Arbite Ticketing System
 
 ## Ticketing
-Use arbite ticketing system for all tasks. See /.arbite/AGENTS.md. Create a ticket if required and claim the ticket before starting work.
+Use arbite ticketing system for all tasks. Read `.arbite/AGENTS.md` (the short quickstart) before your first arbite command; `.arbite/REFERENCE.md` is the full reference -- read only the section you need. Create a ticket if required and claim the ticket before starting work.
 
-# Agent Identiy
+# Agent Identity
 
 When claiming a ticket, please use an identity format like: "claude.opus-5.001" where the company.model.instance is your best educated guess unless otherwise specified.
 If orchestrating, let subagents know their identity and instance number.
 
 ## Shared directory: use arbite for file work
-Read, claim and mutate source files through arbite -- not a shell or editor -- so a competing agent cannot silently overwrite your work:
+Claim and mutate source files through arbite -- not a shell or editor -- so a competing agent cannot silently overwrite your work:
 ```bash
-arbite file list [PATH] --json                        # discover
-arbite file search PATTERN [PATH] --json             # discover
-arbite file claim PATH --ticket T --attempt A        # own the whole file
-arbite file read  PATH --ticket T --attempt A --json # RE-READ; a pre-claim read does not authorize a write
-arbite file write|edit|remove|rename ... --read-token R
+arbite claim T --agent ME                                           # prints your attempt id A
+arbite file claim PATH [PATH ...] --ticket T --attempt A            # own every file of the task at once
+arbite file read PATH --ticket T --attempt A --version-only --json  # read token R, no content served
+arbite file read PATH --ticket T --attempt A --lines 40:90           # look at only what you need
+arbite file edit PATH --ticket T --attempt A --read-token R --edits -    # stdin: [{"old": "...", "new": "..."}]
+arbite file write PATH --ticket T --attempt A [--read-token R] --input - # new (claimed-absent) file: no token
 ```
-Re-read after every claim, takeover and ticket boundary, and take a fresh read before each mutation: a token is single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. A binary file takes `arbite file read PATH ... --version-only`, which returns a token without serving content.
-Every `arbite file` command needs your active `--attempt` id; get it from `arbite export --scope coordination --no-artifacts` (the `work_attempts` entry with your ticket_id and `state: active`).
-There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: arbite records proxy mutations only, so a generated file written into the source tree is unattributed drift. Mutation evidence and artifacts accumulate and are never garbage-collected. Arbite enforces its own operations and reports observed drift, but it cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
+A read token proves the file is unchanged since you took it, not that you read it. Take a fresh one after every claim and before each mutation: tokens are single-use, and a stale or consumed token is refused with `stale_read` and no bytes change. Lost the attempt id? `arbite show T --json` reports `active_attempt.id`.
+There is no runner, daemon, watcher or scheduler, and stale work is never taken over automatically -- agents are started manually and may use different providers; only `arbite claim --force --reason <why>` moves live work. Keep build/test output outside managed source paths: a generated file written into the source tree is unattributed drift. Mutation evidence is never garbage-collected. Arbite cannot prove who made a direct filesystem change -- an external editor or shell can still bypass the proxy.
 
 ## Sole command: "Work Next|All <epic>"
 
 If your sole command is "Work Next" or "Work All", you can use the following commands to find the next arbite ticket(s):
 ```bash
-arbite list next   # Show next workable ticket
+arbite list next [--epic <epic>]   # Show next workable ticket
 arbite list --topo --status open [--epic <epic>]
 ```
 

@@ -361,23 +361,22 @@ def cmd_init(args):
 
     parser, subparsers_by_name = build_parser()
     agents_md = arbite_dir / "AGENTS.md"
+    reference_md = arbite_dir / "REFERENCE.md"
     # The guide is committed and read by processes other than this one, so it
     # describes the sink a *plain* command will use (committed config only, no
     # --sink, no environment) -- and names any other store here that holds tickets
     # but that nothing selects.
     active = build_sink(config.configured_sink_spec(project_root), arbite_dir)
-    agents_md.write_text(
-        docs.render(
-            parser,
-            subparsers_by_name,
-            _describe_safely(active),
-            _find_stale_store(sink, active, arbite_dir),
-        ),
-        encoding="utf-8",
+    active_info = _describe_safely(active)
+    stale_info = _find_stale_store(sink, active, arbite_dir)
+    reference_md.write_text(
+        docs.render(parser, subparsers_by_name, active_info, stale_info), encoding="utf-8"
     )
+    agents_md.write_text(docs.render_quickstart(active_info, stale_info), encoding="utf-8")
     print(
-        f"AGENTS.md refreshed at {agents_md} -- this is not auto-discovered, so point your "
-        f"project's CLAUDE.md (or similar) at it explicitly, e.g. a line like "
+        f"AGENTS.md (quickstart) and REFERENCE.md refreshed in {arbite_dir} -- neither is "
+        f"auto-discovered, so point your project's CLAUDE.md (or similar) at the quickstart, "
+        f"e.g. with 'arbite init --claude-doc' or a line like "
         f"'read {config.ARBITE_DIRNAME}/AGENTS.md', if you want agents to find arbite"
     )
 
@@ -399,6 +398,16 @@ def cmd_init(args):
             print(
                 f"prepended the arbite instructions block to {doc_path} "
                 "(existing contents left in place)"
+            )
+        elif outcome == "updated":
+            print(
+                f"refreshed the arbite instructions block in {doc_path} "
+                "(text outside the BEGIN/END markers left in place)"
+            )
+        elif outcome == "unmatched":
+            print(
+                f"{doc_path} has arbite instruction markers that do not pair up; "
+                "left unchanged -- fix or remove the markers and run init again"
             )
         else:
             print(
