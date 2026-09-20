@@ -1,7 +1,7 @@
 ---
 id: tic-8c96
 title: 'Add ''review: true|false'' to project config'
-status: open
+status: closed
 type: feature
 tier: low
 domain: config
@@ -15,8 +15,8 @@ depends_on:
 - tic-b757
 blocked_by: null
 created: '2026-09-20T12:25:09'
-updated: '2026-09-20T12:25:09'
-closed: null
+updated: '2026-09-20T13:28:34'
+closed: '2026-09-20T13:28:34'
 ---
 
 ## Description
@@ -29,3 +29,4 @@ Non-boolean values are an error naming the file and the key, consistent with how
 Acceptance: absent key reads as true; 'review: false' reads as false; a garbage value errors clearly.
 
 ## Notes
+- 2026-09-20T13:28:34 zoo.orch.001: Added top-level boolean review: key to .arbite/project.yaml with review_enabled() accessor; defaults true; non-boolean values error naming file+key; does not affect the review status or the review/ folder

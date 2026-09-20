@@ -116,7 +116,18 @@ If your sole command is "Classify" use the following command to list all tickets
 arbite list raw
 ```
 
-Use your session to classify all tickets, looking deeper into the requirements, adding notes, etc until all raw tickets are classified.
+Use your session to classify all tickets with `arbite promote <id> --title ... --tier ... --domain ...` (adding `--description`/`--epic`/`--priority`/`--tags` as you learn more), looking deeper into the requirements, adding notes, etc until all raw tickets are classified. Add `--agent <your-id>` to claim one you are going to work yourself; a wish is reclassified and filed in the wishlist bucket by the same command instead of being opened.
+
+## Workflow: claim -> in_progress -> submit -> review -> accept
+
+```bash
+arbite claim <id> --agent <your-id>        # take it: status -> in_progress
+arbite note <id> <your-id> "what changed"  # log progress as you go
+arbite submit <id>                         # finish: status -> review, assignee kept
+arbite accept <id> --agent <reviewer-id>   # the reviewer closes it, credited to them
+```
+
+A reviewer who sends work back uses `arbite reopen <id> --reason "<why>"` -- the reason is required, because it is the only record of what the author must fix. With the file sink a ticket's status is also the folder it sits in (`open/`, `in_progress/`, `review/`, `blocked/`, `shelved/`, `closed/YYYY-MM/`), while `wishlist/` and `plans/` are buckets rather than statuses and `raw/processed/` holds frozen snapshots of promoted captures. A project can set `review: false` in `.arbite/project.yaml`, in which case `arbite submit` closes the ticket directly instead of parking it in review.
 
 # Ticketing etiquette addendum
 
@@ -285,6 +296,17 @@ def _iter_actions(subparser):
         yield action
 
 
+def _nested_choices(subparser) -> list:
+    """`(name, parser)` for a command group's own sub-commands, in the order they
+    were registered -- `ref` yields `add`/`rm`/`list`. Empty for an ordinary
+    command, so the renderer can document a nested group's sub-commands instead of
+    collapsing them into one opaque `{add,rm,list}` usage line."""
+    for action in subparser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return list(action.choices.items())
+    return []
+
+
 def _is_shorthand(subparser) -> bool:
     """True for `arbite bug|feature|memo|wish <message>`, the one-word forms of
     `arbite raw <type> <message>`: they are described as shorthands by the CLI
@@ -424,11 +446,47 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "command; `arbite init` and a successful `arbite migrate` write it for you"
     )
     add(
+        "- a top-level `review:` key (default `true`) is the committed answer to where a finished "
+        "ticket goes: `review/` when true, straight to `closed/` when false. It does not remove the "
+        "`review` status or the `review/` folder -- tickets already awaiting review must not be "
+        "stranded -- and any value that is not a real boolean (true/false, or YAML 1.1 `yes`/`no`/"
+        "`on`/`off`) is a config error naming the file and the key"
+    )
+    add(
         "- available kinds: `file` (markdown files under the arbite directory, the default, and the "
         "one that gives you `git log --follow` history) and `sqlite` (a single database file, "
         "queryable with real SQL, and not version-control friendly)"
     )
     add("- report it, or create it: `arbite sink info`, `arbite sink init`")
+    add(
+        "- count the *backlog* by status -- every status, zeros included, plus a total, "
+        "narrowed by the usual filters: `arbite status`. That is a different question from "
+        "`arbite sink info`, which describes the *store* (its kind, root and capabilities "
+        "rather than what is in it)"
+    )
+    add(
+        "- see what is *in flight* rather than what merely exists: `arbite progress` lists the epics "
+        "holding a live ticket (open, in_progress or review) and then every ticket of those epics, "
+        "closed and shelved siblings included, in dependency order -- an epic with nothing live never "
+        "appears at all. Live tickets with no epic are grouped under `no epic`, each epic gets a count "
+        "line, and `--epic` narrows the report to one epic"
+    )
+    add(
+        "- change one ticket's status with `arbite set-status <id> <status>`: the same change "
+        "`arbite set <id> status <value>` makes, through the same code path, so the two cannot drift. "
+        "The vocabulary comes from the schema, so `review` -- and any status added later -- is accepted "
+        "without the command changing. A status *change* also un-files a ticket held in a bucket, and "
+        "asking for the status a ticket already has is a no-op"
+    )
+    add(
+        "- hand finished work off with `arbite submit <id>`: with `review:` on (the default) the ticket "
+        "becomes `review` and moves to `review/`, **keeping its assignee** -- a ticket in review is "
+        "still owned by whoever did the work, because they are who a reviewer sends it back to -- and "
+        "with `review: false` the same command closes it instead, dated exactly as `arbite close` dates "
+        "it. The reviewer closes accepted work with `arbite accept <id>`, whose note is credited to the "
+        "reviewer rather than the author; the rejection path is `arbite reopen --reason ...`, which is "
+        "why the reason there is mandatory"
+    )
     add("")
     if status_is_location and sink_kind == "file":
         add("```")
@@ -498,6 +556,18 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "the more urgent first within a status)."
     )
     add("")
+    add(
+        "**`references` point into the arbite directory's `plans/` bucket** (`plans/foo.md` == "
+        "`.arbite/plans/foo.md`, root-relative, and omitted from the frontmatter entirely when "
+        "empty). Manage one at a time with `arbite ref add <id> <path>...` / `arbite ref rm <id> "
+        "<path>...` / `arbite ref list <id>` (`--json` gives `{id, references}`); `set references` "
+        "and `create --references` still take the comma-separated form. A referenced plan need not "
+        "exist yet -- a plan is often written after the ticket that needs it -- so a missing one "
+        "**warns** on stderr when it is written and is reported by `arbite doctor` as "
+        "`dangling_reference`. Write the plan, or drop the reference by hand: `doctor --fix` will "
+        "not guess which of the two you meant."
+    )
+    add("")
 
     # -- Identity ----------------------------------------------------------
     add("## Agent identity and resuming work")
@@ -539,12 +609,18 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("arbite list next --epic mesh-pipeline                   # next workable ticket in an epic")
     add("arbite list next --epic classification                  # next raw ticket needing triage")
     add("arbite list raw                                         # raw backlog as a todo list")
+    add("arbite status                                           # tickets per status (+ total)")
+    add("arbite status --epic mesh-pipeline                      # ...for one epic")
+    add("arbite progress                                         # live epics and their closed siblings")
+    add("arbite progress --epic mesh-pipeline                    # ...one epic's whole membership")
     add('arbite search --params title,body "LOD pop-in"          # find tickets by text')
     add('arbite raw feature "add per-mesh LOD"                   # quick capture; classify later')
     add('arbite raw request "collapse the toolbar by default"     # a tweak/lateral change request')
     add('arbite raw wish "fly-through camera preview"            # capture a wish; file it later')
     add("arbite fetch [type]                                     # oldest raw ticket to classify")
-    add("arbite move tic-a1b2 /wishlist                          # file a reclassified wish")
+    add('arbite promote tic-a1b2 --title "Add per-mesh LOD" --tier medium --domain mesh')
+    add("arbite promote tic-a1b2 --agent claude.haiku.001        # ...or classify and claim at once")
+    add("arbite move tic-a1b2 /wishlist                          # file a reclassified wish by hand")
     add("arbite move tic-a1b2 /                                 # ...and un-file it again")
     add("arbite show tic-a1b2                                    # read it in full")
     add("arbite claim tic-a1b2 --agent claude.haiku.001          # take it (status -> in_progress)")
@@ -556,6 +632,9 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add('arbite unshelve tic-a1b2 --reason "back in scope"       # bring it back to open')
     add("arbite close tic-a1b2                                   # when done")
     add('arbite reopen tic-a1b2 --reason "tests fail on ARM"     # --reason is required')
+    add("arbite set-status tic-a1b2 review                       # any status, same path as set status")
+    add("arbite submit tic-a1b2                                  # hand it off (review/, or closed when review: false)")
+    add("arbite accept tic-a1b2 --agent claude.opus.001          # the reviewer closes it, credited")
     add("arbite sink info                                        # where do tickets live, and in what")
     add("arbite migrate --to sqlite                              # copy every ticket into another sink")
     add("```")
@@ -594,7 +673,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("")
     add(
         "**Parse JSON, not tables.** `--json` on `list`, `list next`, `list raw`, `fetch`, `show`, "
-        "`search`, `deps`, `doctor`, `sink` and `delete` emits machine-readable output whose field "
+        "`search`, `deps`, `doctor`, `sink`, `status` and `delete` emits machine-readable output "
+        "whose field "
         "names match the frontmatter; the human table format is not a stable interface. The `path` "
         "field is whatever the sink calls a ticket's location."
     )
@@ -641,7 +721,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         f"expanded description -- before it can be claimed or worked; a `memo` is a request to "
         f"update project notes/docs rather than change code, and a `request` is a request for a "
         f"change that is not necessarily a bug or a new feature (a tweak or lateral change). Raw "
-        f"tickets exist so a thought isn't lost, not as work: classify them before picking them up."
+        f"tickets exist so a thought isn't lost, not as work: classify them with `arbite promote` "
+        f"before picking them up."
     )
     add("")
     add(
@@ -651,27 +732,41 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     )
     add("")
     add(
-        "**`arbite fetch [type]`** pulls the single oldest raw ticket (by `created`, optionally of one "
-        "type) and prints it like `show`, with a `derived_note` at the top (a JSON field in `--json` "
-        "mode, a leading block in text) telling you to classify it "
-        "(title/tier/domain/epic/priority/description) and then either set `status` to `open` (if you "
-        "are only triaging, so someone else can pick it up via `arbite list next`) or `arbite claim` "
-        "it now (if you are working it yourself)."
+        "**`arbite fetch [type]`** is the read-only half of triage: it pulls the single oldest raw "
+        "ticket (by `created`, optionally of one type) and prints it like `show`, with a "
+        "`derived_note` at the top (a JSON field in `--json` mode, a leading block in text) telling "
+        "you to classify it with `arbite promote`. It never writes anything -- the queue hands work "
+        "out, promote is what classifies it."
+    )
+    add("")
+    add(
+        "**`arbite promote <id>`** is the write half: it classifies a raw ticket in one command. It "
+        "snapshots the capture verbatim to `raw/processed/<id>.raw.md` first (exclusive create, "
+        "never overwritten -- a snapshot is frozen audit history, so promoting the same id twice is "
+        "an error), then writes `--title`/`--tier`/`--domain` (required: a promoted ticket must "
+        "never reach `list next` with placeholders), plus `--epic`/`--priority`/`--description`/"
+        "`--tags`, **in place** through a compare-and-swap -- so the id, `created` and any notes "
+        "carry over, and an omitted `--epic` clears the `classification` grouping. It lands at "
+        "`open` (or `in_progress` assigned to `--agent <id>` when you are about to work it), which "
+        "is why an already-classified ticket is refused."
     )
     add("")
     add(
         "A **wish** raw ticket (`arbite raw wish <message>`) is a wishlist item, not ordinary feature "
         "work: its body (and `fetch`'s `derived_note` for it) says to reclassify it as `feature`, "
         "with correct tags, an expanded description, an analysis of the request and a possible epic, "
-        "then file it in the wishlist bucket -- never open or claim it as work."
+        "then file it in the wishlist bucket -- never open or claim it as work. `arbite promote` "
+        "does exactly that for a wish: it retypes it to `feature`, applies the classification and "
+        "files it in the wishlist bucket, leaving its status at `raw` so it leaves the triage queue "
+        "without becoming work (`--agent` is refused for a wish)."
     )
     add("")
     add(
         "A **request** raw ticket (`arbite request <message>` == `arbite raw request <message>`) is "
         "a request for a change that is not necessarily a bug or a new feature -- a tweak or lateral "
         "change to something that already exists (behaviour, UI, data or docs). Unlike a wish it is "
-        "ordinary work once classified: keep the type as `request`, and open or claim it like any "
-        "other raw ticket."
+        "ordinary work once classified: keep the type as `request`, and promote it like any other "
+        "raw ticket."
     )
     add("")
     add(
@@ -684,7 +779,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add(
         "**Integrity.** `arbite doctor` reports what nothing else enforces, then exits 3 so it can "
         "gate CI or an agent's startup. The shared checks cover duplicate ids, invalid field values, "
-        "dependency cycles, dangling and self dependencies, `in_progress` with no assignee, `blocked` "
+        "dependency cycles, dangling and self dependencies, dangling `references` (a referenced plan "
+        "with no document on disk), `in_progress` with no assignee, `blocked` "
         "with no reason, and closed-date mismatches. The sink adds its own -- for a file sink, "
         "frontmatter/folder drift (the folder wins), tickets left loose in the root, temp files "
         "stranded by an interrupted write, and closed tickets archived in the wrong "
@@ -720,7 +816,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "`depend` adds "
         "a dependency (deduplicated), or with one argument clears them all; `search` matches a ticket "
         "if any selected field matches; `migrate` copies every ticket from one sink into another "
-        "(the source is left alone); `delete` destroys a ticket and needs `--force`."
+        "(the source is left alone); `delete` destroys a ticket and needs `--force`; "
+        "`status` reports how many tickets sit in each status for the whole backlog -- every "
+        "status in vocabulary order, zeros included, plus a total -- and takes "
+        "`--epic`/`--domain`/`--tier`/`--assignee` to narrow every count; it always exits 0 "
+        "(a report, not a query), and it is neither `set <id> status` (which changes one "
+        "ticket) nor `sink info` (which describes the store, not the backlog)."
     )
     add("")
     add(f"`{_usage(parser)}` -- ticket sink CLI")
@@ -732,14 +833,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
             break
     add("")
 
-    shorthands: list[str] = []
-    for name, subparser in subparsers_by_name.items():
-        if _is_shorthand(subparser):
-            # Four near-identical blocks would say the same thing four times.
-            shorthands.append(name)
-            continue
-
-        add(f"**`arbite {name}`** -- `{_usage(subparser)}`")
+    def command_block(label: str, subparser) -> None:
+        """One command's usage line plus its own flags. Used for a top-level
+        command and, one level down, for each sub-command of a group like `ref`,
+        so `arbite ref add` is documented in its own right rather than hidden
+        behind `{add,rm,list}`."""
+        add(f"**`{label}`** -- `{_usage(subparser)}`")
         bullets = []
         for action in _iter_actions(subparser):
             required = bool(action.option_strings and action.required)
@@ -753,6 +852,17 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
             add("")
             lines.extend(bullets)
         add("")
+
+    shorthands: list[str] = []
+    for name, subparser in subparsers_by_name.items():
+        if _is_shorthand(subparser):
+            # Four near-identical blocks would say the same thing four times.
+            shorthands.append(name)
+            continue
+
+        command_block(f"arbite {name}", subparser)
+        for child_name, child in _nested_choices(subparser):
+            command_block(f"arbite {name} {child_name}", child)
     if shorthands:
         add(
             f"`arbite {'|'.join(shorthands)} <message>` == `arbite raw <type> <message>`: the same "

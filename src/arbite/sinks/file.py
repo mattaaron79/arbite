@@ -164,6 +164,11 @@ class FileSink(TicketSink):
 
     def __init__(self, root: Path):
         self._root = Path(root)
+        # The file sink's default root *is* the arbite directory, so a directly
+        # constructed sink can still resolve `references`; `build_sink` overwrites
+        # this with the project's real .arbite/ when a config points the root
+        # elsewhere. See TicketSink.arbite_dir.
+        self.arbite_dir = self._root
 
     # ------------------------------------------------------------------
     # Lifecycle

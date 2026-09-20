@@ -18,8 +18,13 @@ Tickets live in a **sink**: a storage backend selected per command. Everything a
 - confirm it at any time: `arbite sink info --json` -- its `kind` field is the store your command will read
 - selection, highest precedence first: `--sink <kind>`, the `ARBITE_SINK` environment variable, a `sink:` key in `.arbite/project.yaml`, then the default (`file`)
 - that `sink:` key is the committed choice and is what makes one store stick for every command; `arbite init` and a successful `arbite migrate` write it for you
+- a top-level `review:` key (default `true`) is the committed answer to where a finished ticket goes: `review/` when true, straight to `closed/` when false. It does not remove the `review` status or the `review/` folder -- tickets already awaiting review must not be stranded -- and any value that is not a real boolean (true/false, or YAML 1.1 `yes`/`no`/`on`/`off`) is a config error naming the file and the key
 - available kinds: `file` (markdown files under the arbite directory, the default, and the one that gives you `git log --follow` history) and `sqlite` (a single database file, queryable with real SQL, and not version-control friendly)
 - report it, or create it: `arbite sink info`, `arbite sink init`
+- count the *backlog* by status -- every status, zeros included, plus a total, narrowed by the usual filters: `arbite status`. That is a different question from `arbite sink info`, which describes the *store* (its kind, root and capabilities rather than what is in it)
+- see what is *in flight* rather than what merely exists: `arbite progress` lists the epics holding a live ticket (open, in_progress or review) and then every ticket of those epics, closed and shelved siblings included, in dependency order -- an epic with nothing live never appears at all. Live tickets with no epic are grouped under `no epic`, each epic gets a count line, and `--epic` narrows the report to one epic
+- change one ticket's status with `arbite set-status <id> <status>`: the same change `arbite set <id> status <value>` makes, through the same code path, so the two cannot drift. The vocabulary comes from the schema, so `review` -- and any status added later -- is accepted without the command changing. A status *change* also un-files a ticket held in a bucket, and asking for the status a ticket already has is a no-op
+- hand finished work off with `arbite submit <id>`: with `review:` on (the default) the ticket becomes `review` and moves to `review/`, **keeping its assignee** -- a ticket in review is still owned by whoever did the work, because they are who a reviewer sends it back to -- and with `review: false` the same command closes it instead, dated exactly as `arbite close` dates it. The reviewer closes accepted work with `arbite accept <id>`, whose note is credited to the reviewer rather than the author; the rejection path is `arbite reopen --reason ...`, which is why the reason there is mandatory
 
 ```
 .arbite/
@@ -63,6 +68,8 @@ The folders above are status *and* buckets. `raw/`, `open/`, `in_progress/`, `re
 
 These axes are independent -- don't collapse them: `depends_on` (structural ticket ids) vs `references` (plan documents this ticket draws on, root-relative under `.arbite/`) vs `blocked_by` (freeform prose); `tier` (capability) vs `domain` (specialization) vs `priority` (urgency) -- an urgent low-tier chore is possible, and a low-tier ticket can still be audio_gen-only; `domain` (routing) vs `tags` (search). `epic` groups for filtering only. Given a choice of workable tickets, take the lowest `priority` number (`list` shows the more urgent first within a status).
 
+**`references` point into the arbite directory's `plans/` bucket** (`plans/foo.md` == `.arbite/plans/foo.md`, root-relative, and omitted from the frontmatter entirely when empty). Manage one at a time with `arbite ref add <id> <path>...` / `arbite ref rm <id> <path>...` / `arbite ref list <id>` (`--json` gives `{id, references}`); `set references` and `create --references` still take the comma-separated form. A referenced plan need not exist yet -- a plan is often written after the ticket that needs it -- so a missing one **warns** on stderr when it is written and is reported by `arbite doctor` as `dangling_reference`. Write the plan, or drop the reference by hand: `doctor --fix` will not guess which of the two you meant.
+
 ## Agent identity and resuming work
 
 Agent ids are `company.model.instance`, e.g. `claude.haiku.001`; each agent has a scratchpad at `.arbite/agents/<agent_id>.md` recording what it is working on. Know your `tier` before claiming (see Ticket fields) and pass it to `arbite list next --tier <tier>` so you are only offered work you can actually do.
@@ -78,12 +85,18 @@ arbite list next --count 3 --tier high                  # ...or a batch of three
 arbite list next --epic mesh-pipeline                   # next workable ticket in an epic
 arbite list next --epic classification                  # next raw ticket needing triage
 arbite list raw                                         # raw backlog as a todo list
+arbite status                                           # tickets per status (+ total)
+arbite status --epic mesh-pipeline                      # ...for one epic
+arbite progress                                         # live epics and their closed siblings
+arbite progress --epic mesh-pipeline                    # ...one epic's whole membership
 arbite search --params title,body "LOD pop-in"          # find tickets by text
 arbite raw feature "add per-mesh LOD"                   # quick capture; classify later
 arbite raw request "collapse the toolbar by default"     # a tweak/lateral change request
 arbite raw wish "fly-through camera preview"            # capture a wish; file it later
 arbite fetch [type]                                     # oldest raw ticket to classify
-arbite move tic-a1b2 /wishlist                          # file a reclassified wish
+arbite promote tic-a1b2 --title "Add per-mesh LOD" --tier medium --domain mesh
+arbite promote tic-a1b2 --agent claude.haiku.001        # ...or classify and claim at once
+arbite move tic-a1b2 /wishlist                          # file a reclassified wish by hand
 arbite move tic-a1b2 /                                 # ...and un-file it again
 arbite show tic-a1b2                                    # read it in full
 arbite claim tic-a1b2 --agent claude.haiku.001          # take it (status -> in_progress)
@@ -95,6 +108,9 @@ arbite shelve tic-a1b2 --reason "parked for later"      # if deprioritized
 arbite unshelve tic-a1b2 --reason "back in scope"       # bring it back to open
 arbite close tic-a1b2                                   # when done
 arbite reopen tic-a1b2 --reason "tests fail on ARM"     # --reason is required
+arbite set-status tic-a1b2 review                       # any status, same path as set status
+arbite submit tic-a1b2                                  # hand it off (review/, or closed when review: false)
+arbite accept tic-a1b2 --agent claude.opus.001          # the reviewer closes it, credited
 arbite sink info                                        # where do tickets live, and in what
 arbite migrate --to sqlite                              # copy every ticket into another sink
 ```
@@ -116,7 +132,7 @@ case $? in
 esac
 ```
 
-**Parse JSON, not tables.** `--json` on `list`, `list next`, `list raw`, `fetch`, `show`, `search`, `deps`, `doctor`, `sink` and `delete` emits machine-readable output whose field names match the frontmatter; the human table format is not a stable interface. The `path` field is whatever the sink calls a ticket's location.
+**Parse JSON, not tables.** `--json` on `list`, `list next`, `list raw`, `fetch`, `show`, `search`, `deps`, `doctor`, `sink`, `status` and `delete` emits machine-readable output whose field names match the frontmatter; the human table format is not a stable interface. The `path` field is whatever the sink calls a ticket's location.
 
 **Claim in one step.** `arbite list next --claim <agent_id>` selects the most urgent workable ticket *and* claims it in the same write, and a plain `arbite claim <id> --agent <agent_id>` does the same thing for a ticket you already know: either way, claiming sets `status: in_progress` and the assignee together (on the file sink the ticket moves to `in_progress/`), so do not follow a claim with a separate `set status`. Prefer `--claim` to running `list next` then `claim`: between those two commands another agent can take the ticket you were just handed, and you would both work it. Any claim is a compare-and-swap -- it fails if the ticket is already assigned to someone else unless you pass `--force`, and it refuses to write over a ticket that changed since it was read.
 
@@ -126,30 +142,34 @@ esac
 
 ## Triage: raw tickets, wishes, filing, scaffolding
 
-A **raw** ticket (`arbite raw <memo|feature|request|bug|wish> <message>`) is a deliberately unclassified quick capture: status `raw`, never returned by `arbite list next`. It sets only `type` plus a placeholder title (`<type> (raw): Requires Classification`), auto-groups the ticket under the `classification` epic (find them with `arbite list next --epic classification`), and its body lists what triage must fill in -- a real title, `tier`, `domain`, a real `epic`, `priority`, an expanded description -- before it can be claimed or worked; a `memo` is a request to update project notes/docs rather than change code, and a `request` is a request for a change that is not necessarily a bug or a new feature (a tweak or lateral change). Raw tickets exist so a thought isn't lost, not as work: classify them before picking them up.
+A **raw** ticket (`arbite raw <memo|feature|request|bug|wish> <message>`) is a deliberately unclassified quick capture: status `raw`, never returned by `arbite list next`. It sets only `type` plus a placeholder title (`<type> (raw): Requires Classification`), auto-groups the ticket under the `classification` epic (find them with `arbite list next --epic classification`), and its body lists what triage must fill in -- a real title, `tier`, `domain`, a real `epic`, `priority`, an expanded description -- before it can be claimed or worked; a `memo` is a request to update project notes/docs rather than change code, and a `request` is a request for a change that is not necessarily a bug or a new feature (a tweak or lateral change). Raw tickets exist so a thought isn't lost, not as work: classify them with `arbite promote` before picking them up.
 
 `arbite list raw` prints the whole raw backlog as a running todo list -- grouped by type, one line per ticket (id + the request text it was captured from), oldest first -- until a classification run drains it.
 
-**`arbite fetch [type]`** pulls the single oldest raw ticket (by `created`, optionally of one type) and prints it like `show`, with a `derived_note` at the top (a JSON field in `--json` mode, a leading block in text) telling you to classify it (title/tier/domain/epic/priority/description) and then either set `status` to `open` (if you are only triaging, so someone else can pick it up via `arbite list next`) or `arbite claim` it now (if you are working it yourself).
+**`arbite fetch [type]`** is the read-only half of triage: it pulls the single oldest raw ticket (by `created`, optionally of one type) and prints it like `show`, with a `derived_note` at the top (a JSON field in `--json` mode, a leading block in text) telling you to classify it with `arbite promote`. It never writes anything -- the queue hands work out, promote is what classifies it.
 
-A **wish** raw ticket (`arbite raw wish <message>`) is a wishlist item, not ordinary feature work: its body (and `fetch`'s `derived_note` for it) says to reclassify it as `feature`, with correct tags, an expanded description, an analysis of the request and a possible epic, then file it in the wishlist bucket -- never open or claim it as work.
+**`arbite promote <id>`** is the write half: it classifies a raw ticket in one command. It snapshots the capture verbatim to `raw/processed/<id>.raw.md` first (exclusive create, never overwritten -- a snapshot is frozen audit history, so promoting the same id twice is an error), then writes `--title`/`--tier`/`--domain` (required: a promoted ticket must never reach `list next` with placeholders), plus `--epic`/`--priority`/`--description`/`--tags`, **in place** through a compare-and-swap -- so the id, `created` and any notes carry over, and an omitted `--epic` clears the `classification` grouping. It lands at `open` (or `in_progress` assigned to `--agent <id>` when you are about to work it), which is why an already-classified ticket is refused.
 
-A **request** raw ticket (`arbite request <message>` == `arbite raw request <message>`) is a request for a change that is not necessarily a bug or a new feature -- a tweak or lateral change to something that already exists (behaviour, UI, data or docs). Unlike a wish it is ordinary work once classified: keep the type as `request`, and open or claim it like any other raw ticket.
+A **wish** raw ticket (`arbite raw wish <message>`) is a wishlist item, not ordinary feature work: its body (and `fetch`'s `derived_note` for it) says to reclassify it as `feature`, with correct tags, an expanded description, an analysis of the request and a possible epic, then file it in the wishlist bucket -- never open or claim it as work. `arbite promote` does exactly that for a wish: it retypes it to `feature`, applies the classification and files it in the wishlist bucket, leaving its status at `raw` so it leaves the triage queue without becoming work (`--agent` is refused for a wish).
+
+A **request** raw ticket (`arbite request <message>` == `arbite raw request <message>`) is a request for a change that is not necessarily a bug or a new feature -- a tweak or lateral change to something that already exists (behaviour, UI, data or docs). Unlike a wish it is ordinary work once classified: keep the type as `request`, and promote it like any other raw ticket.
 
 **`arbite move <id> <folder>`** files a ticket outside the status workflow: `/plans` puts it in the plans bucket, `/plans/ideas` in a nested one, and `/` returns it to its status location. It changes no field, so use the status commands (claim/block/close/...) for anything that should change state -- those un-file the ticket for you.
 
-**Integrity.** `arbite doctor` reports what nothing else enforces, then exits 3 so it can gate CI or an agent's startup. The shared checks cover duplicate ids, invalid field values, dependency cycles, dangling and self dependencies, `in_progress` with no assignee, `blocked` with no reason, and closed-date mismatches. The sink adds its own -- for a file sink, frontmatter/folder drift (the folder wins), tickets left loose in the root, temp files stranded by an interrupted write, and closed tickets archived in the wrong month; for a database sink, an index that has drifted from a ticket body, orphaned index rows, an unexpected schema version and structural corruption. `--fix` repairs only the unambiguous cases and never guesses.
+**Integrity.** `arbite doctor` reports what nothing else enforces, then exits 3 so it can gate CI or an agent's startup. The shared checks cover duplicate ids, invalid field values, dependency cycles, dangling and self dependencies, dangling `references` (a referenced plan with no document on disk), `in_progress` with no assignee, `blocked` with no reason, and closed-date mismatches. The sink adds its own -- for a file sink, frontmatter/folder drift (the folder wins), tickets left loose in the root, temp files stranded by an interrupted write, and closed tickets archived in the wrong month; for a database sink, an index that has drifted from a ticket body, orphaned index rows, an unexpected schema version and structural corruption. `--fix` repairs only the unambiguous cases and never guesses.
 
 ## Commands
 
 Rendered from the installed version's own parsers, so it always matches the CLI: the usage line and flags of every command (argparse's longer descriptions are omitted -- `arbite <cmd> -h` prints them). Every command accepts `--sink <kind>`, and every status command updates `status`/`updated` together while `block`, `shelve`, `release`, `unblock`, `reopen` and `unshelve` also append an automatic timestamped note.
 
-Command notes: `release` is how you hand back work you stop part-way (out of scope, out of context, or the wrong tier) -- it clears the assignee and any block reason so `list next` offers the ticket again; `unblock` clears `blocked_by` and returns the ticket to `in_progress` (`open` with `--open`), and is preferable to `arbite set status`, which would leave `blocked_by` populated and the ticket claiming to be stalled; `reopen` clears the closed date and any block reason and requires `--reason`, which it records as 'Reopened: <reason>.' -- it is the rejection path out of review, so a bare `arbite reopen` is an error; `unshelve` clears the assignee and any block reason; `set` takes PROPERTY VALUE pairs (any number per call, quote multi-word values, `''` clears a field), is type-aware (`tags`/`depends_on`/`references` comma-separated lists, `priority` an integer), cannot set the structural `id`, and re-files the ticket when `status` changes; `depend` adds a dependency (deduplicated), or with one argument clears them all; `search` matches a ticket if any selected field matches; `migrate` copies every ticket from one sink into another (the source is left alone); `delete` destroys a ticket and needs `--force`.
+Command notes: `release` is how you hand back work you stop part-way (out of scope, out of context, or the wrong tier) -- it clears the assignee and any block reason so `list next` offers the ticket again; `unblock` clears `blocked_by` and returns the ticket to `in_progress` (`open` with `--open`), and is preferable to `arbite set status`, which would leave `blocked_by` populated and the ticket claiming to be stalled; `reopen` clears the closed date and any block reason and requires `--reason`, which it records as 'Reopened: <reason>.' -- it is the rejection path out of review, so a bare `arbite reopen` is an error; `unshelve` clears the assignee and any block reason; `set` takes PROPERTY VALUE pairs (any number per call, quote multi-word values, `''` clears a field), is type-aware (`tags`/`depends_on`/`references` comma-separated lists, `priority` an integer), cannot set the structural `id`, and re-files the ticket when `status` changes; `depend` adds a dependency (deduplicated), or with one argument clears them all; `search` matches a ticket if any selected field matches; `migrate` copies every ticket from one sink into another (the source is left alone); `delete` destroys a ticket and needs `--force`; `status` reports how many tickets sit in each status for the whole backlog -- every status in vocabulary order, zeros included, plus a total -- and takes `--epic`/`--domain`/`--tier`/`--assignee` to narrow every count; it always exits 0 (a report, not a query), and it is neither `set <id> status` (which changes one ticket) nor `sink info` (which describes the store, not the backlog).
 
 `arbite [-h] [--version] [--sink KIND] command ...` -- ticket sink CLI
 
 - `init` -- create the arbite directory and initialise the selected sink
 - `sink` -- show or initialise the active sink
+- `status` -- count tickets per status (the shape of the backlog, not 'set status')
+- `progress` -- show live epics: what is in flight, plus the epic's other tickets
 - `create` -- create a new ticket in the open status
 - `raw` -- create an unclassified raw ticket from a brief request
 - `bug` -- capture a raw bug ticket (shorthand for 'arbite raw bug <message>')
@@ -158,6 +178,7 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `memo` -- capture a raw memo ticket (shorthand for 'arbite raw memo <message>')
 - `wish` -- capture a raw wish ticket (shorthand for 'arbite raw wish <message>')
 - `fetch` -- pull the oldest raw ticket for classification (optionally by type)
+- `promote` -- classify a raw ticket and make it workable (the write half of triage)
 - `list` -- list/filter tickets
 - `search` -- search tickets by field and/or body text
 - `claim` -- claim a ticket: assign it and set its status to in_progress (the file sink moves it to in_progress/), so no separate status call is needed
@@ -166,6 +187,8 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `unblock` -- clear a ticket's block and move it back into play
 - `close` -- close a ticket
 - `reopen` -- reopen a ticket (back to the open status); --reason is required
+- `submit` -- submit a finished ticket for review (or close it when review is off)
+- `accept` -- accept a ticket that is in review (closes it, attributed to the reviewer)
 - `shelve` -- shelve a ticket (park it for later)
 - `unshelve` -- move a shelved ticket back to open (unshelve it)
 - `note` -- append a timestamped, agent-identified note to a ticket
@@ -173,10 +196,12 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `deps` -- walk depends_on to show a dependency tree
 - `depend` -- add a dependency to a ticket's depends_on, or clear all of its dependencies
 - `move` -- file a ticket in a bucket (e.g. /plans), or '/' to un-file it
+- `ref` -- manage a ticket's plan references (add / rm / list)
 - `set` -- set one or more ticket properties
+- `set-status` -- change a ticket's status (moves it to the matching status folder)
 - `delete` -- delete a ticket outright (requires --force)
 - `migrate` -- copy every ticket from one sink into another
-- `doctor` -- check ticket integrity (drift, cycles, dangling deps, stale indexes)
+- `doctor` -- check ticket integrity (drift, cycles, dangling deps/references, stale indexes)
 
 **`arbite init`** -- `arbite init [-h] [--agents-doc] [--claude-doc] [--sink KIND]`
 
@@ -186,6 +211,19 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 **`arbite sink`** -- `arbite sink [-h] [--sink KIND] [--json] [SUBCOMMAND]`
 
 - `SUBCOMMAND` -- 'info' (default) reports the active sink; 'init' creates its store if missing
+- `--json` -- JSON output (see Conventions)
+
+**`arbite status`** -- `arbite status [-h] [--epic EPIC] [--domain DOMAIN] [--tier {low,medium,high,frontier}] [--assignee ASSIGNEE] [--json] [--sink KIND]`
+
+- `--epic EPIC` -- only count tickets in this epic, e.g. 'workflow' (narrows every count)
+- `--domain DOMAIN` -- only count tickets in this domain
+- `--tier TIER` -- only count tickets at this agent capability tier. See 'tier' under Ticket fields.
+- `--assignee ASSIGNEE` -- only count tickets assigned to this agent id
+- `--json` -- JSON output (see Conventions)
+
+**`arbite progress`** -- `arbite progress [-h] [--epic EPIC] [--json] [--sink KIND]`
+
+- `--epic EPIC` -- only show this epic, e.g. 'workflow'; it still appears only if it holds a live ticket, so this narrows the report rather than forcing an empty one
 - `--json` -- JSON output (see Conventions)
 
 **`arbite create`** -- `arbite create [-h] [--title TITLE] [--type {bug,feature,request,refactor,chore}] [--tier {low,medium,high,frontier}] [--domain DOMAIN] [--epic EPIC] [--priority PRIORITY] [--tags TAGS] [--depends-on DEPENDS_ON] [--references REFERENCES] [--description DESCRIPTION] [--blank] [--sink KIND]`
@@ -212,9 +250,21 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `TYPE` -- restrict to raw tickets of this type: memo | feature | request | bug | wish (default: any type)
 - `--json` -- JSON output (see Conventions)
 
+**`arbite promote`** -- `arbite promote [-h] [--title TITLE] [--tier TIER] [--domain DOMAIN] [--epic EPIC] [--priority PRIORITY] [--description DESCRIPTION] [--tags TAGS] [--agent AGENT_ID] [--sink KIND] TICKET_ID`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `--title TITLE` -- short human-readable ticket title (required; may not be left as the raw capture's placeholder)
+- `--tier TIER` -- agent capability tier required to work this ticket (low | medium | high | frontier). See 'tier' under Ticket fields. Required.
+- `--domain DOMAIN` -- what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io (required)
+- `--epic EPIC` -- the real epic this work belongs to, e.g. 'mesh-pipeline'; omit it to clear the 'classification' epic the raw capture was auto-grouped under
+- `--priority PRIORITY` -- numeric urgency index, lower = more urgent (a raw capture has none; used to decide which workable ticket 'list next' offers first)
+- `--description DESCRIPTION` -- the ticket's real description, replacing the raw capture's triage text; the request it was captured from is kept in the body as an 'Original request: ...' line, and any notes are preserved either way
+- `--tags TAGS` -- comma-separated, freeform, for codebase-area search, e.g. 'normals,curves'
+- `--agent AGENT_ID` -- agent id to claim the ticket for in the same command, e.g. claude.haiku.001: the ticket lands at 'in_progress' assigned to that agent instead of 'open'. Refused for a wish
+
 **`arbite list`** -- `arbite list [-h] [--status STATUS] [--tier {low,medium,high,frontier}] [--domain DOMAIN] [--epic EPIC] [--priority PRIORITY] [--assignee ASSIGNEE] [--tic TICKET_ID] [--tree | --topo] [--count COUNT] [--claim AGENT_ID] [--json] [--sink KIND] [SUBCOMMAND]`
 
-- `--status STATUS` -- filter by status; a comma-separated list matches any of them, e.g. 'open,in_progress,review'
+- `--status STATUS` -- filter by status; a comma-separated list matches any of them, e.g. 'open,in_progress,review'. This selects tickets; to count tickets per status instead, see 'arbite status'
 - `--tier TIER` -- filter by agent capability tier; with 'next', pass your own tier so you are only offered work you can actually do. See 'tier' under Ticket fields.
 - `--domain DOMAIN` -- filter by domain
 - `--epic EPIC` -- filter by epic (the larger initiative a ticket belongs to), e.g. 'mesh-pipeline'
@@ -231,7 +281,7 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 **`arbite search`** -- `arbite search [-h] [--params FIELDS] [--status STATUS] [-r | -w] [--json] [--sink KIND] SEARCH_TEXT [SEARCH_TEXT ...]`
 
 - `--params FIELDS` -- comma-separated ticket fields to search, e.g. 'title,body'; 'body' means the rest of the ticket (markdown body), 'all' means every field plus the body (default: all)
-- `--status STATUS` -- only search tickets with these statuses (default: all statuses); a comma-separated list matches any of them, e.g. 'open,in_progress,review'
+- `--status STATUS` -- only search tickets with these statuses (default: all statuses); a comma-separated list matches any of them, e.g. 'open,in_progress,review'. This selects tickets; to count tickets per status instead, see 'arbite status'
 - `-r/--regex` -- treat SEARCH_TEXT as a regular expression (case-insensitive)
 - `-w/--wildcard` -- simple wildcards: '*' matches any text, e.g. '*popup*' (case-insensitive)
 - `SEARCH_TEXT` -- text to search for (joined with spaces if multiple words)
@@ -271,6 +321,18 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `--reason REASON` (required) -- why it is being reopened -- the reason it was rejected, recorded verbatim in the automatic note as 'Reopened: <reason>.', e.g. 'tests fail on ARM'
 - `--agent AGENT` -- agent id (or 'system') attributed on the automatic reopen note, e.g. claude.haiku.001 (default: system)
 
+**`arbite submit`** -- `arbite submit [-h] [--message MESSAGE] [--agent AGENT] [--sink KIND] TICKET_ID`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `--message MESSAGE` -- optional detail recorded in the automatic note, e.g. "needs a second pair of eyes"
+- `--agent AGENT` -- agent id the note is attributed to (default: system)
+
+**`arbite accept`** -- `arbite accept [-h] [--message MESSAGE] [--agent AGENT] [--sink KIND] TICKET_ID`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `--message MESSAGE` -- optional detail recorded in the automatic note
+- `--agent AGENT` -- agent id credited in the note (the accepting agent, not the assignee); default: system
+
 **`arbite shelve`** -- `arbite shelve [-h] [--reason REASON] [--sink KIND] TICKET_ID`
 
 - `TICKET_ID` -- see 'Ticket ids' under Conventions
@@ -307,10 +369,32 @@ Command notes: `release` is how you hand back work you stop part-way (out of sco
 - `TICKET_ID` -- see 'Ticket ids' under Conventions
 - `FOLDER` -- root-relative destination, e.g. '/plans', or '/' to return the ticket to its status location
 
+**`arbite ref`** -- `arbite ref [-h] [--sink KIND] SUBCOMMAND ...`
+
+**`arbite ref add`** -- `arbite ref add [-h] [--sink KIND] TICKET_ID PATH [PATH ...]`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `PATH` -- root-relative plan document(s) under the arbite directory's plans/ bucket, e.g. 'plans/review-workflow.md' (one or more)
+
+**`arbite ref rm`** -- `arbite ref rm [-h] [--sink KIND] TICKET_ID PATH [PATH ...]`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `PATH` -- root-relative plan document(s) to remove, e.g. 'plans/review-workflow.md' (one or more; each must already be referenced by the ticket)
+
+**`arbite ref list`** -- `arbite ref list [-h] [--json] [--sink KIND] TICKET_ID`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `--json` -- JSON output (see Conventions)
+
 **`arbite set`** -- `arbite set [-h] [--sink KIND] TICKET_ID PROPERTY VALUE [PROPERTY VALUE ...]`
 
 - `TICKET_ID` -- see 'Ticket ids' under Conventions
 - `PROPERTY VALUE` -- one or more PROPERTY VALUE pairs to set, e.g. title 'New Title' tier high; quote any value that spans more than one word, and use an empty quoted value ('') to clear a field
+
+**`arbite set-status`** -- `arbite set-status [-h] [--sink KIND] TICKET_ID STATUS`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `STATUS` -- the new status: raw | open | in_progress | review | blocked | shelved | closed
 
 **`arbite delete`** -- `arbite delete [-h] [--force] [--agent AGENT] [--reason REASON] [--dry-run] [--json] [--sink KIND] TICKET_ID`
 

@@ -30,6 +30,13 @@ from .errors import TicketError
 # review`.
 STATUSES = ["raw", "open", "in_progress", "review", "blocked", "shelved", "closed"]
 
+# The statuses that count as *live* in a progress view: work that is ready to be
+# claimed, being worked, or with a reviewer. Captured `raw` is deliberately not
+# live (it is not work yet) and neither are the parked or finished statuses.
+# Defined here, beside the vocabulary, so a status added later is classified
+# deliberately rather than silently defaulting into somebody's report.
+LIVE_STATUSES = ["open", "in_progress", "review"]
+
 # Controlled vocabularies. `type` includes "memo" and "wish" because `arbite
 # raw memo` and `arbite raw wish` mint them; `create` deliberately does not
 # offer them (they're captured requests, not something authored directly).
@@ -133,20 +140,23 @@ RAW_DESCRIPTION = (
     "This is a **raw** ticket: it was captured from a brief request without proper "
     "classification. It must be filled out before it can be worked.\n\n"
     "Original request: {message}\n\n"
-    "What still needs to be done (human or agent triage, typically via `arbite fetch`):\n"
+    "What still needs to be done -- human or agent triage, which `arbite fetch` starts "
+    "and `arbite promote <id>` finishes in one write:\n"
     "- title -- replace \"Requires Classification\" with a short human-readable summary\n"
     "- tier -- " + " | ".join(TIERS) + " (agent capability tier required to work it; "
     "how capable the agent must be, not how urgent the work is)\n"
     "- domain -- e.g. mesh, image_gen, audio_gen, ui, io (drives routing)\n"
     "- epic -- this raw ticket is auto-grouped under the 'classification' epic "
-    "(so triage can find it with `arbite list next --epic classification`); replace "
-    "it with the real epic this work belongs to, e.g. mesh-pipeline\n"
+    "(so triage can find it with `arbite list next --epic classification`); pass the real "
+    "epic this work belongs to (e.g. mesh-pipeline) to `arbite promote` and it replaces "
+    "that grouping\n"
     "- priority -- numeric urgency index, lower = more urgent\n"
     "- description -- expand this body into a proper task description based on the "
     "original request, including any acceptance criteria\n"
-    "- status -- set to `open` once classified so it becomes workable via `arbite list "
-    "next` (skip this if you're claiming it yourself instead -- `arbite claim` sets "
-    "status to `in_progress` directly)"
+    "- status -- `arbite promote <id> ...` classifies these fields in place and moves the "
+    "ticket to `open` (or claims it in the same command with `--agent <your-id>`) so it "
+    "becomes workable via `arbite list next`; the same fields can still be written by hand "
+    "with `arbite set`"
 )
 
 MEMO_RAW_NOTE = (
@@ -175,10 +185,12 @@ WISH_RAW_NOTE = (
     "> **Note:** this is a **wishlist** item, not ordinary feature work. When it is "
     "classified, reclassify it as `feature` (not `wish`), with the correct `tags`, an "
     "expanded `description`, an analysis of the request, and a possible `epic`, then file "
-    "the ticket in the wishlist bucket with `arbite move {id} /wishlist` (a folder in the "
-    "file sink, a bucket in a database sink). A wish is captured so it isn't forgotten, "
-    "not so it is worked: leave it in the wishlist until it is deliberately promoted to "
-    "real work."
+    "the ticket in the wishlist bucket (a folder in the file sink, a bucket in a database "
+    "sink). `arbite promote {id} ...` does all of that for a wish: it reclassifies it as "
+    "`feature` and files it in the wishlist bucket without opening it, instead of just "
+    "doing the filing by hand (`arbite move {id} /wishlist`). A wish is captured so it "
+    "isn't forgotten, not so it is worked: leave it in the wishlist until it is "
+    "deliberately promoted to real work."
 )
 
 # Instructions injected at the top of `arbite fetch` output (via --json's
@@ -186,13 +198,15 @@ WISH_RAW_NOTE = (
 # ticket itself -- it's guidance for whichever agent fetches the ticket,
 # not part of its permanent record.
 DERIVED_NOTE_FORMAT = (
-    "Raw ticket {id} is unclassified (status: raw). Fill in title, tier, domain, epic, "
-    "priority, and an expanded description -- see the Description section below for what "
-    "the original request needs. If you are only triaging/classifying it: use `arbite "
-    "set {id} <property> <value> ...` to write those fields, then `arbite set {id} status "
-    "open` so it becomes available via `arbite list next`. If you are going to work it "
-    "yourself: classify it the same way, then run `arbite claim {id} --agent <your-id>` "
-    "immediately instead of setting status to open."
+    "Raw ticket {id} is unclassified (status: raw). Classify it with `arbite promote {id} "
+    "--title <title> --tier <tier> --domain <domain> [--epic <epic>] [--priority <n>] "
+    "[--description <text>] [--tags a,b]` -- see the Description section below for what the "
+    "original request needs. promote is the write half of triage: it freezes the capture "
+    "verbatim into raw/processed/ and rewrites this ticket in place (same id) at status "
+    "'open', so it becomes available via `arbite list next`. If you are going to work it "
+    "yourself, add `--agent <your-id>` and it claims the ticket in the same command instead "
+    "of opening it for someone else. (`arbite set {id} <property> <value> ...` still works "
+    "if you need to triage field by field, but promote is the one-step path.)"
 )
 
 # Wishlist raw tickets are classified differently from ordinary raw tickets:
@@ -200,10 +214,12 @@ DERIVED_NOTE_FORMAT = (
 # than opened or claimed as work.
 DERIVED_NOTE_WISH = (
     "Wishlist item {id} is unclassified (status: raw, type: wish). Wishlist items are NOT "
-    "opened as work: reclassify them as `feature` -- set the correct tags, an expanded "
-    "description, an analysis of the request, and a possible epic -- then file the ticket "
-    "in the wishlist bucket with `arbite move {id} /wishlist`. Do not set status to 'open' "
-    "and do not claim it."
+    "opened as work: `arbite promote {id} --title <title> --tier <tier> --domain <domain> "
+    "[--epic <epic>] [--priority <n>] [--description <text>] [--tags a,b]` reclassifies it "
+    "as `feature` -- with the correct tags, an expanded description, an analysis of the "
+    "request and a possible epic -- and files it in the wishlist bucket, leaving its status "
+    "as 'raw' so it drops out of this queue without becoming work. Do not set status to "
+    "'open' and do not claim it (promote refuses `--agent` for a wish)."
 )
 
 # The markdown heading the append-only audit trail lives under.
@@ -229,6 +245,18 @@ def is_placeholder(value) -> bool:
     """True for a scaffolded `TODO: ...` value. Pending work, not corruption --
     `doctor` must not flag an untriaged ticket as broken."""
     return value is not None and str(value).startswith(PLACEHOLDER_PREFIX)
+
+
+def is_raw_title_placeholder(value) -> bool:
+    """True for the placeholder title `arbite raw` writes for a capture.
+
+    Derived from `RAW_TITLE_FORMAT` rather than restating its text, so the two cannot
+    drift apart: change the format and this predicate follows. `arbite promote`
+    refuses to promote a ticket whose title is still this, so a promoted ticket can
+    never reach `arbite list next` wearing `Requires Classification`."""
+    if value is None:
+        return False
+    return any(str(value) == RAW_TITLE_FORMAT.format(type=t) for t in RAW_TYPE_CHOICES)
 
 
 @dataclass

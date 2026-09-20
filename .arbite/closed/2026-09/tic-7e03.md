@@ -1,7 +1,7 @@
 ---
 id: tic-7e03
 title: Add 'arbite promote' -- turn a raw request into an open ticket
-status: open
+status: closed
 type: feature
 tier: high
 domain: cli
@@ -16,8 +16,8 @@ depends_on:
 - tic-3b55
 blocked_by: null
 created: '2026-09-20T12:26:17'
-updated: '2026-09-20T12:26:17'
-closed: null
+updated: '2026-09-20T13:48:20'
+closed: '2026-09-20T13:48:20'
 ---
 
 ## Description
@@ -37,3 +37,4 @@ Snapshot first, then mutate, so a crash leaves the raw ticket intact rather than
 Acceptance: promote produces a frozen snapshot invisible to fetch/list/doctor plus a fully classified open ticket at the same id; a second promote of the same id errors rather than overwriting the snapshot.
 
 ## Notes
+- 2026-09-20T13:48:20 zoo.orch.001: Added arbite promote <id>: writes a frozen verbatim snapshot to raw/processed/<id>.raw.md (exclusive create, never overwritten) then classifies in place through the sink CAS, carrying the id forward; moves to open or claims with --agent; a wish is retyped to feature and filed in the wishlist bucket instead of opened; refuses placeholder title/tier/domain naming the field; cleared the classification epic; fetch derived_note and docs now name promote

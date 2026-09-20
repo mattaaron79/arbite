@@ -1,7 +1,7 @@
 ---
 id: tic-e394
 title: Update README and design doc for the new model
-status: open
+status: closed
 type: chore
 tier: medium
 domain: docs
@@ -15,8 +15,8 @@ depends_on:
 - tic-675c
 blocked_by: null
 created: '2026-09-20T12:26:54'
-updated: '2026-09-20T12:26:54'
-closed: null
+updated: '2026-09-20T14:35:43'
+closed: '2026-09-20T14:35:43'
 ---
 
 ## Description
@@ -32,3 +32,4 @@ Call out the two breaking changes prominently, since anyone upgrading hits them 
 Acceptance: no document in the repo describes arbite.yaml, the planning bucket, or a lifecycle without review; the README command list matches 'arbite --help'.
 
 ## Notes
+- 2026-09-20T14:35:43 zoo.orch.001: Closed as a duplicate of tic-675c: the two docs tickets were implemented as one sweep (guide + all --help text + README + design doc + AGENTS_EXAMPLE), so the README/design-doc work this ticket describes is already delivered under tic-675c.

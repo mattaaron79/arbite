@@ -24,12 +24,24 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from . import __version__, config, docs, graph, schema
 from .errors import ArbiteError, Conflict, TicketError
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
-from .sinks import SINK_KINDS, Expect, SinkInfo, build_sink
+from .sinks import (
+    RAW_PROCESSED_DIR,
+    SINK_KINDS,
+    Expect,
+    SinkInfo,
+    build_sink,
+    count_by_status,
+    missing_references,
+    raw_snapshot_name,
+    reference_path,
+    write_exclusive,
+)
 
 # Exit codes. Agents drive arbite from shell loops, so "nothing matched" has to
 # be distinguishable from "worked fine" and from "broke" without parsing
@@ -110,6 +122,12 @@ TICKET_ID_HELP = docs.TICKET_ID_HELP
 
 # Read-only commands keep the old convenience: a guess there costs nothing.
 TICKET_ID_HELP_READONLY = docs.TICKET_ID_HELP_READONLY
+
+# The bucket a reclassified wish is filed in: a folder in the file sink, a recorded
+# bucket in SQLite. `arbite init` creates it, `arbite move <id> /wishlist` files a
+# ticket there by hand, and `arbite promote` is the command that does it as part of
+# classifying a wish.
+WISHLIST_BUCKET = "wishlist"
 
 # `arbite bug|feature|request|memo|wish <message>` is shorthand for the
 # equally-named `arbite raw <type> <message>` form: they create an identical raw
@@ -221,6 +239,56 @@ def _expect_from(ticket: Ticket) -> Expect:
     (`note`, `set` of a non-status field) still use it; only `move_to_bucket`
     does not, because filing is not a state change."""
     return Expect(status=ticket.status, assignee=ticket.assignee)
+
+
+def _root_relative_segments(value: str) -> list:
+    """The segments of a root-relative arbite path, an optional leading '/' ignored.
+
+    The one definition of what a root-relative path means on the command line,
+    shared by `move` (whose argument is a bucket) and `ref` (whose arguments are
+    plan documents): a leading '/' is optional, empty and '.' segments are dropped,
+    and '..' is refused so neither a bucket nor a reference can point outside the
+    arbite root. Reusing it is what makes '/plans/a.md' and 'plans/a.md' one
+    reference rather than two spellings arbite happens to accept."""
+    parts = [p for p in value.split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        raise TicketError(
+            f"'{value}' may not contain '..' (a root-relative path must stay under "
+            "the arbite root)"
+        )
+    return parts
+
+
+def _normalise_reference(value: str) -> str:
+    """A `references` entry in its canonical stored form, or a clear error.
+
+    Applies `_root_relative_segments` -- so '/plans/a.md' and 'plans/a.md' are the
+    same reference, and '..' is refused -- then the schema's own validator, which
+    deliberately refuses a leading '/' (so the slash has to be gone *before* it
+    runs) and an empty entry. `ref add` and `ref rm` both go through this, so what
+    `rm` looks for is exactly what `add` wrote."""
+    ref = "/".join(_root_relative_segments(value.strip()))
+    schema.validate_field("references", [ref])
+    return ref
+
+
+def _warn_about_missing_references(references, sink) -> None:
+    """Warn on stderr -- never fail -- about references with no document on disk.
+
+    A plan is routinely written *after* the ticket that needs it, and a SQLite
+    store may have no plans/ directory at all, so a missing document is an ordinary
+    drafting state: the write still succeeds and the exit code stays 0. `arbite
+    doctor` reports the same thing as a problem (kind 'dangling_reference'),
+    resolved through the same `missing_references` helper, so the warning and the
+    check cannot disagree about whether a referenced plan exists."""
+    for ref in missing_references(references, getattr(sink, "arbite_dir", None)):
+        print(
+            f"warning: reference '{ref}' has no document at "
+            f"{reference_path(ref, sink.arbite_dir)} -- a reference may point at a "
+            "plan that has not been written yet; 'arbite doctor' reports dangling "
+            "references",
+            file=sys.stderr,
+        )
 
 
 def cmd_init(args):
@@ -365,6 +433,128 @@ def cmd_sink(args):
     print(f"tickets: {info.ticket_count}{f' ({counts})' if counts else ''}")
 
 
+def cmd_status(args):
+    """Report the shape of the backlog: how many tickets sit in each status.
+
+    A report rather than a query, and deliberately not any of the three things
+    its name collides with: not `arbite set <id> status <value>` (which changes
+    one ticket's status), not the `--status` filter on list/search (which selects
+    tickets), and not `arbite sink info` (which describes the *store* -- its kind,
+    root and capabilities). Every status in `schema.STATUSES` is rendered, in
+    vocabulary order, including the ones holding nothing: an empty status must be
+    visibly empty rather than absent, and a status added to the vocabulary later
+    must show up without this command changing. Tickets filed in a bucket (a
+    promoted wish in `wishlist/`, a `move <id> /plans` filing) are out of the
+    status workflow, exactly as `arbite list` treats them, so they are not counted
+    under the status they retain -- which is what keeps a `raw 2` here agreeing
+    with `arbite list --status raw` showing two tickets."""
+    sink = _require_sink(args)
+    # The same `TicketQuery` plumbing every list view builds, so a filter means
+    # here exactly what it means there. `arbite status` deliberately takes no
+    # --status flag (the command's whole job is every status at once) and no
+    # --priority flag, so both stay unset in the query.
+    counts = count_by_status(sink.query(_filter_query(args)), vocabulary=True)
+    total = sum(counts.values())
+    if args.json:
+        # A flat mapping of status -> count in `STATUSES` order, plus `total`.
+        # Flat rather than nested because no status is named "total", so nothing
+        # collides, and an agent can read the count for one status without
+        # knowing the shape of a wrapper. Dict insertion order is the vocabulary
+        # order, which json.dumps preserves.
+        _print_json({**counts, "total": total})
+        return
+    filters = _filter_labels(args)
+    print("tickets by status" + (f" (filters: {', '.join(filters)})" if filters else ""))
+    status_width = max([len(status) for status in counts] + [len("total")])
+    count_width = max([len(str(n)) for n in counts.values()] + [len(str(total))])
+    for status, n in counts.items():
+        print(f"{status:<{status_width}}  {n:>{count_width}}")
+    print(f"{'total':<{status_width}}  {total:>{count_width}}")
+
+
+def cmd_progress(args):
+    """Show what is actually in flight, and the epics it sits in.
+
+    `arbite status` counts the whole backlog; this answers the other question --
+    "what is moving right now, and what surrounds it". The selection rule is the
+    whole substance of the command:
+
+    1. the **live** tickets are every ticket whose status is open, in_progress or
+       review (`schema.LIVE_STATUSES`);
+    2. the epics in scope are every epic holding at least one live ticket;
+    3. **every** ticket of those epics is shown, whatever its status -- including
+       closed and shelved ones, which are the context that makes the live ticket
+       legible. An epic with seven closed siblings and one in_progress ticket
+       shows all eight; an epic whose tickets are all closed never appears at all.
+
+    Live tickets with no epic are grouped under a `no epic` heading rather than
+    dropped. Within an epic the order is topological by `depends_on`
+    (`graph.topo_order`, the same ordering `list next` uses), computed over the
+    whole ticket set so a dependency outside the epic still orders the tickets
+    inside it, and unsatisfiable cycles are warned about on stderr exactly as the
+    other listings do.
+
+    Buckets are excluded, as in every other view: a ticket filed in `wishlist/` or
+    `plans/` is out of the status workflow, so it is not live and cannot pull its
+    epic into the report."""
+    sink = _require_sink(args)
+    every = sink.query(TicketQuery())
+    by_id = {t.id: t for t in every}
+
+    live = [t for t in every if t.status in schema.LIVE_STATUSES]
+    if args.epic is not None:
+        live = [t for t in live if t.epic == args.epic]
+
+    order = graph.topo_order(by_id)
+
+    groups = []  # (heading, members), one entry per epic in scope
+    for epic in sorted({t.epic for t in live if t.epic}):
+        groups.append((epic, [by_id[tid] for tid in order if by_id[tid].epic == epic]))
+    ungrouped = {t.id for t in live if not t.epic}
+    if ungrouped:
+        groups.append(("no epic", [by_id[tid] for tid in order if tid in ungrouped]))
+
+    if not groups:
+        qualifier = f" in epic '{args.epic}'" if args.epic else ""
+        print(
+            f"no live tickets{qualifier} (live = {' | '.join(schema.LIVE_STATUSES)})"
+        )
+        sys.exit(EXIT_EMPTY)
+
+    selected = {t.id for _, members in groups for t in members}
+    _warn_cycles(by_id, selected)
+
+    if args.json:
+        locations = sink.location_map(
+            [t for _, members in groups for t in members]
+        )
+        payload = []
+        for heading, members in groups:
+            counts = count_by_status(members, vocabulary=True)
+            payload.append(
+                {
+                    # `null` for the un-epic'd group rather than the display
+                    # heading, so a consumer can test epic membership honestly.
+                    "epic": None if heading == "no epic" else heading,
+                    "counts": counts,
+                    "live": sum(counts[status] for status in schema.LIVE_STATUSES),
+                    "total": len(members),
+                    "tickets": [t.to_dict(locations.get(t.id)) for t in members],
+                }
+            )
+        _print_json(payload)
+        return
+
+    for heading, members in groups:
+        counts = count_by_status(members, vocabulary=True)
+        # Every status present, in vocabulary order, so the line reads the same
+        # shape as `arbite status` -- the same counting implementation, so the
+        # two cannot disagree.
+        summary = " / ".join(f"{n} {status}" for status, n in counts.items() if n)
+        print(f"{heading}  ({len(members)} tickets: {summary or 'none'})")
+        _print_flat(members)
+
+
 def cmd_create(args):
     if not args.blank:
         missing = [
@@ -488,10 +678,11 @@ def cmd_fetch(args):
     """Pull the oldest raw ticket (status 'raw'), optionally restricted to a type,
     and print it exactly like 'arbite show' would -- except with a 'derived_note'
     injected at the top (a JSON field in --json mode, a leading block in text mode)
-    telling the calling agent to classify it and either open it for someone else or
-    claim it now. This is a triage queue, so it's oldest-first (by 'created')
-    rather than priority-ordered like 'list next' -- a raw ticket has no priority
-    yet."""
+    telling the calling agent to classify it with 'arbite promote' and either open it
+    for someone else or claim it now. This is a triage queue, so it's oldest-first
+    (by 'created') rather than priority-ordered like 'list next' -- a raw ticket has
+    no priority yet, and fetch itself is strictly read-only: 'arbite promote' is the
+    write half of triage."""
     sink = _require_sink(args)
     candidates = sink.query(
         TicketQuery(
@@ -519,6 +710,219 @@ def cmd_fetch(args):
     else:
         print(f"derived_note: {note}\n")
         print(sink.render(t), end="")
+
+
+def _promoted_body(captured_request: str, description: Optional[str], original_body: str) -> str:
+    """The body a promoted ticket should carry.
+
+    Triage replaces what `arbite raw` wrote, so the capture's 'this must be filled
+    out before it can be worked' checklist must not survive promotion: the
+    description becomes `--description` when it is given, and otherwise the request
+    the ticket was captured from -- which is at least the thing that was asked for.
+
+    Either way the capture is kept as an `Original request: ...` line, read out of
+    the raw body by the same helper (`schema.raw_captured_request`) that found it
+    when `arbite raw` wrote it, so nothing the original request said is lost --
+    unless the description already quotes it. Any notes the ticket had are carried
+    over verbatim, since promotion edits the description, not the audit trail."""
+    text = (description or "").strip() or captured_request
+    block = text
+    if captured_request and captured_request not in text:
+        block = (
+            f"{block}\n\nOriginal request: {captured_request}"
+            if block
+            else f"Original request: {captured_request}"
+        )
+    body = schema.DEFAULT_BODY.format(description=block)
+    notes = schema.notes_body(original_body).strip("\n")
+    return f"{body}{notes}\n" if notes else body
+
+
+def _write_raw_snapshot(sink, ticket) -> Path:
+    """Freeze a raw capture as `<arbite_dir>/raw/processed/<id>.raw.md`.
+
+    The content is `sink.render(ticket)` -- the ticket's own canonical text, taken
+    *before* anything is rewritten -- and the name comes from the file sink's
+    `raw_snapshot_name()` convention, so promote cannot drift from what the scan
+    excludes. It is a filesystem artifact on *both* sinks (the same reasoning that
+    keeps agent scratchpads as plain files either way), so the SQLite sink gets one
+    too; the directory is created if missing.
+
+    Written with an exclusive create, because a snapshot is frozen audit history: a
+    second promote of the same id -- or two agents promoting it at once -- must
+    refuse rather than rewrite the record of what was originally requested. A manual
+    delete is the remedy if a snapshot is genuinely stale."""
+    path = Path(sink.arbite_dir).joinpath(*RAW_PROCESSED_DIR) / raw_snapshot_name(ticket.id)
+    try:
+        write_exclusive(sink.render(ticket), path, ticket.id)
+    except Conflict:
+        # `write_exclusive` reports this as a lost race; for a snapshot the reason is
+        # not a race but the audit rule, so say that instead.
+        raise TicketError(
+            f"a snapshot of {ticket.id} already exists at {path}, and a snapshot is frozen "
+            "audit history -- it is never rewritten. If this one is genuinely stale, delete "
+            "that file by hand and promote again"
+        )
+    return path
+
+
+def cmd_promote(args):
+    """Turn a raw capture into a classified, workable ticket: the write half of triage.
+
+    `arbite fetch` is the read-only queue that hands out raw tickets; this is what an
+    agent runs once it has classified one. In order:
+
+    1. The raw ticket is snapshotted *verbatim* -- its own canonical text, taken
+       before anything is rewritten -- to `<arbite_dir>/raw/processed/<id>.raw.md`,
+       through the file sink's `raw_snapshot_name()` convention, on both sinks,
+       created if missing. The snapshot is written with an exclusive create and is
+       never overwritten (a second promote refuses and names the path), because it is
+       frozen audit history. Snapshot first, then mutate, so a crash leaves the raw
+       ticket intact rather than a half-classified one with no record of what was
+       originally requested.
+    2. The ticket is classified *in place*, through the sink's compare-and-swap
+       `update(expect=...)` -- never delete-and-recreate -- so the id, `created` and
+       any notes carry forward, and anything that already referenced the raw request
+       stays valid. `--title`/`--tier`/`--domain` are required (the level `arbite
+       create` requires, since a promoted ticket must never reach `list next` with
+       placeholder fields), and a title still in the raw placeholder form
+       (`<type> (raw): Requires Classification`) or a `TODO:` tier/domain is refused
+       with the offending field(s) named, before anything is written.
+    3. `type` is carried over unchanged -- there is deliberately no `--type` flag --
+       except that a `wish` becomes `feature` (the documented wish rule). A wish is
+       then filed in the `wishlist` bucket with its status left at `raw`: it leaves
+       the triage queue because the default query excludes bucketed tickets, but it
+       does not become work. `--agent` is refused for a wish rather than silently
+       ignored, since claiming a wishlist item is meaningless.
+    4. Otherwise the ticket moves to `open` -- or, with `--agent <id>`, straight to
+       `in_progress` assigned to that agent in the same write, which is the end state
+       `fetch`'s `derived_note` suggests for an agent about to work it.
+
+    An omitted `--epic` clears the `classification` epic the capture was auto-grouped
+    under (a hand-set real epic is left alone); `--priority` and `--tags` replace
+    those fields; and `--description` replaces the capture's triage body, keeping the
+    original request as an `Original request: ...` line and keeping any notes the
+    ticket already had (see `_promoted_body`). The receipt names the id, the new
+    status and location, and the snapshot path. Only a `raw` ticket can be promoted:
+    a classified one is refused, so re-promoting cannot silently reclassify work that
+    has moved on."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    if t.status != "raw":
+        raise TicketError(
+            f"ticket {t.id} is not a raw capture (status: {t.status}) -- only a raw ticket "
+            "can be promoted; use 'arbite set' to change a classified ticket"
+        )
+    is_wish = t.type == "wish"
+    if is_wish and args.agent:
+        raise TicketError(
+            f"--agent does not apply to a wish: {t.id} is a wishlist item, and promote files "
+            "it in the wishlist bucket instead of claiming it (drop --agent)"
+        )
+
+    # The same fields `arbite create` refuses to do without: promotion means
+    # classified, not merely moved out of `raw`.
+    missing = [
+        flag
+        for flag, value in (
+            ("--title", args.title),
+            ("--tier", args.tier),
+            ("--domain", args.domain),
+        )
+        if not value
+    ]
+    if missing:
+        raise TicketError(
+            f"missing required arguments: {', '.join(missing)} -- a promoted ticket is fully "
+            "classified, so title/tier/domain cannot be left as the raw capture's placeholders"
+        )
+
+    # A second guard, on the values this call would actually write. The title needs two
+    # tests because the raw form is not a `TODO:` value: `<type> (raw): Requires
+    # Classification` is derived from RAW_TITLE_FORMAT (so it cannot drift from what
+    # `arbite raw` wrote), while a plain `TODO: ...` title is the generic placeholder rule.
+    still_placeholder = []
+    if schema.is_raw_title_placeholder(args.title) or schema.is_placeholder(args.title):
+        still_placeholder.append("--title")
+    if schema.is_placeholder(args.tier):
+        still_placeholder.append("--tier")
+    if schema.is_placeholder(args.domain):
+        still_placeholder.append("--domain")
+    if still_placeholder:
+        raise TicketError(
+            f"still a placeholder: {', '.join(still_placeholder)} -- replace the placeholder "
+            "text with a real value before promoting (a promoted ticket must not reach "
+            "'arbite list next' with placeholder fields)"
+        )
+    # `--tier` deliberately has no argparse choices (like `arbite set`), so the shared
+    # validator is what refuses a typo'd tier -- with the same message `set` gives.
+    schema.validate_field("tier", args.tier)
+    if args.priority is not None and args.priority < 1:
+        raise TicketError("--priority must be a positive integer (lower = more urgent)")
+
+    # Snapshot first, then mutate: a crash between the two must leave the raw ticket
+    # intact rather than a classified ticket whose original capture was never recorded.
+    snapshot = _write_raw_snapshot(sink, t)
+
+    captured = schema.raw_captured_request(t)
+    original_body = t.body
+    expect = _expect_from(t)
+    t.title = args.title
+    t.tier = args.tier
+    t.domain = args.domain
+    t.tags = _split_csv(args.tags)
+    t.priority = args.priority
+    if args.epic:
+        t.epic = args.epic
+    elif t.epic == CLASSIFICATION_EPIC:
+        # Raw tickets are grouped under the `classification` epic *for triage*; that
+        # grouping is done with, so it goes unless a real epic replaces it.
+        t.epic = None
+    t.body = _promoted_body(captured, args.description, original_body)
+    t.updated = schema.now()
+
+    if is_wish:
+        # Retyped, not opened: the documented wish rule, and the status deliberately
+        # stays `raw` -- filing it in the wishlist bucket is what takes it out of the
+        # triage queue (the default query excludes bucketed tickets).
+        t.type = "feature"
+    elif args.agent:
+        t.status = "in_progress"
+        t.assignee = args.agent
+    else:
+        t.status = "open"
+
+    sink.update(t, expect=expect)
+    if is_wish:
+        # Filing is not a state change, so it is a second call -- but it is the half
+        # that makes the wish stop being served by `fetch`/`list raw`.
+        sink.move_to_bucket(t.id, WISHLIST_BUCKET)
+
+    if is_wish:
+        print(
+            f"promoted {t.id} -> {sink.location(t.id)} (reclassified as feature and filed in "
+            f"the '{WISHLIST_BUCKET}' bucket; status stays raw, so it is out of the work and "
+            "triage queues)"
+        )
+    else:
+        owner = f", assigned to {args.agent}" if args.agent else ""
+        print(f"promoted {t.id} -> {sink.location(t.id)} (status {t.status}{owner})")
+    print(f"snapshot of the raw capture: {snapshot}")
+
+
+def _filter_labels(args) -> list:
+    """The filters an `arbite status` call actually narrowed by, as display-ready
+    `--flag value` strings.
+
+    `arbite status` echoes them above the table, so a narrowed report can never be
+    mistaken for the whole backlog -- a count of `open 1` under `--epic workflow`
+    means something quite different from `open 1` overall."""
+    labels = []
+    for flag in ("epic", "domain", "tier", "assignee"):
+        value = getattr(args, flag, None)
+        if value:
+            labels.append(f"--{flag} {value}")
+    return labels
 
 
 def _filter_query(args) -> TicketQuery:
@@ -973,6 +1377,75 @@ def cmd_reopen(args):
     print(f"reopened {t.id} -> {sink.location(t.id)}")
 
 
+def cmd_submit(args):
+    """Hand a finished ticket off: the transition out of the work loop.
+
+    Where it lands is the project's committed answer, read from the `review:` key in
+    `.arbite/project.yaml` through `config.review_enabled()`:
+
+    - `review: true` (the default) -- the ticket becomes `review` and lands in
+      `review/`, and it **keeps its assignee**: a ticket in review is still owned by
+      whoever did the work, because they are the one a reviewer sends it back to.
+      From there the rejection path is `arbite reopen --reason ...` and the accepting
+      path is `arbite accept`.
+    - `review: false` -- the ticket is closed instead, dated and filed exactly as
+      `arbite close` does it.
+
+    Either way the ticket gets an automatic note -- 'Submitted for review.' or
+    'Submitted; closed (review disabled).' -- with `--message` appended as detail in
+    the same shape release/shelve/unblock use. A ticket that is already closed is
+    refused: there is nothing left to hand off. Everything else is accepted, because
+    submit is a hand-off rather than a validator -- `arbite doctor` is what reports a
+    ticket sitting in a status its history does not explain."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    if t.status == "closed":
+        raise TicketError(f"ticket {t.id} is already closed")
+    expect = _expect_from(t)
+    detail = f": {args.message}" if args.message else "."
+    if config.review_enabled():
+        t.status = "review"
+        t.updated = schema.now()
+        schema.append_note(t, args.agent, f"Submitted for review{detail}")
+        landed = "review"
+    else:
+        # Exactly what `arbite close` writes: same dating, same status, same move.
+        t.closed = schema.now()
+        t.updated = t.closed
+        t.status = "closed"
+        schema.append_note(t, args.agent, f"Submitted; closed (review disabled){detail}")
+        landed = "closed"
+    sink.update(t, expect=expect)
+    print(f"submitted {t.id} -> {sink.location(t.id)} ({landed})")
+
+
+def cmd_accept(args):
+    """Close a ticket that is in review: the reviewer's counterpart to `submit`.
+
+    Only a ticket actually in `review` can be accepted; anything else is refused
+    with its real status named, because a general-purpose close is `arbite close`
+    and silently closing an `open` ticket here would erase the distinction between
+    "reviewed and accepted" and "never reviewed at all". The note is attributed to
+    the **accepting** agent (`--agent`), not to the ticket's assignee: the point of
+    the record is who approved the work. `--message` is appended as detail, and
+    `closed` is dated the same way `arbite close` dates it."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    if t.status != "review":
+        raise TicketError(
+            f"ticket {t.id} is not in review (status: {t.status}); only a ticket "
+            "awaiting review can be accepted (use 'arbite close' to close one)"
+        )
+    expect = _expect_from(t)
+    detail = f": {args.message}" if args.message else "."
+    schema.append_note(t, args.agent, f"Accepted{detail}")
+    t.closed = schema.now()
+    t.updated = t.closed
+    t.status = "closed"
+    sink.update(t, expect=expect)
+    print(f"accepted {t.id} -> {sink.location(t.id)}")
+
+
 def cmd_shelve(args):
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
@@ -1113,13 +1586,10 @@ def cmd_move(args):
             f"<folder> must be a root-relative path like '/plans', or '/' to return "
             f"the ticket to its status location, got '{args.folder}'"
         )
-    # Root-relative -> bucket name, dropping empty/'.' segments and refusing '..'
-    # so a ticket can never be filed outside the arbite root.
-    parts = [p for p in folder[1:].split("/") if p and p != "."]
-    if any(p == ".." for p in parts):
-        raise TicketError(
-            f"<folder> may not contain '..' (it must stay under the arbite root): '{folder}'"
-        )
+    # Root-relative -> bucket name through the shared path definition (dropping
+    # empty/'.' segments, refusing '..'), so a ticket can never be filed outside
+    # the arbite root -- and so a bucket and a reference agree about what a path is.
+    parts = _root_relative_segments(folder)
     bucket = "/".join(parts) if parts else None
 
     if sink.bucket(t.id) == bucket:
@@ -1129,6 +1599,115 @@ def cmd_move(args):
     print(f"moved {t.id} -> {sink.location(t.id)}")
 
 
+def cmd_ref_add(args):
+    """Append plan references to a ticket, de-duplicated and order-preserving.
+
+    Paths are root-relative documents under the arbite directory ('plans/a.md' ==
+    .arbite/plans/a.md); a leading '/' is accepted and stripped, so '/plans/a.md'
+    and 'plans/a.md' are the same reference -- the same normalisation `move`
+    applies to a bucket (`_normalise_reference`). New entries are appended in the
+    order given and one already present is left where it is: re-adding a path is a
+    no-op success, not an error. A referenced document need not exist yet, so a
+    missing one is a warning on stderr and the write still succeeds (exit 0);
+    `arbite doctor` reports it as a problem."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    expect = _expect_from(t)
+
+    named = []
+    for raw in args.paths:
+        ref = _normalise_reference(raw)
+        if ref not in named:
+            named.append(ref)
+
+    current = list(t.references)
+    added = [ref for ref in named if ref not in current]
+    if not added:
+        print(f"{t.id} already references {', '.join(named)}")
+        return
+
+    t.references = current + added
+    t.updated = schema.now()
+    sink.update(t, expect=expect)
+    _warn_about_missing_references(added, sink)
+    print(f"added {', '.join(added)} to {t.id} references")
+
+
+def cmd_ref_rm(args):
+    """Remove plan references from a ticket, refusing a path that is not referenced.
+
+    Every path is checked against the ticket's references before anything is
+    written, so a multi-path `rm` that names one path the ticket does not
+    reference changes nothing at all -- the all-or-nothing rule `set` applies to
+    its property/value pairs, for the same reason: a half-applied removal leaves
+    the caller to work out which half happened. Paths are normalised exactly as
+    `ref add` normalised them, so a reference can be removed the way it was
+    added (including a leading '/')."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    expect = _expect_from(t)
+
+    wanted = []
+    for raw in args.paths:
+        ref = _normalise_reference(raw)
+        if ref not in wanted:
+            wanted.append(ref)
+
+    current = list(t.references)
+    not_referenced = [ref for ref in wanted if ref not in current]
+    if not_referenced:
+        raise TicketError(
+            f"ticket {t.id} does not reference "
+            f"{', '.join(repr(ref) for ref in not_referenced)}; it references "
+            f"{', '.join(current) if current else '(nothing)'}"
+        )
+
+    t.references = [ref for ref in current if ref not in wanted]
+    t.updated = schema.now()
+    sink.update(t, expect=expect)
+    print(f"removed {', '.join(wanted)} from {t.id} references")
+
+
+def cmd_ref_list(args):
+    """Print a ticket's references, one per line, or as JSON with --json.
+
+    Read-only, so an ambiguous id takes the first match like `show`/`deps` rather
+    than being an error. --json emits an object with the ticket `id` and a
+    `references` list (field names matching the frontmatter), e.g.
+    {"id": "tic-x", "references": ["plans/a.md"]}; an empty list prints nothing in
+    text mode, which is the same answer `show` gives by omitting the field."""
+    sink = _require_sink(args)
+    t = sink.get(args.id)
+    if args.json:
+        _print_json({"id": t.id, "references": list(t.references)})
+        return
+    for ref in t.references:
+        print(ref)
+
+
+def _apply_status_change(ticket, new_status):
+    """Apply a status change to an already-read ticket, in place.
+
+    The one definition of what changing a status *means*, shared by
+    `arbite set <id> status <value>` and `arbite set-status <id> <status>` so the
+    two front doors cannot drift. Relocating the ticket is deliberately not done
+    here: status -> location is the sink's own side effect of `update()`, and a
+    *change* of status is what moves the file into the folder matching the new
+    status, un-filing a ticket that was sitting in a bucket. Asking for the status
+    a ticket already has is a no-op that returns False and leaves it filed where it
+    is -- which is exactly what `arbite set <id> status <value>` already did, so the
+    two front doors stay identical. Moving to `closed` auto-dates `closed`, the same
+    way `arbite close` does.
+
+    Returns True when the status actually changed."""
+    if new_status == ticket.status:
+        return False
+    if new_status == "closed" and ticket.closed is None:
+        ticket.closed = ticket.updated
+    ticket.status = new_status
+    return True
+
+
 def cmd_set(args):
     """Set one or more ticket properties on an existing ticket. Properties come in
     PROPERTY VALUE pairs (any number per call); quote any value that spans more
@@ -1136,7 +1715,10 @@ def cmd_set(args):
     comma-separated lists, 'priority' must be an integer, and an empty quoted
     value ('') clears a field. A 'status' change also un-files the ticket (the
     file sink moves it) so status and location stay in sync, and auto-dates
-    'closed' when a ticket is set to closed."""
+    'closed' when a ticket is set to closed. Setting 'status' is the same change
+    as `arbite set-status <id> <status>`, through one shared code path, so the
+    two front doors cannot drift; `set-status` is the dedicated front door for
+    the statuses no work-flow command reaches (the escape hatch)."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     assignments = args.assignments
@@ -1158,12 +1740,16 @@ def cmd_set(args):
         schema.validate_field(prop, value)
 
     expect = _expect_from(t)
-    original_status = t.status
     new_status = None
     updated_given = False
     for prop, value in pairs:
         if prop == "status":
+            # Left unapplied here and done below through the shared path, so
+            # that `set status` and `set-status` cannot drift -- and so the
+            # ticket's *previous* status is still readable when deciding whether
+            # to date `closed`.
             new_status = value
+            continue
         if prop == "updated":
             updated_given = True
         setattr(t, prop, schema.coerce_field_value(prop, value))
@@ -1171,18 +1757,50 @@ def cmd_set(args):
     if not updated_given:
         t.updated = schema.now()
 
-    if new_status is not None and new_status != original_status:
+    if new_status is not None:
         # A real status change also re-files the ticket (the file sink relocates
         # the file, the database sink clears its bucket), mirroring
         # claim/close/etc.; moving to closed auto-dates 'closed' like
         # `arbite close` does.
-        if new_status == "closed" and t.closed is None:
-            t.closed = t.updated
-        t.status = new_status
+        _apply_status_change(t, new_status)
 
     sink.update(t, expect=expect)
+    if any(prop == "references" for prop, _ in pairs):
+        # The same write-time warning `ref add` gives, from the same helper: a
+        # reference may legitimately point at a plan not written yet, so this
+        # warns and the write stands. `arbite doctor` reports it as a problem.
+        _warn_about_missing_references(t.references, sink)
     what = ", ".join(prop for prop, _ in pairs)
     print(f"set {what} on {t.id} at {sink.location(t.id)}")
+
+
+def cmd_set_status(args):
+    """Change one ticket's status: the dedicated front door for the same change
+    `arbite set <id> status <value>` makes, writing through the same code path so
+    the two cannot drift.
+
+    Additive, not a replacement -- `arbite set status <value>` keeps working. Both
+    funnel through `_apply_status_change`, so the two cannot drift: a status change
+    lands the ticket in the folder matching the new status, which un-files a ticket
+    that was sitting in a bucket so status and location cannot disagree, and moving
+    to `closed` auto-dates `closed`. Asking for the status a ticket already has is a
+    no-op that leaves it filed where it is -- identical to `arbite set <id> status
+    <value>` with the same argument.
+
+    This is the escape hatch rather than a workflow front door: it deliberately
+    does *not* refuse transitions that dedicated commands exist for
+    (claim/close/submit/accept). The point of it is reaching the rest of the
+    vocabulary -- notably `review`, which no other command sets yet -- and
+    `arbite doctor` is what catches the drift those dedicated commands prevent. The
+    status vocabulary comes from `schema.STATUSES`, so a status added later is
+    accepted here without this command changing."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    expect = _expect_from(t)
+    t.updated = schema.now()
+    _apply_status_change(t, args.status)
+    sink.update(t, expect=expect)
+    print(f"set status on {t.id} at {sink.location(t.id)}")
 
 
 def cmd_search(args):
@@ -1451,7 +2069,10 @@ def build_parser():
         description="Report which sink is in use, where its store lives, and what it supports "
         "(status_is_location, buckets, per-status ticket counts), or with 'init' create the "
         "store for the selected sink. The sink is chosen by --sink, then ARBITE_SINK, then a "
-        "'sink:' key in .arbite/project.yaml, then the default (file).",
+        "'sink:' key in .arbite/project.yaml, then the default (file). This describes the "
+        "*store*; to read the backlog itself -- a count per status, with filters and --json -- "
+        "use 'arbite status', which shares this command's counting implementation so the two "
+        "cannot disagree.",
     )
     p_sink.add_argument(
         "subcommand",
@@ -1463,6 +2084,67 @@ def build_parser():
     _sink_flag(p_sink)
     _json_flag(p_sink)
     p_sink.set_defaults(func=cmd_sink)
+
+    p_status = sub.add_parser(
+        "status",
+        help="count tickets per status (the shape of the backlog, not 'set status')",
+        description="Report how many tickets sit in each status: the whole backlog at a glance. "
+        "Every status in the vocabulary is printed in its canonical order (raw, open, "
+        "in_progress, review, blocked, shelved, closed) -- including the ones with a count of "
+        "zero, so an empty status is visibly empty rather than absent -- followed by a total. "
+        "'--json' emits a mapping of status to count plus 'total'. The usual filters narrow the "
+        "counts, so 'arbite status --epic workflow' answers 'how far along is this epic'. This "
+        "is a report, not a query: it always exits 0, even when the store is empty or a filter "
+        "matches nothing (the '2 = nothing matched' convention does not apply). Tickets filed "
+        "in a bucket (wishlist/plans) are out of the status workflow, so they are not counted "
+        "under the status they retain -- exactly as 'arbite list' excludes them, which is what "
+        "makes the two agree. Three things this is not: not 'arbite set <id> status <value>' "
+        "(which changes one ticket's status), not the '--status' filter on list/search (which "
+        "selects tickets), and not 'arbite sink info' (which describes the store -- its kind, "
+        "root and capabilities -- rather than the backlog). There is deliberately no --status "
+        "filter here: counting every status at once is this command's whole job.",
+    )
+    p_status.add_argument(
+        "--epic", help="only count tickets in this epic, e.g. 'workflow' (narrows every count)"
+    )
+    p_status.add_argument("--domain", help="only count tickets in this domain")
+    p_status.add_argument(
+        "--tier",
+        choices=TIERS,
+        help=f"only count tickets at this agent capability tier. {schema.TIER_HELP}",
+    )
+    p_status.add_argument("--assignee", help="only count tickets assigned to this agent id")
+    _json_flag(p_status)
+    _sink_flag(p_status)
+    p_status.set_defaults(func=cmd_status)
+
+    p_progress = sub.add_parser(
+        "progress",
+        help="show live epics: what is in flight, plus the epic's other tickets",
+        description="Report what is actually in flight, and the epics it sits in. The "
+        "live tickets are those whose status is open, in_progress or review; the epics in "
+        "scope are the ones holding at least one of them; and then every ticket of those "
+        "epics is shown, whatever its status -- closed and shelved siblings included, "
+        "because they are the context that makes the live ticket legible. An epic whose "
+        "tickets are all closed never appears at all. Live tickets with no epic are "
+        "grouped under a 'no epic' heading rather than dropped. Within an epic, tickets "
+        "are ordered topologically by depends_on (the same ordering 'list next' uses) and "
+        "an unsatisfiable dependency cycle is warned about on stderr, as the other "
+        "listings do. Each epic gets a count line (e.g. '1 open / 1 in_progress / 6 "
+        "closed') so progress is readable without counting rows. Tickets filed in a bucket "
+        "(wishlist/plans) are out of the status workflow, so they are not live and cannot "
+        "put an epic in scope. This is not 'arbite status' (which counts the whole backlog "
+        "per status) and not 'arbite list --topo' (which shows a filtered selection rather "
+        "than an epic's full membership).",
+    )
+    p_progress.add_argument(
+        "--epic",
+        help="only show this epic, e.g. 'workflow'; it still appears only if it holds "
+        "a live ticket, so this narrows the report rather than forcing an empty one",
+    )
+    _json_flag(p_progress)
+    _sink_flag(p_progress)
+    p_progress.set_defaults(func=cmd_progress)
 
     p_create = sub.add_parser(
         "create",
@@ -1538,7 +2220,9 @@ def build_parser():
         "lateral change to something that already exists; it is ordinary work once "
         "classified. Use 'wish' for a wishlist item: the ticket notes that wishlist items "
         "are reclassified as 'feature' and filed in the wishlist bucket rather than opened "
-        "as work.",
+        "as work. Classification is the write half of triage and is done with 'arbite "
+        "promote <id> --title ... --tier ... --domain ...' ('arbite fetch' is the read-only "
+        "queue that hands the oldest raw ticket out).",
     )
     p_raw.add_argument(
         "type",
@@ -1574,11 +2258,13 @@ def build_parser():
         description="Pull the next raw ticket (status 'raw'), oldest first by creation "
         "date, optionally restricted to TYPE. Prints it the same as 'arbite show' (raw "
         "markdown, or --json), with a 'derived_note' injected at the top -- as a JSON "
-        "field in --json mode, a leading block in text mode -- giving brief instructions "
-        "to classify the ticket (title/tier/domain/epic/priority/description) and then "
-        "either set status to 'open' (if just triaging) or claim it immediately (if going "
-        "to work it now). A wish raw ticket is classified differently: it is reclassified "
-        "as 'feature' and filed in the wishlist bucket instead of being opened or claimed. "
+        "field in --json mode, a leading block in text mode -- telling the caller how to "
+        "classify the ticket (title/tier/domain/epic/priority/description) with 'arbite "
+        "promote', which snapshots the capture to raw/processed/ and moves the ticket to "
+        "'open', or to 'in_progress' for the agent that classifies it with --agent. fetch "
+        "itself is strictly read-only: it is the triage queue, promote is the write half. A "
+        "wish raw ticket is classified differently: 'arbite promote' reclassifies it as "
+        "'feature' and files it in the wishlist bucket instead of opening or claiming it. "
         "Exits 2 if no raw ticket matches.",
     )
     p_fetch.add_argument(
@@ -1594,6 +2280,71 @@ def build_parser():
     _sink_flag(p_fetch)
     p_fetch.set_defaults(func=cmd_fetch)
 
+    p_promote = sub.add_parser(
+        "promote",
+        help="classify a raw ticket and make it workable (the write half of triage)",
+        description="Turn a raw capture (status 'raw') into a classified, workable ticket "
+        "in one command -- the write half of triage, where 'arbite fetch' is the read-only "
+        "queue. Writes a verbatim snapshot of the capture to raw/processed/<id>.raw.md "
+        "first, by exclusive create: a snapshot is frozen audit history and is never "
+        "overwritten, so promoting the same id twice is an error. It then classifies the "
+        "ticket in place, carrying the id -- and so any note, dependency or reference that "
+        "already names it -- forward. --title/--tier/--domain are required, and a title "
+        "still in the raw placeholder form or a TODO: tier/domain is refused, naming the "
+        "offending field; an omitted --epic clears the 'classification' epic. The ticket "
+        "moves to 'open', or straight to 'in_progress' assigned to --agent when the same "
+        "agent is going to work it. A wish is the exception: it is reclassified as 'feature' "
+        "and filed in the wishlist bucket with its status left at 'raw' (so it leaves the "
+        "triage queue without becoming work), and --agent is refused for it.",
+    )
+    p_promote.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_promote.add_argument(
+        "--title",
+        help="short human-readable ticket title (required; may not be left as the raw "
+        "capture's placeholder)",
+    )
+    p_promote.add_argument(
+        "--tier",
+        help="agent capability tier required to work this ticket "
+        f"({schema.TIER_VALUES}). {schema.TIER_HELP} Required.",
+    )
+    p_promote.add_argument(
+        "--domain",
+        help="what kind of agent/tool this needs, e.g. mesh, image_gen, audio_gen, ui, io "
+        "(required)",
+    )
+    p_promote.add_argument(
+        "--epic",
+        help="the real epic this work belongs to, e.g. 'mesh-pipeline'; omit it to clear "
+        "the 'classification' epic the raw capture was auto-grouped under",
+    )
+    p_promote.add_argument(
+        "--priority",
+        type=int,
+        default=None,
+        help="numeric urgency index, lower = more urgent (a raw capture has none; used to "
+        "decide which workable ticket 'list next' offers first)",
+    )
+    p_promote.add_argument(
+        "--description",
+        default=None,
+        help="the ticket's real description, replacing the raw capture's triage text; the "
+        "request it was captured from is kept in the body as an 'Original request: ...' "
+        "line, and any notes are preserved either way",
+    )
+    p_promote.add_argument(
+        "--tags", default="", help="comma-separated, freeform, for codebase-area search, e.g. 'normals,curves'"
+    )
+    p_promote.add_argument(
+        "--agent",
+        metavar="AGENT_ID",
+        help="agent id to claim the ticket for in the same command, e.g. claude.haiku.001: "
+        "the ticket lands at 'in_progress' assigned to that agent instead of 'open'. "
+        "Refused for a wish",
+    )
+    _sink_flag(p_promote)
+    p_promote.set_defaults(func=cmd_promote)
+
     p_list = sub.add_parser(
         "list", help="list/filter tickets", description="List tickets, optionally filtered by one or more fields. "
         "Sorted so that within a status, more urgent tickets (lower priority number) come first."
@@ -1604,7 +2355,8 @@ def build_parser():
         default=[],
         metavar="STATUS",
         help="filter by status; a comma-separated list matches any of them, "
-        "e.g. 'open,in_progress,review'",
+        "e.g. 'open,in_progress,review'. This selects tickets; to count tickets per "
+        "status instead, see 'arbite status'",
     )
     p_list.add_argument(
         "--tier",
@@ -1700,7 +2452,8 @@ def build_parser():
         default=[],
         metavar="STATUS",
         help="only search tickets with these statuses (default: all statuses); a "
-        "comma-separated list matches any of them, e.g. 'open,in_progress,review'",
+        "comma-separated list matches any of them, e.g. 'open,in_progress,review'. This "
+        "selects tickets; to count tickets per status instead, see 'arbite status'",
     )
     search_mode = p_search.add_mutually_exclusive_group()
     search_mode.add_argument(
@@ -1844,6 +2597,53 @@ def build_parser():
     _sink_flag(p_reopen)
     p_reopen.set_defaults(func=cmd_reopen)
 
+    p_submit = sub.add_parser(
+        "submit",
+        help="submit a finished ticket for review (or close it when review is off)",
+        description="Hand a finished ticket off. Where it lands is the project's "
+        "committed answer, the 'review:' key in .arbite/project.yaml: with review enabled "
+        "(the default) the ticket becomes 'review' and moves to review/, keeping its "
+        "assignee -- a ticket in review is still owned by whoever did the work, since they "
+        "are who a reviewer sends it back to; with 'review: false' it is closed instead, "
+        "dated and filed exactly as 'arbite close' does. Either way an automatic note is "
+        "appended ('Submitted for review.' or 'Submitted; closed (review disabled).'), with "
+        "--message added as detail. A ticket that is already closed is refused. The "
+        "rejection path out of review is 'arbite reopen --reason ...', and the accepting "
+        "path is 'arbite accept'.",
+    )
+    p_submit.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_submit.add_argument(
+        "--message",
+        help='optional detail recorded in the automatic note, e.g. "needs a second pair of eyes"',
+    )
+    p_submit.add_argument(
+        "--agent", default="system", help="agent id the note is attributed to (default: system)"
+    )
+    _sink_flag(p_submit)
+    p_submit.set_defaults(func=cmd_submit)
+
+    p_accept = sub.add_parser(
+        "accept",
+        help="accept a ticket that is in review (closes it, attributed to the reviewer)",
+        description="Close a ticket that is in review: the reviewer's counterpart to "
+        "'arbite submit'. Only a ticket whose status is 'review' can be accepted -- "
+        "anything else is refused with its real status named, because the general-purpose "
+        "close is 'arbite close'. An automatic 'Accepted.' note is appended, attributed to "
+        "the accepting agent rather than to the ticket's assignee (the point of the record "
+        "is who approved the work), with --message added as detail; 'closed' is dated "
+        "exactly as 'arbite close' dates it. To send the work back instead, use 'arbite "
+        "reopen --reason ...', which records why it was rejected.",
+    )
+    p_accept.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_accept.add_argument("--message", help="optional detail recorded in the automatic note")
+    p_accept.add_argument(
+        "--agent",
+        default="system",
+        help="agent id credited in the note (the accepting agent, not the assignee); default: system",
+    )
+    _sink_flag(p_accept)
+    p_accept.set_defaults(func=cmd_accept)
+
     p_shelve = sub.add_parser(
         "shelve",
         help="shelve a ticket (park it for later)",
@@ -1949,6 +2749,76 @@ def build_parser():
     _sink_flag(p_move)
     p_move.set_defaults(func=cmd_move)
 
+    p_ref = sub.add_parser(
+        "ref",
+        help="manage a ticket's plan references (add / rm / list)",
+        description="Manage a ticket's `references`: the plan documents it draws on, stored "
+        "as a frontmatter list. Entries are root-relative into the arbite directory's plans/ "
+        "bucket ('plans/foo.md' == .arbite/plans/foo.md) -- the same root-relative form "
+        "`move` takes for a bucket, including a leading '/' that is stripped. A referenced "
+        "document need not exist yet: a plan is often written after the ticket that needs "
+        "it, so a missing one warns on stderr and the write still succeeds -- `arbite "
+        "doctor` reports it as a problem (kind 'dangling_reference').",
+    )
+    ref_sub = p_ref.add_subparsers(dest="ref_action", required=True, metavar="SUBCOMMAND")
+    _sink_flag(p_ref)
+
+    p_ref_add = ref_sub.add_parser(
+        "add",
+        help="append references to a ticket (de-duplicated, order preserved)",
+        description="Append one or more plan references to a ticket. Each PATH is "
+        "root-relative into the arbite directory's plans/ bucket, e.g. "
+        "'plans/review-workflow.md'; a leading '/' is accepted and stripped, so "
+        "'/plans/review-workflow.md' and 'plans/review-workflow.md' are the same "
+        "reference. Entries are appended in the order given, keeping the ones the ticket "
+        "already has in place; adding a path it already references is a no-op success, not "
+        "an error. The referenced document need not exist yet: a missing one warns on "
+        "stderr and the command still succeeds (exit 0).",
+    )
+    p_ref_add.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_ref_add.add_argument(
+        "paths",
+        metavar="PATH",
+        nargs="+",
+        help="root-relative plan document(s) under the arbite directory's plans/ bucket, "
+        "e.g. 'plans/review-workflow.md' (one or more)",
+    )
+    _sink_flag(p_ref_add)
+    p_ref_add.set_defaults(func=cmd_ref_add)
+
+    p_ref_rm = ref_sub.add_parser(
+        "rm",
+        help="remove references from a ticket (errors on one it does not reference)",
+        description="Remove one or more plan references from a ticket, keeping the order of "
+        "the ones that remain. Each PATH must be one the ticket currently references, and "
+        "is normalised exactly as `ref add` normalised it (so a leading '/' is accepted); a "
+        "path it does not reference is an error (exit 1). The whole invocation is atomic: "
+        "if any path is not referenced, nothing is written.",
+    )
+    p_ref_rm.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_ref_rm.add_argument(
+        "paths",
+        metavar="PATH",
+        nargs="+",
+        help="root-relative plan document(s) to remove, e.g. 'plans/review-workflow.md' "
+        "(one or more; each must already be referenced by the ticket)",
+    )
+    _sink_flag(p_ref_rm)
+    p_ref_rm.set_defaults(func=cmd_ref_rm)
+
+    p_ref_list = ref_sub.add_parser(
+        "list",
+        help="print a ticket's references, one per line (--json for machine output)",
+        description="Print a ticket's `references`, one per line -- or, with --json, an "
+        "object {'id': <ticket id>, 'references': [<stored path>, ...]} whose field names "
+        "match the frontmatter. A ticket with no references prints nothing, and reports an "
+        "empty 'references' list in --json, matching how `show` omits the field entirely.",
+    )
+    p_ref_list.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP_READONLY)
+    _json_flag(p_ref_list)
+    _sink_flag(p_ref_list)
+    p_ref_list.set_defaults(func=cmd_ref_list)
+
     p_set = sub.add_parser(
         "set",
         help="set one or more ticket properties",
@@ -1957,8 +2827,12 @@ def build_parser():
         "any value that spans more than one word. Type-aware: 'tags', 'depends_on' and "
         "'references' are comma-separated lists, 'priority' must be an integer, and an "
         "empty quoted value ('') clears a field. If 'status' is set, the ticket is "
-        "re-filed to match (moving to 'closed' auto-dates 'closed'). 'id' is structural "
-        "and cannot be set.",
+        "re-filed to match (moving to 'closed' auto-dates 'closed'); 'arbite set-status "
+        "<id> <status>' is the dedicated front door for the same change, through the same "
+        "code path, and is the escape hatch for the statuses no work-flow command reaches. "
+        "'id' is structural "
+        "and cannot be set. This changes one ticket; to count tickets per status across the "
+        "whole backlog, use 'arbite status'.",
     )
     p_set.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_set.add_argument(
@@ -1971,6 +2845,32 @@ def build_parser():
     )
     _sink_flag(p_set)
     p_set.set_defaults(func=cmd_set)
+
+    p_set_status = sub.add_parser(
+        "set-status",
+        help="change a ticket's status (moves it to the matching status folder)",
+        description="Change one ticket's status. Additive, not a replacement: "
+        "'arbite set <id> status <value>' keeps working, and both write through the same "
+        "code path so the two cannot drift. In the file sink a status change moves the "
+        "ticket into the folder matching the new status, which un-files a ticket sitting in "
+        "a bucket so status and location cannot disagree; moving to 'closed' auto-dates "
+        "'closed', and asking for the status a ticket already has is a no-op. The "
+        "status vocabulary comes from schema.STATUSES, so 'review' -- and any status added "
+        "later -- is accepted here without this command changing. This is the escape hatch "
+        "rather than a workflow front door: it will make any status change into any other, "
+        "including the transitions 'claim'/'close'/'submit'/'accept' exist for, because its "
+        "purpose is reaching the rest of the vocabulary. It changes one ticket; to count "
+        "tickets per status across the whole backlog, use 'arbite status'.",
+    )
+    p_set_status.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_set_status.add_argument(
+        "status",
+        choices=schema.STATUSES,
+        metavar="STATUS",
+        help=f"the new status: {' | '.join(schema.STATUSES)}",
+    )
+    _sink_flag(p_set_status)
+    p_set_status.set_defaults(func=cmd_set_status)
 
     p_delete = sub.add_parser(
         "delete",
@@ -2056,10 +2956,13 @@ def build_parser():
 
     p_doctor = sub.add_parser(
         "doctor",
-        help="check ticket integrity (drift, cycles, dangling deps, stale indexes)",
+        help="check ticket integrity (drift, cycles, dangling deps/references, stale indexes)",
         description="Check the invariants nothing else enforces and report what it finds, "
         "then exit 3 if any problem remains. The shared checks cover duplicate ids, invalid "
-        "field values, dependency cycles, dangling and self dependencies, in_progress "
+        "field values, dependency cycles, dangling and self dependencies, dangling "
+        "references (a referenced plan with no document on disk -- an ordinary drafting "
+        "state, reported but never repaired: creating the plan and dropping the reference "
+        "are equally plausible), in_progress "
         "tickets with no assignee, blocked tickets with no reason, and closed-date "
         "mismatches. The sink adds its own: for the file sink, frontmatter/folder drift (the "
         "folder is authoritative), stray temp files from an interrupted write, and closed "

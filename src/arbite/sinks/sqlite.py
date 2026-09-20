@@ -153,6 +153,11 @@ class SqliteSink(TicketSink):
 
     def __init__(self, path: Path, timeout: float = 5.0):
         self._path = Path(path)
+        # The database lives inside .arbite/ by default, so its parent is a usable
+        # default anchor for resolving `references`; `build_sink` overwrites this
+        # with the project's real .arbite/ when the store is configured elsewhere.
+        # See TicketSink.arbite_dir.
+        self.arbite_dir = self._path.parent
         # Seconds a writer waits for a lock before giving up. Agents run as
         # separate processes, so a lock *will* be contended occasionally; waiting
         # briefly is far better than failing a claim that would have succeeded.

@@ -1,7 +1,7 @@
 ---
 id: tic-7be7
 title: Add commands to manage a ticket's references
-status: open
+status: closed
 type: feature
 tier: medium
 domain: cli
@@ -17,8 +17,8 @@ depends_on:
 - tic-ea0e
 blocked_by: null
 created: '2026-09-20T12:26:17'
-updated: '2026-09-20T12:26:17'
-closed: null
+updated: '2026-09-20T13:39:35'
+closed: '2026-09-20T13:39:35'
 ---
 
 ## Description
@@ -36,3 +36,4 @@ Warn -- do not error -- when a referenced document does not exist on disk: refer
 Acceptance: add/rm/list round-trip through both sinks; a dangling reference warns on write and is reported by doctor.
 
 ## Notes
+- 2026-09-20T13:39:34 zoo.orch.001: Added arbite ref add/rm/list (reusing cmd_move's bucket-path normalisation); dangling references warn on write and are reported by doctor as a shared check resolving <arbite_dir>/<ref> on both sinks; empty list renders as absent

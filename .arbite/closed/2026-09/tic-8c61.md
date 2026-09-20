@@ -1,7 +1,7 @@
 ---
 id: tic-8c61
 title: Add 'arbite progress' -- live epics in dependency order
-status: open
+status: closed
 type: feature
 tier: high
 domain: cli
@@ -18,8 +18,8 @@ depends_on:
 - tic-f838
 blocked_by: null
 created: '2026-09-20T12:26:33'
-updated: '2026-09-20T12:26:33'
-closed: null
+updated: '2026-09-20T14:19:21'
+closed: '2026-09-20T14:19:21'
 ---
 
 ## Description
@@ -41,3 +41,4 @@ Output: grouped by epic, and within each epic sorted topologically by depends_on
 Acceptance: an epic with a single in_progress ticket and otherwise-closed siblings shows every one of them, topologically ordered; an epic with all tickets closed does not appear at all.
 
 ## Notes
+- 2026-09-20T14:19:21 zoo.orch.001: Added "arbite progress": live tickets (open/in_progress/review, via schema.LIVE_STATUSES) put their epics in scope, then every ticket of those epics is shown -- closed and shelved siblings included, ordered topologically by depends_on through graph.topo_order, with cycles warned on stderr. An all-closed epic never appears; epic-less live tickets group under "no epic"; each epic gets a count line; --epic narrows; --json emits per-epic counts/live/total/tickets. Exits 2 when nothing is live. Bucketed tickets are out of the status workflow, so they are not live and cannot pull an epic into the report.

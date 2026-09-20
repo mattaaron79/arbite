@@ -1,7 +1,7 @@
 ---
 id: tic-08ad
 title: Add 'arbite accept' -- close a ticket that is in review
-status: open
+status: closed
 type: feature
 tier: low
 domain: cli
@@ -16,8 +16,8 @@ depends_on:
 - tic-0088
 blocked_by: null
 created: '2026-09-20T12:25:55'
-updated: '2026-09-20T12:25:55'
-closed: null
+updated: '2026-09-20T14:23:15'
+closed: '2026-09-20T14:23:15'
 ---
 
 ## Description
@@ -33,3 +33,4 @@ The rejection path is 'arbite reopen --reason ...', which is a separate ticket; 
 Acceptance: accept on a review ticket closes it with an attributed note; accept on an open or closed ticket errors.
 
 ## Notes
+- 2026-09-20T14:23:15 zoo.orch.001: Added "arbite accept": closes a ticket that is in review, dating closed exactly as arbite close does, with an "Accepted." auto-note (plus --message as detail) credited to the accepting --agent rather than to the ticket assignee, because the record is about who approved the work. Refuses any ticket not in review, naming its real status, so accept cannot be used as a general-purpose close; no reject command was added, since the rejection path is arbite reopen --reason. The full claim -> submit -> review -> reopen/accept loop is pinned by an end-to-end test.

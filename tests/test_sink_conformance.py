@@ -410,6 +410,28 @@ def test_check_reports_shared_problems_in_every_sink(sink):
     } <= kinds
 
 
+def test_check_reports_a_dangling_reference_in_every_sink(sink, arbite_dir):
+    """`references` are filesystem documents on *both* sinks -- plans are files in
+    the project either way -- so this check is shared: it resolves each reference
+    against the arbite directory. A missing plan is an ordinary drafting state, so
+    it is reported and never repaired (`--fix` neither writes the plan nor drops
+    the reference: neither choice is unambiguously the caller's)."""
+    sink.create(make_ticket("tic-a1b2", references=["plans/gone.md"]))
+    problems = sink.check()
+    assert [p.kind for p in problems] == ["dangling_reference"]
+    assert "plans/gone.md" in problems[0].detail
+
+    fixed = sink.check(fix=True)
+    assert [p.kind for p in fixed] == ["dangling_reference"]
+    assert not fixed[0].fixed
+    assert sink.get("tic-a1b2").references == ["plans/gone.md"]
+
+    # Writing the plan is what makes it clean.
+    (arbite_dir / "plans").mkdir(exist_ok=True)
+    (arbite_dir / "plans" / "gone.md").write_text("a plan\n")
+    assert sink.check() == []
+
+
 def test_check_does_not_flag_todo_placeholders(sink):
     """`arbite raw` and `create --blank` write TODO placeholders on purpose;
     reporting them would leave `doctor` failing in any repo mid-triage."""

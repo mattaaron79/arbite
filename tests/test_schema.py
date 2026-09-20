@@ -11,10 +11,15 @@ import pytest
 
 from arbite.errors import TicketError
 from arbite.schema import (
+    BLANK_TITLE,
     FIELD_ORDER,
+    RAW_TITLE_FORMAT,
+    RAW_TYPE_CHOICES,
     SETTABLE_PROPERTIES,
     STATUSES,
     coerce_field_value,
+    is_placeholder,
+    is_raw_title_placeholder,
     parse_ticket,
     validate_field,
     validate_ticket,
@@ -44,6 +49,22 @@ def test_a_review_ticket_has_no_intrinsic_problems():
     """`review` carries no per-status rule of its own (unlike in_progress needing
     an assignee), so a plain review ticket must validate cleanly."""
     assert validate_ticket(make_ticket(status="review")) == []
+
+
+def test_the_per_status_count_table_is_seeded_from_the_vocabulary():
+    """`arbite status` renders its table from this list -- its entries, in this
+    order, zeros included -- so a status added here appears with no change to any
+    command or test. The sparse form (only statuses that hold tickets) is what
+    `sink info` reports, from the same counting implementation."""
+    from arbite.sinks import count_by_status
+
+    assert list(count_by_status([], vocabulary=True)) == list(STATUSES)
+    assert count_by_status([]) == {}
+    ticket = make_ticket(status="review")
+    assert count_by_status([ticket], vocabulary=True) == {
+        **{status: 0 for status in STATUSES},
+        "review": 1,
+    }
 
 
 # --- the references field ---------------------------------------------------
@@ -119,3 +140,17 @@ def test_a_hand_written_empty_references_list_parses_then_renders_as_absent():
     reparsed = parse_ticket(text)
     assert reparsed.references == []
     assert "references" not in reparsed.to_markdown()
+
+
+def test_the_raw_title_placeholder_predicate_follows_the_format():
+    """`arbite promote` refuses a title that is still a raw capture's placeholder, and the
+    test for it is derived from `RAW_TITLE_FORMAT` -- every raw type in turn -- rather than
+    restating its text, so it cannot drift from what `arbite raw` writes. A `TODO: ...`
+    title is a placeholder too, but by the generic rule rather than this one, which is why
+    promote checks both."""
+    for raw_type in RAW_TYPE_CHOICES:
+        assert is_raw_title_placeholder(RAW_TITLE_FORMAT.format(type=raw_type))
+    assert not is_raw_title_placeholder("Add per-mesh LOD")
+    assert not is_raw_title_placeholder(None)
+    assert not is_raw_title_placeholder(BLANK_TITLE)
+    assert is_placeholder(BLANK_TITLE)

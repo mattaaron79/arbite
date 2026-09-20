@@ -9,7 +9,7 @@ uses -- so the data lands in exactly the state the CLI would produce and
 round-trips cleanly through `arbite list` / `arbite deps` / `arbite doctor`.
 
 Which store it seeds is decided the same way a command decides it: `--sink`,
-then ARBITE_SINK, then the `sink:` key in arbite.yaml, then the default (file).
+then ARBITE_SINK, then the `sink:` key in .arbite/project.yaml, then the default (file).
 Because the data is built through the interface rather than by writing files,
 `--sink sqlite` seeds a database with the same ticket set -- which makes the two
 sinks directly comparable, and is a pleasant way to browse a filterable store.
@@ -540,7 +540,7 @@ def main() -> None:
         "--sink",
         choices=SINK_KINDS,
         default=None,
-        help=f"which store to seed (default: ARBITE_SINK / arbite.yaml / "
+        help=f"which store to seed (default: ARBITE_SINK / .arbite/project.yaml / "
         f"{DEFAULT_SINK_KIND})",
     )
     args = parser.parse_args()

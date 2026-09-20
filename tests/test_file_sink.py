@@ -14,8 +14,9 @@ import pytest
 
 from arbite.errors import Conflict, TicketNotFound
 from arbite.query import TicketQuery
-from arbite.schema import ID_PATTERN, parse_ticket
+from arbite.schema import ID_PATTERN, STATUSES, parse_ticket
 from arbite.sinks.file import (
+    FLAT_STATUS_DIRS,
     RAW_PROCESSED_DIR,
     RAW_SNAPSHOT_SUFFIX,
     TMP_PREFIX,
@@ -350,4 +351,79 @@ def test_details_describe_the_layout(file_sink, arbite_dir):
     assert details["closed_dir"] == "closed"
     assert "in_progress" in details["status_dirs"]
     assert "review" in details["status_dirs"]
+    # The flat status-dir tuple is *derived* from the one vocabulary -- it is not
+    # hand-written -- and keeps its order: `review` sits immediately after
+    # `in_progress`, and `closed` (the month archive) is the one status that is
+    # not a flat folder. Pinning the derivation here is what stops the layout
+    # silently drifting from `schema.STATUSES`.
+    assert details["status_dirs"] == list(FLAT_STATUS_DIRS)
+    assert list(FLAT_STATUS_DIRS) == [s for s in STATUSES if s != "closed"]
+    assert (
+        details["status_dirs"].index("review")
+        == details["status_dirs"].index("in_progress") + 1
+    )
+    assert "closed" not in details["status_dirs"]
     assert details["buckets"] == ["wishlist"]
+
+
+def test_a_review_ticket_is_a_status_ticket_not_a_bucket(file_sink, arbite_dir):
+    """`review` is a status, so its folder implies the status and *not* a bucket.
+
+    The three path predicates special-case a `<status>/<file>` path, so adding a
+    status directory changes what counts as a bucket: a ticket at
+    `review/tic-xxxx.md` must be a review ticket filed nowhere, found exactly
+    once, and clean under `doctor` -- not a stray, a misfiling or a duplicate."""
+    file_sink.create(make_ticket("tic-a1b2", status="review"))
+    path = arbite_dir / "review" / "tic-a1b2.md"
+    assert path.exists()
+
+    # The path predicates agree: a ticket in a status folder, no bucket.
+    assert file_sink._is_ticket_file(path) is True
+    assert file_sink._expected_status_for(path) == "review"
+    assert file_sink._bucket_for(path) is None
+
+    # So it is a status ticket, filed nowhere -- `review` is not a bucket.
+    assert file_sink.bucket("tic-a1b2") is None
+    assert file_sink.buckets() == []
+    assert file_sink.details()["buckets"] == []
+    assert "review" in file_sink.details()["status_dirs"]
+
+    # Found exactly once, in the review view and in a full sweep alike.
+    assert file_sink.ids() == ["tic-a1b2"]
+    assert [t.id for t in file_sink.query(TicketQuery(status="review"))] == ["tic-a1b2"]
+    assert [t.id for t in file_sink.query(TicketQuery(buckets=("*",)))] == ["tic-a1b2"]
+    assert file_sink.location("tic-a1b2") == str(path)
+    assert file_sink.storage_locations("tic-a1b2") == [str(path)]
+
+    # No drift, no stray, no misfiling -- before and after --fix.
+    assert file_sink.check() == []
+    assert file_sink.check(fix=True) == []
+
+
+def test_a_directory_under_review_is_a_bucket_by_the_status_bucket_convention(file_sink, arbite_dir):
+    """A nested directory under a status folder is a *bucket*, not a second kind
+    of status folder: that is the existing `<status>/<bucket>/` convention (the
+    `plans/ideas` shape, one level down), and `raw/processed/` is the single
+    deliberate exception, excluded by path.
+
+    So `review/ideas/tic-xxxx.md` is a legitimately filed ticket -- its location
+    implies no status, its bucket is `review/ideas`, and `doctor` is clean --
+    rather than a drift or a misfiling. This is pinned because adding `review` as
+    a status is exactly the change that reinterprets such paths."""
+    nested = arbite_dir / "review" / "ideas"
+    nested.mkdir(parents=True)
+    write_atomic(
+        make_ticket("tic-a1b2", status="review").to_markdown(), nested / "tic-a1b2.md"
+    )
+
+    assert file_sink._is_ticket_file(nested / "tic-a1b2.md") is True
+    assert file_sink._expected_status_for(nested / "tic-a1b2.md") is None
+    assert file_sink._bucket_for(nested / "tic-a1b2.md") == "review/ideas"
+    assert file_sink.bucket("tic-a1b2") == "review/ideas"
+    assert file_sink.buckets() == ["review/ideas"]
+
+    # Filed in a bucket: out of the status views, present in a full sweep.
+    assert file_sink.query(TicketQuery(status="review")) == []
+    assert [t.id for t in file_sink.query(TicketQuery(buckets=("*",)))] == ["tic-a1b2"]
+    assert file_sink.check() == []
+    assert file_sink.check(fix=True) == []

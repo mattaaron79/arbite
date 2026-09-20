@@ -1,7 +1,7 @@
 ---
 id: tic-b0ac
 title: Create review/ status folder in the file sink layout
-status: open
+status: closed
 type: feature
 tier: low
 domain: sinks
@@ -16,8 +16,8 @@ depends_on:
 - tic-9876
 blocked_by: null
 created: '2026-09-20T12:25:31'
-updated: '2026-09-20T12:25:31'
-closed: null
+updated: '2026-09-20T13:32:32'
+closed: '2026-09-20T13:32:32'
 ---
 
 ## Description
@@ -32,3 +32,4 @@ Watch _bucket_for/_expected_status_for/_is_ticket_file: they special-case paths 
 Acceptance: arbite init creates .arbite/review/; a ticket set to review lands there; arbite doctor reports no drift for it.
 
 ## Notes
+- 2026-09-20T13:32:29 zoo.orch.001: Already satisfied by tic-9876, no code fix needed: FLAT_STATUS_DIRS derives from schema.STATUSES so review sits right after in_progress and init() creates .arbite/review/ from that tuple with no separate mkdir; a ticket at review/<id>.md already reported status review and bucket None. This ticket added regression tests only -- review/ creation, the physical review/ path and show --json path, bucket None and single-count resolution, doctor clean incl. --fix no-op, the <status>/<bucket>/ convention for review/ideas/, and unconditional creation with review: false where an existing review ticket still resolves.

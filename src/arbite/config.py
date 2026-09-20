@@ -23,6 +23,10 @@ lead to sane defaults rather than a crash.
 
 Agent identity assignment and collision detection remain out of scope: this only
 reads a static list of known ids so `arbite init` can create scratchpads for them.
+
+One more committed choice is read here: the top-level `review:` flag, exposed as
+`review_enabled`. `arbite submit` is its only reader -- see that function for why the
+`review` status and the `review/` folder are deliberately unaffected by it.
 """
 
 from __future__ import annotations
@@ -42,6 +46,10 @@ from .sinks import DEFAULT_SINK_KIND, SINK_KINDS, SinkSpec, build_sink, default_
 #: `project.yaml` inside the located `.arbite/` directory. Named in the singular
 #: because there is no search order any more -- see the module docstring.
 CONFIG_FILENAME = "project.yaml"
+
+#: The top-level boolean that decides where a finished ticket goes. Exposed through
+#: `review_enabled` so no command has to reach into the raw config dict.
+REVIEW_KEY = "review"
 
 ARBITE_DIRNAME = ".arbite"
 
@@ -84,11 +92,33 @@ def config_path(project_root: Path) -> Optional[Path]:
     return None
 
 
+def _check_review_key(config: dict, path: Path) -> None:
+    """A `review:` key that is present at all must be a real boolean.
+
+    Reported rather than coerced, in the same spirit as `load_config`'s other
+    validation: a blank value (`review:` parses to None) or a quoted `'false'`
+    (a string) is a mistake, and collapsing it to false would silently send
+    finished tickets somewhere the author did not choose. PyYAML follows YAML 1.1,
+    so `yes`/`no`/`on`/`off` already parse to booleans and pass through here.
+    """
+    if REVIEW_KEY not in config:
+        return
+    value = config[REVIEW_KEY]
+    if isinstance(value, bool):
+        return
+    raise TicketError(
+        f"{path}: '{REVIEW_KEY}' must be a boolean (true or false), not {value!r}; "
+        f"remove the key to get the default (true)"
+    )
+
+
 def load_config(project_root: Path) -> dict:
     """The project's .arbite/project.yaml as a dict ({} when absent).
 
     A malformed config is reported rather than ignored: silently falling back to
-    the default sink would send tickets to the wrong store."""
+    the default sink would send tickets to the wrong store. The same applies to a
+    present-but-unusable `review:` value, which is why `_check_review_key` runs
+    here: any command that reads config reports it."""
     path = config_path(project_root)
     if path is None:
         return {}
@@ -98,12 +128,35 @@ def load_config(project_root: Path) -> dict:
         raise TicketError(f"{path}: config is not valid YAML: {e}")
     if not isinstance(data, dict):
         raise TicketError(f"{path}: config must be a YAML mapping of key: value")
+    _check_review_key(data, path)
     return data
 
 
 def load_known_agent_ids(project_root: Path) -> list:
     agents = load_config(project_root).get("agents", [])
     return [str(a) for a in agents]
+
+
+def review_enabled(project_root: Optional[Path] = None) -> bool:
+    """Whether a finished ticket goes to `review` (True) or straight to `closed`.
+
+    The flag has exactly one job: it decides where `arbite submit` files a ticket --
+    into `review` when true, straight to `closed` when false. `submit` is the only
+    caller, and it reads the answer through here rather than reaching into the raw
+    config dict, so "the flag gates submit and nothing else" stays checkable.
+
+    It does *not* remove `review` from the status vocabulary and does *not* stop
+    `arbite init` creating `review/`: a project that flips the flag off must not
+    strand tickets already sitting in review.
+
+    Absent (and a project with no config file at all) reads as True. A key that is
+    present but not a real boolean -- including YAML null / a blank value -- is an
+    error naming the file and the key, rather than a silent falsey default: the
+    check lives in `load_config`, so `review_enabled` raises through it. PyYAML is
+    YAML 1.1, so `yes`/`no`/`on`/`off` are booleans and are accepted."""
+    project_root = project_root or find_project_root()
+    config = load_config(project_root)  # raises on a malformed `review:` value
+    return config.get(REVIEW_KEY, True)
 
 
 def sink_spec(

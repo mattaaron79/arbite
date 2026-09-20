@@ -24,10 +24,20 @@ from .base import (  # noqa: F401  (re-exported: the public face of a sink)
     SinkInfo,
     TicketSink,
     common_problems,
+    count_by_status,
     enforce_expect,
     filter_tickets,
+    missing_references,
+    reference_path,
 )
-from .file import CLOSED_DIR, FLAT_STATUS_DIRS, FileSink
+from .file import (  # noqa: F401  (re-exported: the public face of a sink)
+    CLOSED_DIR,
+    FLAT_STATUS_DIRS,
+    RAW_PROCESSED_DIR,
+    FileSink,
+    raw_snapshot_name,
+    write_exclusive,
+)
 from .sqlite import SCHEMA_VERSION, SqliteSink
 
 #: The sink used when nothing selects one. Files stay the default because the
@@ -67,9 +77,16 @@ def build_sink(spec: SinkSpec, arbite_dir: Path) -> TicketSink:
         )
     if kind == "file":
         root = Path(spec.root) if spec.root else arbite_dir
-        return FileSink(root)
-    path = Path(spec.root) if spec.root else arbite_dir / SQLITE_FILENAME
-    return SqliteSink(path, **spec.options)
+        sink = FileSink(root)
+    else:
+        path = Path(spec.root) if spec.root else arbite_dir / SQLITE_FILENAME
+        sink = SqliteSink(path, **spec.options)
+    # `references` resolve against the *arbite directory* on both sinks -- plans are
+    # filesystem documents whichever store holds the tickets -- so record the anchor
+    # here, where it is known, rather than re-deriving it from a sink's root (a
+    # configured `sinks.file.root`/`sinks.sqlite.path` need not live inside .arbite/).
+    sink.arbite_dir = Path(arbite_dir)
+    return sink
 
 
 def default_location(kind: str, arbite_dir: Path) -> Path:

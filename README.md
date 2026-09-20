@@ -14,6 +14,28 @@ database file, where `status` is a column and queries are real SQL. Every comman
 field, exit code and `--json` payload is identical whichever sink is in use — see
 [Sinks](#sinks).
 
+## Breaking changes when upgrading
+
+Two changes are hard cuts with **no fallback, no deprecation warning and no
+migration** — anyone upgrading an existing project hits them immediately:
+
+1. **The project config moved to `.arbite/project.yaml`, and the repo-root names are
+   gone.** The old `arbite.yaml` and `.arbite.yaml` are not read *at all*: a project
+   that still has only one of them behaves exactly as if it had no config, silently
+   falling back to the default `file` sink (and losing its `agents:`, `sinks:` and
+   `review:` keys). Move the file into `.arbite/project.yaml`, or let
+   `arbite init --sink <kind>` write it fresh.
+2. **`arbite reopen` now requires `--reason`.** A bare `arbite reopen <id>` fails
+   with argparse's missing-argument error, deliberately: `reopen` is the rejection
+   path out of review, so a rejection with no stated reason is useless to whoever
+   has to act on it (`arbite reopen <id> --reason "tests fail on ARM"`).
+
+Two related renames came with the same release: the default non-status bucket is now
+`plans/` (the old `planning/` is not aliased — an existing directory simply stays
+there as a non-default bucket), and `review` is a first-class status and folder,
+reached through `arbite submit` and left through `arbite accept` (or
+`arbite reopen --reason`).
+
 ## Example AGENTS.md
 
 See AGENTS_EXAMPLE.md. An AGENTS.md or CLAUDE.md pointing the agent to the .arbite/AGENTS.md file will
@@ -33,11 +55,17 @@ arbite list --topo --epic <epic_name>
 Get the next workable ticket (if you'd like to specify the ticket to an agent):
 arbite list next
 
-File a quick bug/feature/request/memo:
+File a quick bug/feature/request/memo/wish:
 arbite bug The thing doesn't work that I want to work!
 arbite feature Make the button glow when hovering
 arbite request Collapse the toolbar when scrolling
 arbite memo The readme probably needs to be updated
+arbite wish Fly-through camera preview mode
+
+How is the backlog distributed across statuses (and how far along is an epic)?
+arbite status
+arbite status --epic <epic_name>
+arbite status --json
 
 Which store am I using, and where is it?
 arbite sink info
@@ -72,6 +100,12 @@ or more epics in arbite. Once the tickets are ready, use an agent in orchestrati
 mode to work the tickets until completion. Well designed tickets can usually be completed
 by small or medium-sized models.
 
+A ticket can point at the plan or spec it came from with `arbite ref add <id>
+plans/<doc>.md` — a root-relative path into the arbite directory's `plans/` bucket.
+The document need not exist yet (a plan is often written after the ticket that needs
+it): a missing one warns on stderr, and `arbite doctor` reports it as
+`dangling_reference` until the plan is written.
+
 ---
 
 ## Ticket Creation
@@ -80,7 +114,8 @@ Usually it's best to have the agent create the tickets, as a command line interf
 cumbersome. However, there are 'raw' tickets that are created via the
 `arbite bug|feature|request|memo|wish` commands. A `request` is a request for a change that is
 not necessarily a bug or a new feature, but a tweak or lateral change. Raw tickets need to be
-classified before they are worked.
+classified before they are worked, which is what `arbite fetch` (read the queue) and
+`arbite promote <id>` (classify in place, keeping the id) together do.
 
 You can view raw tickets via:
 arbite list raw
@@ -118,14 +153,14 @@ See AGENTS_EXAMPLE.md, which tells the agent to classify and work raw tickets wh
 
 ## Non-goals
 
-Explicitly **out of scope** for arbite (see [CLAUDE.md](CLAUDE.md:139) for the
-original rationale):
+Explicitly **out of scope** for arbite (see
+[`INITIAL_DESIGN_DOC.md`](INITIAL_DESIGN_DOC.md:156) for the original rationale):
 
 - **Agent identity, liveness and staleness detection.** Assigning identities,
   avoiding collisions, and detecting abandoned work belong to an external *agent
-  harness*. arbite only reads a static list of known agent ids from
-  `arbite.yaml`/`.arbite.yaml` so `arbite init` can pre-create scratchpads —
-  see [`load_known_agent_ids()`](src/arbite/config.py).
+  harness*. arbite only reads a static list of known agent ids from the `agents:`
+  key in `.arbite/project.yaml` so `arbite init` can pre-create scratchpads — see
+  [`load_known_agent_ids()`](src/arbite/config.py:135).
 - **Scheduling or dispatching work.** arbite answers "what is workable"; getting an
   agent started on it is the caller's job.
 - **A UI, web service, or notifications.** The CLI is the interface.
@@ -161,24 +196,35 @@ Highest precedence first:
 
 1. `--sink <kind>` on any command (before or after the command name)
 2. the `ARBITE_SINK` environment variable
-3. a `sink:` key in `arbite.yaml` / `.arbite.yaml`
+3. a `sink:` key in `.arbite/project.yaml`
 4. the default: `file`
 
 ```yaml
-# arbite.yaml
+# .arbite/project.yaml
 sink: sqlite
 sinks:
   file:   { root: .arbite }            # optional location overrides
   sqlite: { path: .arbite/arbite.db }
 agents: [claude.haiku.001]
+review: true                           # where 'arbite submit' files a finished ticket (optional)
 ```
+
+`review:` (default `true`) is a top-level boolean deciding where a finished ticket
+is filed: `true` sends it to the `review` status, `false` sends it straight to
+`closed`. An absent key means `true`. `arbite submit` is its only reader — `arbite
+accept` then closes the reviewed ticket, and a reviewer who sends work back uses
+`arbite reopen --reason …`. It does **not** remove the `review` status
+and does **not** stop `arbite init` creating `review/` — flipping the flag off must
+not strand tickets already awaiting review. Only a YAML boolean is accepted
+(`yes`/`no`/`on`/`off` included); a blank or quoted value is an error naming the
+file and the key, not a silent default.
 
 `arbite init` initialises whichever sink is selected, and `arbite sink info`
 reports what is active and where. Creating a database-backed project is one flag,
-not a different command — and `init` **writes the choice into `arbite.yaml`**
-(created if missing, every other key left alone), so the store you just set up is
-the one every later command reads, including commands an agent runs with no flags
-at all:
+not a different command — and `init` **writes the choice into
+`.arbite/project.yaml`** (created if missing, every other key left alone), so the
+store you just set up is the one every later command reads, including commands an
+agent runs with no flags at all:
 
 ```bash
 arbite init --sink sqlite        # creates the database AND sets sink: sqlite
@@ -232,8 +278,8 @@ Three deliberate properties of that surface:
 
 `arbite doctor` reports the checks that mean the same thing anywhere (duplicate
 ids, invalid field values, dependency cycles, dangling and self dependencies,
-`in_progress` without an assignee, `blocked` without a reason, closed-date
-mismatches) and then the ones that don't:
+dangling `references`, `in_progress` without an assignee, `blocked` without a
+reason, closed-date mismatches) and then the ones that don't:
 
 - **file sink** — frontmatter/folder drift (the folder wins), a ticket left loose
   in the arbite root, temp files stranded by an interrupted write, a closed ticket
@@ -323,11 +369,12 @@ The package exposes the console script `arbite`, providing:
 | --- | --- |
 | Setup | `init`, `sink [info\|init]` |
 | Creation | `create` (incl. `--blank` scaffolding), `raw <memo\|feature\|request\|bug\|wish>` plus the one-word shortcuts `bug` / `feature` / `request` / `wish` / `memo` |
-| Triage | `fetch [type]` (oldest raw ticket + injected `derived_note`), `list raw` |
+| Triage | `fetch [type]` (oldest raw ticket + injected `derived_note`), `promote <id>` (classify in place + freeze a `raw/processed/` snapshot, optionally `--agent` to claim it), `list raw` |
 | Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
-| Lifecycle | `claim`, `release`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen <id> --reason <text>` |
-| Authoring | `note`, `set`, `depend`, `move` |
+| Lifecycle | `claim`, `release`, `submit`, `accept`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen <id> --reason <text>` |
+| Authoring | `note`, `set`, `set-status`, `depend`, `move`, `ref` (`add` / `rm` / `list`) |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
+| Reporting | `status` (per-status counts + total; `--epic`/`--domain`/`--tier`/`--assignee`, `--json`), `progress` (live epics and their full membership, in dependency order; `--epic`, `--json`) |
 | Integrity | `doctor [--fix]` |
 | Destruction | `delete <id> --force` |
 
@@ -344,12 +391,86 @@ Key behaviours worth calling out:
 - **`--count N`** turns `list next` into a batch pull; with `--claim` each claim is
   individually a compare-and-swap, so a short batch is a correct result, reported as
   such.
-- **`arbite fetch`** implements the triage queue: it pulls the oldest `raw` ticket
-  and prints it with a `derived_note` (a JSON field in `--json` mode, a leading block
-  otherwise) telling the caller exactly how to classify it.
+- **`arbite fetch`** implements the read-only half of the triage queue: it pulls the
+  oldest `raw` ticket and prints it with a `derived_note` (a JSON field in `--json`
+  mode, a leading block otherwise) telling the caller to classify it with
+  `arbite promote`.
+- **`arbite promote <id>`** is the write half: it freezes the capture verbatim to
+  `raw/processed/<id>.raw.md` (exclusive create — a snapshot is frozen audit history
+  and is never overwritten, so promoting the same id twice is an error), then
+  classifies the ticket **in place** through a compare-and-swap, so the id, `created`
+  and any notes survive. `--title`/`--tier`/`--domain` are required and placeholder
+  values are refused, naming the field; an omitted `--epic` clears the `classification`
+  grouping the capture was filed under. The ticket lands at `open` — or `in_progress`
+  assigned to `--agent <id>` when the classifier is going to work it. A **wish** is the
+  exception: it is retyped to `feature` and filed in the `wishlist` bucket with its
+  status left at `raw`, so it leaves the triage queue without becoming work
+  (`--agent` is refused for it).
+- **`arbite submit <id>`** hands finished work off, and where it lands is the project's
+  committed `review:` answer: with review on (the default) the ticket becomes `review`
+  and moves to `review/`, **keeping its assignee** — a ticket in review is still owned
+  by whoever did the work, because they are the one a reviewer sends it back to —
+  while `review: false` makes the same command close it, dated exactly as
+  `arbite close` dates it. Both paths append an automatic note (`Submitted for
+  review.` / `Submitted; closed (review disabled).`), with `--message` as detail, and a
+  ticket that is already closed is refused.
+- **`arbite accept <id>`** is the reviewer's counterpart: it closes a ticket that is in
+  `review`, with a note credited to the accepting `--agent` rather than to the ticket's
+  assignee, because the point of the record is who approved the work. A ticket that is
+  not in review is refused with its real status named — a general-purpose close is
+  `arbite close` — and the rejection path back into work is `arbite reopen --reason …`,
+  which is why that reason is mandatory.
 - **`arbite move`** files a ticket in a bucket (`/wishlist`, `/plans/ideas`) or
   returns it to its status location (`/`). It changes no field, so it is not a state
   change — status commands un-file a ticket for you.
+- **`arbite ref add|rm|list <id> [path…]`** manages a ticket's `references`: plan
+  documents under the arbite directory's `plans/` bucket (`plans/foo.md` ==
+  `.arbite/plans/foo.md`), stored root-relative like `move`'s buckets — a leading
+  `/` is accepted and stripped. `add` appends de-duplicated while preserving order,
+  `rm` removes and errors (exit `1`, writing nothing) on a path the ticket does not
+  reference, and `list` prints them one per line (`--json` gives
+  `{"id": …, "references": […]}`). A referenced plan need not exist yet: a missing
+  one **warns** on stderr and the write still succeeds, because references are
+  written while a plan is still being drafted — `arbite doctor` reports it as a
+  `dangling_reference` problem and `--fix` deliberately repairs neither direction.
+- **`arbite status`** prints a count for every status — in the canonical vocabulary
+  order (`raw`, `open`, `in_progress`, `review`, `blocked`, `shelved`, `closed`),
+  including the ones holding nothing, so the *shape* of the backlog is readable at a
+  glance and a newly added status is visibly empty rather than absent — plus a total.
+  `--json` emits a flat mapping of status to count plus `total`. The counts use the
+  same query semantics the default listing does, so `arbite status` and
+  `arbite list --status <status>` never disagree: tickets filed in a bucket
+  (`wishlist/`, `plans/`) are out of the status workflow and are **not** counted
+  under the status they retain — which is what keeps `arbite status` agreeing with
+  `arbite list --status <status>` and with `arbite sink info`'s per-status counts
+  (one counting implementation serves both). `--epic`/`--domain`/`--tier`/`--assignee`
+  narrow every count and the total, so `arbite status --epic workflow` answers "how
+  far along is this epic". It always
+  exits `0` — it is a report, not a query, so the "`2` = nothing matched" convention
+  does not apply. It is not `arbite set <id> status <value>` (which changes one
+  ticket) and not `arbite sink info` (which describes the *store*, not the backlog).
+- **`arbite progress`** answers "what is actually in flight, and what surrounds it":
+  the live tickets are those whose status is `open`, `in_progress` or `review`; the
+  epics in scope are those holding at least one of them; and then **every** ticket of
+  those epics is shown, whatever its status — closed and shelved siblings included,
+  because they are the context that makes the live ticket legible. An epic whose
+  tickets are all closed never appears at all, live tickets with no epic are grouped
+  under a `no epic` heading rather than dropped, and within an epic the order is
+  topological by `depends_on` (the same ordering `list next` uses). Each epic gets a
+  count line, `--epic` narrows to one epic, and `--json` emits one object per epic
+  with its `counts`, `live` and `tickets`. It exits `2` when nothing is live, and it
+  is not `arbite status`: that counts the whole backlog per status rather than
+  following epics, and not `list --topo`, which shows a filtered selection rather
+  than an epic's full membership.
+- **`arbite set-status <id> <status>`** is the dedicated front door for a status
+  change, additive rather than a replacement: `arbite set <id> status <value>` still
+  works, and both write through one shared code path, so they cannot drift. A status
+  *change* moves the ticket into the folder matching the new status — which un-files a
+  ticket that was sitting in a bucket — and auto-dates `closed`; asking for the status
+  a ticket already has is a no-op that leaves it filed where it is. It deliberately
+  does **not** refuse the transitions `claim`/`close`/`submit`/`accept` exist for: it
+  is the escape hatch for the rest of the vocabulary, and its choices come from
+  `schema.STATUSES`, so `review` is accepted without this command changing.
 - **`arbite delete`** destroys a ticket and refuses to do so without `--force`; it
   records a `Deleted by <agent>` note first and prints a receipt. `close` is usually
   what you want.
@@ -362,9 +483,59 @@ Key behaviours worth calling out:
 - **`arbite doctor`** checks the invariants nothing else enforces and exits `3` when
   problems remain — see [Integrity checking per sink](#integrity-checking-per-sink).
 
-`CLAUDE.md` records a handful of deliberately open judgement calls — validation
-strictness for `domain`/`tags`, the `deps` visualization format, and whether
-`blocked_by` should support multiple blockers.
+[`INITIAL_DESIGN_DOC.md`](INITIAL_DESIGN_DOC.md:434) records a handful of
+deliberately open judgement calls — validation strictness for `domain`/`tags`, the
+`deps` visualization format, and whether `blocked_by` should support multiple
+blockers.
+
+---
+
+## Ticket lifecycle and statuses
+
+`status` is one of a fixed vocabulary — `raw`, `open`, `in_progress`, `review`,
+`blocked`, `shelved`, `closed` — and with the file sink the folder a ticket sits in
+mirrors it exactly:
+
+```
+raw ──promote──▶ open ──claim──▶ in_progress ──submit──▶ review ──accept──▶ closed
+                                        │                    │
+                                        ├─block──▶ blocked   └─reopen --reason──▶ open
+                                        ├─release──▶ open
+                                        └─shelve──▶ shelved ──unshelve──▶ open
+```
+
+| Status | Folder | Meaning |
+| --- | --- | --- |
+| `raw` | `raw/` | unclassified capture — not workable, never offered by `list next` |
+| `open` | `open/` | actionable, unclaimed |
+| `in_progress` | `in_progress/` | claimed and being worked (`assignee` set) |
+| `review` | `review/` | finished, awaiting a reviewer |
+| `blocked` | `blocked/` | stalled — `blocked_by` records why |
+| `shelved` | `shelved/` | parked for later |
+| `closed` | `closed/YYYY-MM/` | done, archived by close date |
+
+Transitions and the command that makes each one:
+
+| From | Command | To |
+| --- | --- | --- |
+| `raw` | `promote` | `open` (or `in_progress` with `--agent`) |
+| `open` | `claim --agent` | `in_progress` |
+| `in_progress` | `submit` | `review` (or straight to `closed` when `review: false`) |
+| `review` | `accept` | `closed` |
+| `review` (or any) | `reopen --reason` | `open` |
+| `in_progress` (`open`) | `block --reason` | `blocked` |
+| `blocked` | `unblock` | `in_progress` (`open` with `--open`) |
+| `in_progress` | `release` | `open` |
+| `open` | `shelve` | `shelved` |
+| `shelved` | `unshelve` | `open` |
+| any | `close` | `closed` |
+| any | `set-status <id> <status>` | any status — the escape hatch for the rest |
+
+`arbite submit` lands a finished ticket in `review` **keeping its assignee** (the
+author is who a reviewer sends the work back to); `review: false` in
+`.arbite/project.yaml` makes the same command close it instead. The flag does not
+remove `review` from the vocabulary, so tickets already awaiting review are never
+stranded.
 
 ---
 
@@ -406,8 +577,8 @@ strictness for `domain`/`tags`, the `deps` visualization format, and whether
   Everything under it is skipped by path, not by status, so `list`, `fetch`, `doctor`
   and the id index never see it and an already-promoted request is never re-served.
 - `agents/` holds one scratchpad file per known agent identity (no required schema),
-  pre-created from the `agents:` list in `arbite.yaml` / `.arbite.yaml`. Scratchpads
-  stay files whichever sink is active: they are harness-facing state, not tickets.
+  pre-created from the `agents:` list in `.arbite/project.yaml`. Scratchpads stay
+  files whichever sink is active: they are harness-facing state, not tickets.
 - `AGENTS.md` is regenerated on every `arbite init`. It is **not auto-discovered** —
   a project that wants agents to find arbite must point at it explicitly (e.g. a line
   in its own `CLAUDE.md` like "read `.arbite/AGENTS.md`").
@@ -516,11 +687,14 @@ arbite init
 arbite raw feature "add per-mesh LOD"
 arbite list raw                       # the running triage backlog
 
-# 3. Triage: pull the oldest raw ticket and classify it
-arbite fetch
-arbite set tic-a1b2 title "Add per-mesh LOD" tier medium domain mesh \
-    epic mesh-pipeline priority 3
-arbite set tic-a1b2 status open
+# 3. Triage: pull the oldest raw ticket, then classify it in place with promote
+arbite fetch                           # read-only: what is in the queue
+arbite promote tic-a1b2 --title "Add per-mesh LOD" --tier medium --domain mesh \
+    --epic mesh-pipeline --priority 3 \
+    --description "Add a per-mesh LOD ladder to the mesh importer."
+# -> status open at the same id, plus a frozen copy of the capture for audit at
+#    .arbite/raw/processed/tic-a1b2.raw.md (--agent claude.haiku.001 would classify
+#    and claim it in the same command instead of leaving it open for someone else)
 
 # 4. Work it
 arbite list next --tier medium        # what's ready at my capability level?
@@ -560,11 +734,11 @@ selected, the CLI says so on stderr rather than quietly reading the other store.
 
 These exist because agents, not humans, are the main callers:
 
-- **`--json`** on `list`, `list next`, `fetch`, `show`, `search`, `deps`, `doctor`,
-  `sink` and `delete` emits machine-readable output whose field names match the
-  frontmatter. The human table format is explicitly *not* a stable interface. The
-  `path` field is whatever the sink calls a ticket's location (a file path, or
-  `sqlite:/…/arbite.db#tic-a1b2`).
+- **`--json`** on `list`, `list next`, `list raw`, `ref list`, `fetch`, `show`,
+  `search`, `deps`, `doctor`, `sink`, `status`, `progress` and `delete` emits machine-readable
+  output whose field names match the frontmatter. The human table format is explicitly *not* a
+  stable interface. The `path` field is whatever the sink calls a ticket's location
+  (a file path, or `sqlite:/…/arbite.db#tic-a1b2`).
 - **Exit codes** let a shell loop branch without matching message text: `0` success
   with results, `1` error, `2` the query ran but matched nothing, `3` `doctor` found
   problems.
@@ -591,7 +765,8 @@ These exist because agents, not humans, are the main callers:
 
 ```
 pyproject.toml          packaging + console-script entry point (+ pytest config)
-CLAUDE.md               the original design spec and rationale
+INITIAL_DESIGN_DOC.md   the original design spec and rationale (+ a later update banner)
+AGENTS_EXAMPLE.md       the agent instructions block `arbite init --agents-doc` installs
 src/arbite/
   __init__.py           package version
   cli.py                argument parsing, command dispatch, exit codes
@@ -628,6 +803,6 @@ The core system is implemented: creation, listing and filtering, dependency-orde
 `list next`, raw capture plus triage, the full claim/release/block/unblock/shelve/
 close/reopen lifecycle, notes, `set`/`move`/`depend`, the `doctor` integrity checker,
 the sink abstraction with both the file and SQLite implementations, sink selection
-and `sink info`, `delete`, and `migrate`. `CLAUDE.md` remains the canonical record of
-the design; open judgement calls and any schema change should be raised there before
-implementation.
+and `sink info`, `delete`, and `migrate`. `INITIAL_DESIGN_DOC.md` remains the
+canonical record of the design; open judgement calls and any schema change should be
+raised there before implementation.

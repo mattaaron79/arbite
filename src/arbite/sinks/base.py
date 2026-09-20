@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable, Optional
 
 from .. import graph, schema
@@ -156,6 +157,12 @@ class TicketSink(ABC):
     #: True when the sink can file a ticket somewhere other than its status
     #: location (the file sink's wishlist/ and plans/ folders).
     supports_buckets: bool = False
+    #: The project's `.arbite/` directory, when this sink was built for a project.
+    #: `references` resolve against it on *both* sinks -- plans are filesystem
+    #: documents whichever store holds the tickets, the same reasoning that keeps
+    #: agent scratchpads as files either way -- so this is what lets the
+    #: dangling-reference check mean the same thing in either. `build_sink` sets it.
+    arbite_dir: Optional[Path] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -173,17 +180,18 @@ class TicketSink(ABC):
         file), used in messages and in `SinkInfo`."""
 
     def describe(self) -> SinkInfo:
+        # Counting lives in `count_by_status()` rather than here, because
+        # `arbite status` answers the same question ("how many tickets are in
+        # each status") and the two surfaces must not be able to disagree. The
+        # sparse form is what `sink info` has always printed.
         tickets = self.query(TicketQuery())
-        counts = {}
-        for t in tickets:
-            counts[t.status] = counts.get(t.status, 0) + 1
         return SinkInfo(
             kind=self.kind,
             root=str(self.root),
             status_is_location=self.status_is_location,
             supports_buckets=self.supports_buckets,
             ticket_count=len(tickets),
-            status_counts=counts,
+            status_counts=count_by_status(tickets),
             details=self.details(),
         )
 
@@ -356,6 +364,31 @@ class TicketSink(ABC):
         return problems
 
 
+def reference_path(ref: str, arbite_dir) -> Path:
+    """The filesystem document a `references` entry points at.
+
+    A reference is root-relative to the arbite directory -- `plans/foo.md` means
+    `<arbite_dir>/plans/foo.md` -- on *both* sinks: plans are filesystem documents
+    regardless of which store holds the tickets. This is the single definition of
+    that resolution, so the CLI's write-time warning and `doctor`'s check cannot
+    disagree about whether a referenced plan exists."""
+    return Path(arbite_dir) / ref
+
+
+def missing_references(references, arbite_dir) -> list:
+    """The entries of `references` that have no document on disk, in stored order.
+
+    A dangling reference is an ordinary drafting state -- references are written
+    while a plan is still being drafted, and a SQLite store may have no `plans/`
+    directory at all -- so callers warn (`ref add`) or report (`doctor`) but never
+    fail on one. With no arbite directory to resolve against, nothing is reported:
+    the check cannot run, and inventing missing files would be worse than silence.
+    """
+    if arbite_dir is None:
+        return []
+    return [ref for ref in (references or []) if not reference_path(ref, arbite_dir).exists()]
+
+
 def common_problems(tickets: list, sink: Optional["TicketSink"] = None) -> list:
     """Integrity problems that mean the same thing in every sink.
 
@@ -369,6 +402,10 @@ def common_problems(tickets: list, sink: Optional["TicketSink"] = None) -> list:
     was found, which is the one finding whose value is entirely in its
     locations."""
     problems = []
+    # `references` are plan documents on the filesystem whichever sink holds the
+    # tickets, so the dangling check is shared rather than per-sink: it resolves
+    # each reference against the arbite directory through the one helper above.
+    arbite_dir = getattr(sink, "arbite_dir", None)
 
     by_id = {}
     duplicates = {}
@@ -434,6 +471,19 @@ def common_problems(tickets: list, sink: Optional["TicketSink"] = None) -> list:
         if t.id in t.depends_on:
             problems.append(Problem("self_dependency", "depends on itself", ticket_id=t.id))
 
+        for ref in missing_references(t.references, arbite_dir):
+            problems.append(
+                Problem(
+                    "dangling_reference",
+                    f"references '{ref}', which has no document at "
+                    f"{reference_path(ref, arbite_dir)} -- references are written "
+                    "while a plan is still being drafted, so this is an ordinary "
+                    "drafting state rather than corruption; write the plan or drop "
+                    "the reference by hand (arbite will not guess which)",
+                    ticket_id=t.id,
+                )
+            )
+
         if t.status == "in_progress" and not t.assignee:
             problems.append(
                 Problem(
@@ -477,6 +527,30 @@ def common_problems(tickets: list, sink: Optional["TicketSink"] = None) -> list:
         )
 
     return problems
+
+
+def count_by_status(tickets: list, vocabulary: bool = False) -> dict:
+    """How many of `tickets` sit in each status: the *one* counting
+    implementation behind both `arbite sink info` and `arbite status`, so the two
+    surfaces cannot give two answers to the same question.
+
+    With `vocabulary=False` the result is sparse -- only statuses that actually
+    hold a ticket are keys -- which is the shape `sink info` has always reported.
+    With `vocabulary=True` it is seeded with every entry of `schema.STATUSES`, in
+    that order, so a status with no tickets is present with a count of 0: the
+    whole point of `arbite status` is that the shape of the backlog (including
+    what is empty) is visible at a glance, and a status added to the vocabulary
+    later cannot be forgotten by a caller that renders this dict.
+
+    Counts are therefore derived from the vocabulary rather than from a list
+    restated at each call site. A ticket whose status is outside the vocabulary
+    (only reachable by hand-editing; `doctor` reports it) is counted under its own
+    key, appended after the vocabulary entries, rather than silently dropped -- a
+    report that hides a ticket would be worse than one with an unexpected row."""
+    counts = {status: 0 for status in schema.STATUSES} if vocabulary else {}
+    for ticket in tickets:
+        counts[ticket.status] = counts.get(ticket.status, 0) + 1
+    return counts
 
 
 def filter_tickets(tickets: list, q: TicketQuery, buckets: Optional[dict] = None) -> list:

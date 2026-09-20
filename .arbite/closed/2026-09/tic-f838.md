@@ -1,7 +1,7 @@
 ---
 id: tic-f838
 title: Add 'arbite status' -- ticket counts by status
-status: open
+status: closed
 type: feature
 tier: low
 domain: cli
@@ -15,8 +15,8 @@ depends_on:
 - tic-9876
 blocked_by: null
 created: '2026-09-20T12:26:32'
-updated: '2026-09-20T12:26:32'
-closed: null
+updated: '2026-09-20T13:56:12'
+closed: '2026-09-20T13:56:12'
 ---
 
 ## Description
@@ -31,3 +31,4 @@ Name collision to be aware of, not to avoid: 'arbite status' (this command) sits
 Acceptance: arbite status prints every status with its count and a total; --json round-trips; filters narrow the counts.
 
 ## Notes
+- 2026-09-20T13:56:12 zoo.orch.001: Added arbite status: per-status counts in STATUSES order including zeros, plus a total; --json mapping + total; --epic/--domain/--tier/--assignee filters; counts reuse the same implementation as sink info and reconcile with list (bucketed tickets are out of the status workflow); exit 0 always; help text distinguishes it from set status / --status / sink info
