@@ -1,1 +1,1 @@
-sink: sqlite
+sink: file
