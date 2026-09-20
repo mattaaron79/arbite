@@ -1,7 +1,7 @@
 ---
 id: tic-3b55
 title: Add raw/processed/ snapshot area, excluded from the ticket scan
-status: open
+status: closed
 type: feature
 tier: medium
 domain: sinks
@@ -15,8 +15,8 @@ assignee: null
 depends_on: []
 blocked_by: null
 created: '2026-09-20T12:25:32'
-updated: '2026-09-20T12:25:32'
-closed: null
+updated: '2026-09-20T12:40:14'
+closed: '2026-09-20T12:40:14'
 ---
 
 ## Description
@@ -34,3 +34,4 @@ Snapshot filenames carry a suffix that cannot collide with a ticket filename (ID
 Acceptance: a snapshot under raw/processed/ is invisible to list, fetch, doctor and the id index, while the promoted ticket of the same id lives normally in open/.
 
 ## Notes
+- 2026-09-20T12:40:14 zoo.orch.001: Added raw/processed/ snapshot area excluded from the scan by path; snapshot convention <id>.raw.md exposed as reusable file-sink helpers for the future promote command

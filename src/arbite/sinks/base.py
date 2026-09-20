@@ -154,7 +154,7 @@ class TicketSink(ABC):
     #: docs use to decide whether to explain the folder rule.
     status_is_location: bool = False
     #: True when the sink can file a ticket somewhere other than its status
-    #: location (the file sink's wishlist/ and planning/ folders).
+    #: location (the file sink's wishlist/ and plans/ folders).
     supports_buckets: bool = False
 
     # ------------------------------------------------------------------

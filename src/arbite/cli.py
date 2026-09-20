@@ -49,7 +49,7 @@ def _split_csv(value):
 
 def _status_list(value):
     """argparse type for --status: a single status or a comma-separated list of
-    them, e.g. 'open' or 'open,in_progress'. Validated here so an unknown status
+    them, e.g. 'open' or 'open,in_progress,review'. Validated here so an unknown status
     is an argparse error (exit 2) naming the valid values, rather than a filter
     that silently matches nothing. The result is always a list, and an empty
     value means 'no status filter'."""
@@ -79,7 +79,7 @@ def _sink_flag(parser, suppress=True):
         choices=SINK_KINDS,
         default=argparse.SUPPRESS if suppress else None,
         help=f"which storage to use for this command: {', '.join(SINK_KINDS)} "
-        "(default: the 'sink:' key in arbite.yaml, else file)",
+        "(default: the 'sink:' key in .arbite/project.yaml, else file)",
     )
 
 
@@ -164,7 +164,7 @@ def _warn_about_an_unused_database(args, sink) -> None:
         print(
             f"note: {database} exists but no sink is configured, so this command used "
             f"the '{config.DEFAULT_SINK_KIND}' sink instead -- pass --sink sqlite, set "
-            f"{config.ENV_SINK}=sqlite, or add 'sink: sqlite' to arbite.yaml",
+            f"{config.ENV_SINK}=sqlite, or add 'sink: sqlite' to .arbite/project.yaml",
             file=sys.stderr,
         )
 
@@ -228,12 +228,13 @@ def cmd_init(args):
     agent-facing command reference.
 
     Which sink it creates is decided exactly like every other command decides --
-    `--sink`, then `ARBITE_SINK`, then `sink:` in arbite.yaml, then file -- so
-    setting up a SQLite project is one flag, not a different command. The store it
-    creates then becomes the project default: `sink:` is written to arbite.yaml
-    (created if missing), so later commands -- including ones an agent runs with no
-    flags -- read the same store. An `ARBITE_SINK` selection is treated as
-    this-process-only and reported rather than written into committed config."""
+    `--sink`, then `ARBITE_SINK`, then `sink:` in .arbite/project.yaml, then file --
+    so setting up a SQLite project is one flag, not a different command. The store
+    it creates then becomes the project default: `sink:` is written to
+    .arbite/project.yaml (the directory and the file created if missing), so later
+    commands -- including ones an agent runs with no flags -- read the same store.
+    An `ARBITE_SINK` selection is treated as this-process-only and reported rather
+    than written into committed config."""
     spec, project_root = _cwd_sink(args)
     arbite_dir = project_root / config.ARBITE_DIRNAME
     arbite_dir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +251,7 @@ def cmd_init(args):
     agent_ids = config.load_known_agent_ids(project_root)
     if not agent_ids:
         print(
-            "no agents configured (add an 'agents:' list to arbite.yaml to "
+            "no agents configured (add an 'agents:' list to .arbite/project.yaml to "
             "pre-create scratchpads)"
         )
     else:
@@ -355,7 +356,7 @@ def cmd_sink(args):
     # exists; `sink info` is where they look to ask what is going on.
     print(
         f"available sinks: {', '.join(SINK_KINDS)} (choose one with --sink, "
-        f"{config.ENV_SINK}, or a 'sink:' key in arbite.yaml)"
+        f"{config.ENV_SINK}, or a 'sink:' key in .arbite/project.yaml)"
     )
     if info.details:
         for key, value in sorted(info.details.items()):
@@ -383,6 +384,11 @@ def cmd_create(args):
             )
     if args.priority is not None and args.priority < 1:
         raise TicketError("--priority must be a positive integer (lower = more urgent)")
+    # `--references` is validated like any other settable field (tags/depends_on
+    # are freeform, but a reference is a path under the arbite root, so a bad one
+    # -- absolute or escaping with '..' -- is refused up front).
+    if args.references:
+        schema.validate_field("references", args.references)
 
     sink = _require_sink(args)
     now = schema.now()
@@ -403,6 +409,7 @@ def cmd_create(args):
         tags=_split_csv(args.tags),
         assignee=None,
         depends_on=_split_csv(args.depends_on),
+        references=_split_csv(args.references),
         blocked_by=None,
         created=now,
         updated=now,
@@ -841,11 +848,13 @@ def _print_tree(scope, roots):
 
 
 def cmd_claim(args):
-    """Claim a ticket for an agent. Claiming is a compare-and-swap, not a
-    blind write: a ticket already assigned to somebody else is refused unless
-    --force, and the write carries the expectation that the ticket is still in
-    the state it was read in, so two agents racing for the same ticket can't
-    both come away believing they own it."""
+    """Claim a ticket for an agent: this sets `status` to `in_progress` and the
+    assignee in the same write (on the file sink the ticket is filed under
+    `in_progress/`), so no separate `set status` call is needed. Claiming is a
+    compare-and-swap, not a blind write: a ticket already assigned to somebody
+    else is refused unless --force, and the write carries the expectation that
+    the ticket is still in the state it was read in, so two agents racing for
+    the same ticket can't both come away believing they own it."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     previous = t.assignee
@@ -940,6 +949,16 @@ def cmd_close(args):
 
 
 def cmd_reopen(args):
+    """Reopen a ticket that is not currently open, recording why it was rejected.
+
+    The reason is required and is the point of the command: reopening is the
+    rejection path back out of review (or out of closed/blocked/shelved), and a
+    rejection with no stated reason is useless to whoever has to act on it.
+    --reason is enforced by argparse, so a bare `arbite reopen <id>` fails before
+    any of this runs, and the note it writes is exactly 'Reopened: <reason>.'
+    (timestamped and attributed like every other automatic note). The ticket goes
+    back to open with its closed date and any block reason cleared; a ticket that
+    is already open is still refused."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     if t.status == "open":
@@ -949,7 +968,7 @@ def cmd_reopen(args):
     t.blocked_by = None
     t.status = "open"
     t.updated = schema.now()
-    schema.append_note(t, args.agent, "Reopened.")
+    schema.append_note(t, args.agent, f"Reopened: {args.reason}.")
     sink.update(t, expect=expect)
     print(f"reopened {t.id} -> {sink.location(t.id)}")
 
@@ -1079,19 +1098,19 @@ def cmd_move(args):
     """File a ticket somewhere other than its status location, or bring it back.
 
     `<folder>` is root-relative, and what it means is the sink's business: the
-    file sink moves the ticket's file (a folder, created if missing), the SQLite
-    sink records a bucket. '/' returns the ticket to where its status says it
-    belongs, which is the only way to un-file a ticket without changing its
-    status. Nothing here changes a field -- use the status commands
-    (claim/block/close/...) for moves that are state changes, which also un-file
-    the ticket automatically."""
+    file sink moves the ticket's file (`/plans` files it under a folder, created
+    if missing; `/plans/ideas` nests one), the SQLite sink records a bucket.
+    '/' returns the ticket to where its status says it belongs, which is the only
+    way to un-file a ticket without changing its status. Nothing here changes a
+    field -- use the status commands (claim/block/close/...) for moves that are
+    state changes, which also un-file the ticket automatically."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
 
     folder = args.folder.strip()
     if not folder.startswith("/"):
         raise TicketError(
-            f"<folder> must be a root-relative path like '/wishlist', or '/' to return "
+            f"<folder> must be a root-relative path like '/plans', or '/' to return "
             f"the ticket to its status location, got '{args.folder}'"
         )
     # Root-relative -> bucket name, dropping empty/'.' segments and refusing '..'
@@ -1113,11 +1132,11 @@ def cmd_move(args):
 def cmd_set(args):
     """Set one or more ticket properties on an existing ticket. Properties come in
     PROPERTY VALUE pairs (any number per call); quote any value that spans more
-    than one word. Type-aware: 'tags'/'depends_on' are comma-separated lists,
-    'priority' must be an integer, and an empty quoted value ('') clears a field.
-    A 'status' change also un-files the ticket (the file sink moves it) so status
-    and location stay in sync, and auto-dates 'closed' when a ticket is set to
-    closed."""
+    than one word. Type-aware: 'tags'/'depends_on'/'references' are
+    comma-separated lists, 'priority' must be an integer, and an empty quoted
+    value ('') clears a field. A 'status' change also un-files the ticket (the
+    file sink moves it) so status and location stay in sync, and auto-dates
+    'closed' when a ticket is set to closed."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     assignments = args.assignments
@@ -1400,10 +1419,10 @@ def build_parser():
         "auto-discovered -- point your project's CLAUDE.md or similar at it explicitly if you "
         "want agents to find arbite, or pass --agents-doc/--claude-doc to have the instructions "
         "block installed into those files for you), and pre-create a scratchpad file under .arbite/agents/ "
-        "for every id listed in an 'agents:' list in ./arbite.yaml, if present. Which sink is "
+        "for every id listed in an 'agents:' list in .arbite/project.yaml, if present. Which sink is "
         "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
-        "in ./arbite.yaml, then file. The store it creates then becomes the project default -- "
-        "'sink:' is written to arbite.yaml, created if it does not exist, so no later command "
+        "in .arbite/project.yaml, then file. The store it creates then becomes the project default -- "
+        "'sink:' is written to .arbite/project.yaml, created if it does not exist, so no later command "
         "reads a different store by accident (an ARBITE_SINK selection is reported instead, "
         "since that was this process's decision rather than the project's). Running it again is "
         "safe: it never destroys data.",
@@ -1432,7 +1451,7 @@ def build_parser():
         description="Report which sink is in use, where its store lives, and what it supports "
         "(status_is_location, buckets, per-status ticket counts), or with 'init' create the "
         "store for the selected sink. The sink is chosen by --sink, then ARBITE_SINK, then a "
-        "'sink:' key in arbite.yaml, then the default (file).",
+        "'sink:' key in .arbite/project.yaml, then the default (file).",
     )
     p_sink.add_argument(
         "subcommand",
@@ -1485,6 +1504,11 @@ def build_parser():
     )
     p_create.add_argument(
         "--depends-on", default="", help="comma-separated ticket ids that must close before this one, e.g. 'tic-a1b2,tic-c3d4'"
+    )
+    p_create.add_argument(
+        "--references", default="", help="comma-separated plan documents under the arbite root's plans/ bucket, "
+        "stored root-relative -- e.g. 'plans/review-workflow.md' (.arbite/plans/review-workflow.md), not a "
+        "repo-root path; the referenced file need not exist yet"
     )
     p_create.add_argument("--description", default="", help="free-text body under the '## Description' heading")
     p_create.add_argument(
@@ -1580,7 +1604,7 @@ def build_parser():
         default=[],
         metavar="STATUS",
         help="filter by status; a comma-separated list matches any of them, "
-        "e.g. 'open,in_progress'",
+        "e.g. 'open,in_progress,review'",
     )
     p_list.add_argument(
         "--tier",
@@ -1676,7 +1700,7 @@ def build_parser():
         default=[],
         metavar="STATUS",
         help="only search tickets with these statuses (default: all statuses); a "
-        "comma-separated list matches any of them, e.g. 'open,in_progress'",
+        "comma-separated list matches any of them, e.g. 'open,in_progress,review'",
     )
     search_mode = p_search.add_mutually_exclusive_group()
     search_mode.add_argument(
@@ -1703,12 +1727,16 @@ def build_parser():
 
     p_claim = sub.add_parser(
         "claim",
-        help="claim a ticket: assign it and mark it in progress",
-        description="Set a ticket's assignee, status and updated together. The claim is a "
-        "compare-and-swap: a ticket already assigned to another agent is refused unless "
-        "--force, and the write only lands if the ticket is still in the state it was read "
-        "in, so two agents racing for the same ticket cannot both end up believing they own "
-        "it. (Identity assignment and liveness remain the agent harness's job.)",
+        help="claim a ticket: assign it and set its status to in_progress (the file sink "
+        "moves it to in_progress/), so no separate status call is needed",
+        description="Set a ticket's assignee, status and updated together: claiming sets "
+        "status to 'in_progress' and the assignee in one write (the file sink files the "
+        "ticket under in_progress/), so a caller never needs a separate 'set status' after "
+        "claiming. The claim is a compare-and-swap: a ticket already assigned to another "
+        "agent is refused unless --force, and the write only lands if the ticket is still "
+        "in the state it was read in, so two agents racing for the same ticket cannot both "
+        "end up believing they own it. (Identity assignment and liveness remain the agent "
+        "harness's job.)",
     )
     p_claim.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_claim.add_argument("--agent", required=True, help="agent id claiming the ticket, e.g. claude.haiku.001 (required)")
@@ -1792,12 +1820,21 @@ def build_parser():
 
     p_reopen = sub.add_parser(
         "reopen",
-        help="reopen a ticket (back to the open status)",
+        help="reopen a ticket (back to the open status); --reason is required",
         description="Set a ticket that is not currently open back to open: clear its "
-        "closed date and block reason, append an automatic 'Reopened' note, and update "
-        "status/updated.",
+        "closed date and block reason, append an automatic 'Reopened: <reason>.' note, and "
+        "update status/updated. --reason is required, and deliberately so: reopening is the "
+        "rejection path out of review, and a rejection with no stated reason is useless to "
+        "whoever has to act on it, so a bare 'arbite reopen <id>' is an error. A ticket that "
+        "is already open is refused.",
     )
     p_reopen.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_reopen.add_argument(
+        "--reason",
+        required=True,
+        help="why it is being reopened -- the reason it was rejected, recorded verbatim "
+        "in the automatic note as 'Reopened: <reason>.', e.g. 'tests fail on ARM' (required)",
+    )
     p_reopen.add_argument(
         "--agent",
         default="system",
@@ -1892,10 +1929,10 @@ def build_parser():
 
     p_move = sub.add_parser(
         "move",
-        help="file a ticket in a bucket (e.g. /wishlist), or '/' to un-file it",
+        help="file a ticket in a bucket (e.g. /plans), or '/' to un-file it",
         description="File a ticket somewhere other than its status location, without changing "
-        "any field. <folder> is root-relative: '/wishlist' files it in the wishlist bucket, "
-        "'/planning/ideas' in a nested one, and '/' returns it to wherever its status says it "
+        "any field. <folder> is root-relative: '/plans' files it in the plans bucket, "
+        "'/plans/ideas' in a nested one, and '/' returns it to wherever its status says it "
         "belongs. What a bucket physically is depends on the sink: a folder under the arbite "
         "root for the file sink (created if missing), a recorded bucket for the SQLite sink. "
         "This is deliberately not a state change, so a status command (claim/close/block/...) "
@@ -1906,7 +1943,7 @@ def build_parser():
     p_move.add_argument(
         "folder",
         metavar="FOLDER",
-        help="root-relative destination, e.g. '/wishlist', or '/' to return the ticket to "
+        help="root-relative destination, e.g. '/plans', or '/' to return the ticket to "
         "its status location",
     )
     _sink_flag(p_move)
@@ -1917,10 +1954,11 @@ def build_parser():
         help="set one or more ticket properties",
         description="Set one or more ticket properties on an existing ticket. Properties "
         "are given as PROPERTY VALUE pairs and any number can be set in one call; quote "
-        "any value that spans more than one word. Type-aware: 'tags' and 'depends_on' "
-        "are comma-separated lists, 'priority' must be an integer, and an empty quoted "
-        "value ('') clears a field. If 'status' is set, the ticket is re-filed to match "
-        "(moving to 'closed' auto-dates 'closed'). 'id' is structural and cannot be set.",
+        "any value that spans more than one word. Type-aware: 'tags', 'depends_on' and "
+        "'references' are comma-separated lists, 'priority' must be an integer, and an "
+        "empty quoted value ('') clears a field. If 'status' is set, the ticket is "
+        "re-filed to match (moving to 'closed' auto-dates 'closed'). 'id' is structural "
+        "and cannot be set.",
     )
     p_set.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_set.add_argument(

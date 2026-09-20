@@ -57,7 +57,35 @@ def execute(db_path, sql, params=()):
 def test_init_creates_the_schema_and_records_its_version(sqlite_sink, db_path):
     assert sqlite_sink.schema_version() == SCHEMA_VERSION
     tables = {r["name"] for r in rows(db_path, "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"tickets", "ticket_tags", "ticket_deps", "ticket_notes", "schema_version"} <= tables
+    assert {
+        "tickets",
+        "ticket_tags",
+        "ticket_deps",
+        "ticket_references",
+        "ticket_notes",
+        "schema_version",
+    } <= tables
+
+
+def test_the_schema_version_records_the_current_vocabulary(sqlite_sink, db_path):
+    """Version 2 recorded `review` joining `schema.STATUSES`; version 3 added the
+    `references` list field and its normalized table. Neither changed the `tickets`
+    columns, so no migration is written -- a fresh store states the current version
+    and that is checked against the module constant."""
+    assert SCHEMA_VERSION == 3
+    assert sqlite_sink.schema_version() == 3
+    assert rows(db_path, "SELECT version FROM schema_version") == [{"version": 3}]
+
+
+def test_an_older_schema_version_is_reported_not_migrated(sqlite_sink, db_path):
+    """Doctor's job here is to *report* the mismatch -- there is no migration to
+    run, so `fix` has nothing to change and the store keeps saying 1."""
+    execute(db_path, "UPDATE schema_version SET version = 1")
+    problems = [p for p in sqlite_sink.check() if p.kind == "schema_version"]
+    assert len(problems) == 1
+    assert "1" in problems[0].detail and "3" in problems[0].detail
+    assert sqlite_sink.check(fix=True)
+    assert sqlite_sink.schema_version() == 1, "no migration is written"
 
 
 def test_init_is_idempotent_and_keeps_data(sqlite_sink, db_path):
@@ -116,14 +144,32 @@ def test_tags_and_dependencies_become_rows_in_order(sqlite_sink, db_path):
     assert [(d["dep_id"], d["ordinal"]) for d in deps] == [("tic-c", 0), ("tic-a", 1)]
 
 
+def test_references_become_rows_in_order(sqlite_sink, db_path):
+    sqlite_sink.create(make_ticket("tic-a1b2", references=["plans/b.md", "plans/a.md"]))
+    refs = rows(
+        db_path,
+        "SELECT ref_path, ordinal FROM ticket_references WHERE ticket_id = 'tic-a1b2' "
+        "ORDER BY ordinal",
+    )
+    assert [(r["ref_path"], r["ordinal"]) for r in refs] == [("plans/b.md", 0), ("plans/a.md", 1)]
+
+
 def test_an_update_rewrites_the_child_rows_rather_than_appending(sqlite_sink, db_path):
-    sqlite_sink.create(make_ticket("tic-a1b2", tags=["a", "b"], depends_on=["tic-b"]))
+    sqlite_sink.create(
+        make_ticket(
+            "tic-a1b2", tags=["a", "b"], depends_on=["tic-b"], references=["plans/a.md"]
+        )
+    )
     ticket = sqlite_sink.get("tic-a1b2")
     ticket.tags = ["c"]
     ticket.depends_on = []
+    ticket.references = ["plans/z.md"]
     sqlite_sink.update(ticket)
     assert [r["tag"] for r in rows(db_path, "SELECT tag FROM ticket_tags")] == ["c"]
     assert rows(db_path, "SELECT * FROM ticket_deps") == []
+    assert [r["ref_path"] for r in rows(db_path, "SELECT ref_path FROM ticket_references")] == [
+        "plans/z.md"
+    ]
 
 
 def test_notes_are_indexed_from_the_body(sqlite_sink, db_path):
@@ -195,10 +241,12 @@ def test_orphaned_index_rows_are_reported_and_removed(sqlite_sink, db_path):
 
 
 def test_removing_a_ticket_cascades_to_its_rows(sqlite_sink, db_path):
-    sqlite_sink.create(make_ticket("tic-a1b2", tags=["x"], depends_on=["tic-b"]))
+    sqlite_sink.create(
+        make_ticket("tic-a1b2", tags=["x"], depends_on=["tic-b"], references=["plans/a.md"])
+    )
     sqlite_sink.add_note("tic-a1b2", "claude.haiku.001", "note")
     sqlite_sink.remove("tic-a1b2")
-    for table in ("ticket_tags", "ticket_deps", "ticket_notes"):
+    for table in ("ticket_tags", "ticket_deps", "ticket_references", "ticket_notes"):
         assert rows(db_path, f"SELECT * FROM {table}") == []
 
 

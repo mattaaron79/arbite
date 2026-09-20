@@ -456,3 +456,69 @@ def test_location_is_a_stable_string_that_names_the_ticket(sink, populated):
 
 def test_storage_locations_lists_every_copy(sink, populated):
     assert populated.storage_locations("tic-a1b2") == [populated.location("tic-a1b2")]
+
+
+# --- the status vocabulary --------------------------------------------------
+
+
+def test_review_round_trips_validates_and_renders(sink):
+    """`review` is a first-class status, so it must behave like any other one:
+    create/get returns it, a status query selects exactly it, integrity checking
+    is clean, and the rendered text re-parses byte-for-byte. Nothing below is
+    review-specific except the value -- which is the point."""
+    sink.create(make_ticket("tic-a1b2", status="review"))
+    assert sink.get("tic-a1b2").status == "review"
+    assert [t.id for t in sink.query(TicketQuery(status="review"))] == ["tic-a1b2"]
+    assert sink.check() == []
+
+    text = sink.render(sink.get("tic-a1b2"))
+    reparsed = parse_ticket(text)
+    assert reparsed.to_markdown() == text
+    assert reparsed.status == "review"
+
+
+# --- the references field ---------------------------------------------------
+
+
+def test_references_absent_renders_no_line_and_reads_back_empty(sink):
+    """A ticket with no references is byte-for-byte what it was before the field
+    existed: no `references:` line at all, and a read yields an empty list."""
+    sink.create(make_ticket("tic-a1b2"))
+    text = sink.render(sink.get("tic-a1b2"))
+    assert "references" not in text
+    assert sink.get("tic-a1b2").references == []
+
+
+def test_references_empty_is_rendered_as_absent(sink):
+    """Absent and empty are deliberately indistinguishable: an explicit empty list
+    is never re-emitted, and it reads back as an empty list."""
+    sink.create(make_ticket("tic-a1b2", references=[]))
+    text = sink.render(sink.get("tic-a1b2"))
+    assert "references" not in text
+    assert sink.get("tic-a1b2").references == []
+
+
+def test_references_single_round_trips(sink):
+    sink.create(make_ticket("tic-a1b2", references=["plans/review-workflow.md"]))
+    got = sink.get("tic-a1b2")
+    assert got.references == ["plans/review-workflow.md"]
+    text = sink.render(got)
+    assert parse_ticket(text).references == ["plans/review-workflow.md"]
+    assert parse_ticket(text).to_markdown() == text
+
+
+def test_references_multiple_preserve_order(sink):
+    refs = ["plans/b.md", "plans/a.md", "plans/nested/c.md"]
+    sink.create(make_ticket("tic-a1b2", references=refs))
+    assert sink.get("tic-a1b2").references == refs
+    text = sink.render(sink.get("tic-a1b2"))
+    assert parse_ticket(text).references == refs
+    assert parse_ticket(text).to_markdown() == text
+
+
+def test_references_renders_immediately_after_depends_on(sink):
+    """The stored position is pinned: `references` follows `depends_on`, and only
+    appears at all when it is non-empty."""
+    sink.create(make_ticket("tic-a1b2", depends_on=["tic-zzzz"], references=["plans/a.md"]))
+    text = sink.render(sink.get("tic-a1b2"))
+    assert "depends_on:\n- tic-zzzz\nreferences:\n- plans/a.md\n" in text

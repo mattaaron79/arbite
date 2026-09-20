@@ -11,7 +11,15 @@ Two jobs that both come down to "find the thing, or say clearly what is missing"
   every command works from a subdirectory of the repo;
 - resolve the *sink* -- the storage implementation tickets live in -- from, in
   order of precedence: the `--sink` flag, the `ARBITE_SINK` environment variable,
-  the `sink:` key in `arbite.yaml`, then the default (`file`).
+  the `sink:` key in `.arbite/project.yaml`, then the default (`file`).
+
+The config file lives *inside* the directory it is found relative to: resolution
+runs through `find_arbite_dir`/`find_project_root` and then reads `project.yaml`
+inside that `.arbite/`, never the other way round. The old repo-root names
+(`arbite.yaml`, `.arbite.yaml`) are not consulted at all -- no fallback, no
+deprecation warning, no migration: a project that still has only one of those
+behaves exactly as if it had no config, so `config_path()` returning None has to
+lead to sane defaults rather than a crash.
 
 Agent identity assignment and collision detection remain out of scope: this only
 reads a static list of known ids so `arbite init` can create scratchpads for them.
@@ -30,7 +38,10 @@ import yaml
 from .errors import SinkNotInitialised, TicketError
 from .sinks import DEFAULT_SINK_KIND, SINK_KINDS, SinkSpec, build_sink, default_location
 
-CONFIG_FILENAMES = ["arbite.yaml", ".arbite.yaml"]
+#: The one config file, and the only place a project's committed choices live:
+#: `project.yaml` inside the located `.arbite/` directory. Named in the singular
+#: because there is no search order any more -- see the module docstring.
+CONFIG_FILENAME = "project.yaml"
 
 ARBITE_DIRNAME = ".arbite"
 
@@ -61,15 +72,20 @@ def find_project_root(start: Optional[Path] = None) -> Path:
 
 
 def config_path(project_root: Path) -> Optional[Path]:
-    for name in CONFIG_FILENAMES:
-        candidate = project_root / name
-        if candidate.is_file():
-            return candidate
+    """The project's config file, or None when there isn't one.
+
+    Looks in exactly one place -- `<project_root>/.arbite/project.yaml` -- and
+    reports its absence rather than creating anything: a project with no `.arbite/`
+    directory yet is a "no config" answer, not a state to fix here.
+    """
+    candidate = project_root / ARBITE_DIRNAME / CONFIG_FILENAME
+    if candidate.is_file():
+        return candidate
     return None
 
 
 def load_config(project_root: Path) -> dict:
-    """The project's arbite.yaml/.arbite.yaml as a dict ({} when absent).
+    """The project's .arbite/project.yaml as a dict ({} when absent).
 
     A malformed config is reported rather than ignored: silently falling back to
     the default sink would send tickets to the wrong store."""
@@ -115,7 +131,7 @@ def sink_spec(
         raise TicketError(
             f"unknown sink '{kind}' (valid: {', '.join(SINK_KINDS)}); choose one with "
             f"--sink, the {ENV_SINK} environment variable, or a 'sink:' key in "
-            "arbite.yaml"
+            f"{ARBITE_DIRNAME}/{CONFIG_FILENAME}"
         )
 
     options = {}
@@ -141,11 +157,17 @@ def set_configured_sink(kind: str, project_root: Optional[Path] = None) -> Path:
     like an empty one, which is the one failure this project cannot afford to leave
     silently available.
 
-    The file is edited line by line rather than re-dumped from YAML, so a
-    hand-maintained `arbite.yaml` keeps its comments, key order and anything else in
-    it (`agents:`, per-sink locations). The write is atomic."""
+    Writes `<project_root>/.arbite/project.yaml`, creating the `.arbite/` directory
+    and the file when they do not exist yet -- so this is also what turns a project
+    with no config into a configured one. The file is edited line by line rather
+    than re-dumped from YAML, so a hand-maintained `project.yaml` keeps its
+    comments, key order and anything else in it (`agents:`, per-sink locations).
+    The write is atomic."""
     project_root = project_root or find_project_root()
-    path = config_path(project_root) or (project_root / CONFIG_FILENAMES[0])
+    path = config_path(project_root) or (
+        project_root / ARBITE_DIRNAME / CONFIG_FILENAME
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
     line = f"sink: {kind}"
     if path.is_file():
         lines = path.read_text(encoding="utf-8").splitlines()

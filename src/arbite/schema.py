@@ -22,7 +22,13 @@ import yaml
 
 from .errors import TicketError
 
-STATUSES = ["raw", "open", "in_progress", "blocked", "shelved", "closed"]
+# The canonical status vocabulary *and order*: this list is the single source
+# every other status ordering derives from -- the file sink's folder set, the
+# rendered docs, and the `--status` choices all come from here. "review" sits
+# between "in_progress" and "blocked" as the finished-awaiting-review state; no
+# command sets it by default, so it is reached through `arbite set ... status
+# review`.
+STATUSES = ["raw", "open", "in_progress", "review", "blocked", "shelved", "closed"]
 
 # Controlled vocabularies. `type` includes "memo" and "wish" because `arbite
 # raw memo` and `arbite raw wish` mint them; `create` deliberately does not
@@ -77,6 +83,12 @@ FIELD_ORDER = [
     "tags",
     "assignee",
     "depends_on",
+    # `references` sits immediately after `depends_on`, the field it most
+    # resembles (a comma-separated list), so the rendered frontmatter keeps it
+    # there when it is present. Unlike `depends_on` it is omitted entirely when
+    # empty (see `to_markdown`), so a ticket with no references renders exactly
+    # as it did before this field existed.
+    "references",
     "blocked_by",
     "created",
     "updated",
@@ -246,6 +258,10 @@ class Ticket:
     tags: list = field(default_factory=list)
     assignee: Optional[str] = None
     depends_on: list = field(default_factory=list)
+    # Root-relative plan documents under the arbite dir's `plans/` bucket, e.g.
+    # "plans/review-workflow.md" (== .arbite/plans/review-workflow.md). Never
+    # repo-root paths, and the referenced file need not exist yet.
+    references: list = field(default_factory=list)
     blocked_by: Optional[str] = None
     created: str = ""
     updated: str = ""
@@ -275,10 +291,20 @@ class Ticket:
     def to_markdown(self) -> str:
         """The ticket's canonical text form. Identical across sinks: the file
         sink writes exactly this to disk, and `arbite show` prints exactly this
-        regardless of where the ticket is stored."""
+        regardless of where the ticket is stored.
+
+        `references` is omitted entirely when empty, so absent and empty are
+        indistinguishable in the stored form: a ticket with no references stays
+        byte-for-byte what it was before the field existed, and an explicit
+        `references: []` in a hand-written file parses back to an empty list and
+        is never re-emitted. This deliberately differs from `depends_on`, which
+        always renders `[]`; that output is pinned by tests and not changed."""
         data = {}
         for name in FIELD_ORDER:
-            data[name] = getattr(self, name)
+            value = getattr(self, name)
+            if name == "references" and not value:
+                continue
+            data[name] = value
         front = yaml.safe_dump(data, sort_keys=False, default_flow_style=False, allow_unicode=True)
         return f"---\n{front}---\n\n{self.body.strip()}\n"
 
@@ -305,7 +331,7 @@ def parse_ticket(text: str) -> Ticket:
         raise TicketError("ticket frontmatter must be a YAML mapping of field: value")
     known = {f.name for f in fields(Ticket)}
     kwargs = {k: v for k, v in data.items() if k in known}
-    for k in ("tags", "depends_on"):
+    for k in ("tags", "depends_on", "references"):
         if kwargs.get(k) is None:
             kwargs[k] = []
     try:
@@ -456,7 +482,50 @@ CLEARABLE_TEXT_FIELDS = {"epic", "assignee", "blocked_by", "closed"}
 SEARCH_FIELDS = set(FIELD_ORDER) | {"body"}
 
 
-def validate_field(prop: str, value: str) -> None:
+def _reference_entries(value):
+    """The entries of a `references` value: a comma-separated string (the CLI
+    form, matching `coerce_field_value`) or an already-parsed list. Anything
+    else -- an int, a dict, a nested list -- is a value nothing in arbite
+    writes, so it is reported rather than coerced."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [] if value == "" else [v.strip() for v in value.split(",") if v.strip()]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise TicketError(
+        f"references must be a list of strings, got {type(value).__name__}: {value!r}"
+    )
+
+
+def validate_references(value) -> None:
+    """Validate a `references` value (a list, or its comma-separated CLI form).
+
+    Entries are plan documents under the arbite root's `plans/` bucket, stored
+    root-relative -- e.g. 'plans/review-workflow.md', which resolves to
+    .arbite/plans/review-workflow.md -- and deliberately *not* repo-root paths.
+    Each entry must be a non-empty string that stays under the arbite root, so
+    absolute paths and '..' segments are refused. The referenced file is NOT
+    required to exist: a ticket may reference a plan that has not been written
+    yet."""
+    for entry in _reference_entries(value):
+        if not isinstance(entry, str):
+            raise TicketError(f"references entries must be strings, got {entry!r}")
+        if entry == "":
+            raise TicketError("references may not contain an empty entry")
+        if entry.startswith("/"):
+            raise TicketError(
+                "references must be root-relative to the arbite dir, e.g. "
+                f"'plans/review-workflow.md', not an absolute path: '{entry}'"
+            )
+        if ".." in entry.split("/"):
+            raise TicketError(
+                f"references may not contain '..' (they must stay under the arbite "
+                f"root): '{entry}'"
+            )
+
+
+def validate_field(prop: str, value) -> None:
     """Reject values `arbite create` would never have produced.
 
     `set` is the one way to write any field by hand, so without this it is the
@@ -465,6 +534,9 @@ def validate_field(prop: str, value: str) -> None:
     filters that route work to agents. Shared by `set` and by every sink's
     integrity check so the two can never disagree about what is valid."""
     if value == "":
+        return
+    if prop == "references":
+        validate_references(value)
         return
     if prop == "status" and value not in STATUSES:
         raise TicketError(f"invalid status '{value}' (valid: {', '.join(STATUSES)})")
@@ -488,9 +560,9 @@ def validate_field(prop: str, value: str) -> None:
 
 def coerce_field_value(prop: str, value: str):
     """Convert a CLI string into the typed value a ticket property expects:
-    lists (tags/depends_on) are comma-split, priority is parsed as an int, and an
-    empty quoted value clears optional/list/int fields."""
-    if prop in ("tags", "depends_on"):
+    lists (tags/depends_on/references) are comma-split, priority is parsed as an
+    int, and an empty quoted value clears optional/list/int fields."""
+    if prop in ("tags", "depends_on", "references"):
         return [] if value == "" else [v.strip() for v in value.split(",") if v.strip()]
     if prop == "priority":
         return None if value == "" else int(value)

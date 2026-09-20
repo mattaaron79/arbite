@@ -1,7 +1,7 @@
 ---
 id: tic-89aa
 title: Make 'arbite reopen --reason' mandatory and record it
-status: open
+status: closed
 type: refactor
 tier: low
 domain: cli
@@ -15,8 +15,8 @@ assignee: null
 depends_on: []
 blocked_by: null
 created: '2026-09-20T12:25:55'
-updated: '2026-09-20T12:25:55'
-closed: null
+updated: '2026-09-20T12:54:21'
+closed: '2026-09-20T12:54:21'
 ---
 
 ## Description
@@ -29,3 +29,4 @@ Touches src/arbite/cli.py: cmd_reopen and p_reopen. Existing behaviour to preser
 Acceptance: bare reopen errors; reopen --reason 'tests fail on ARM' reopens the ticket with that text in the note.
 
 ## Notes
+- 2026-09-20T12:54:21 zoo.orch.001: Made reopen --reason mandatory (breaking); auto-note is now 'Reopened: <reason>.'; closed/blocked_by clearing and already-open refusal preserved; docs and tests updated

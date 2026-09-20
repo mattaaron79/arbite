@@ -183,6 +183,11 @@ FIELD_NOTES = {
     "tags": "freeform list, for human/codebase-area search -- distinct from domain",
     "assignee": "agent id currently working the ticket, e.g. claude.haiku.001, or null if unclaimed",
     "depends_on": "list of other ticket ids that must close first (structural)",
+    "references": "list of plan documents under the arbite root's `plans/` bucket, stored "
+    "root-relative -- e.g. 'plans/review-workflow.md' (== .arbite/plans/review-workflow.md), "
+    "*not* a repo-root path. The referenced file need not exist yet. Like `depends_on` it is a "
+    "comma-separated list, but it is rendered only when non-empty (a ticket with no references "
+    "has no `references:` line at all)",
     "blocked_by": "freeform reason OR a ticket id -- why it's stalled, only meaningful when "
     "status: blocked",
     "created": "creation timestamp (YYYY-MM-DDTHH:MM:SS); a bare YYYY-MM-DD also validates",
@@ -386,7 +391,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
             f"but a plain `arbite` command -- no `--sink`, no `ARBITE_SINK` -- reads the "
             f"`{sink_kind}` store at `{sink_root}` instead. Decide before running anything "
             f"that writes: either point the project at the other store (add `sink: "
-            f"{stale_kind}` to `arbite.yaml`, or pass `--sink {stale_kind}`), or bring its "
+            f"{stale_kind}` to `.arbite/project.yaml`, or pass `--sink {stale_kind}`), or bring its "
             f"tickets across with `arbite migrate --from {stale_kind} --to {sink_kind}`. "
             f"**The wrong store looks exactly like an empty one**, so if a command reports no "
             f"tickets, run `arbite sink info --json` and check its `kind` field before "
@@ -412,7 +417,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     )
     add(
         "- selection, highest precedence first: `--sink <kind>`, the `ARBITE_SINK` environment "
-        "variable, a `sink:` key in `arbite.yaml`, then the default (`file`)"
+        "variable, a `sink:` key in `.arbite/project.yaml`, then the default (`file`)"
     )
     add(
         "- that `sink:` key is the committed choice and is what makes one store stick for every "
@@ -429,25 +434,36 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         add("```")
         add(".arbite/")
         add("  raw/            unclassified captures -- not workable (see Triage)")
+        add("    processed/    snapshots of promoted captures -- audit copies, not tickets")
         add("  open/           actionable, unclaimed")
         add("  in_progress/    claimed, being worked")
+        add("  review/         finished, awaiting review")
         add("  blocked/        stalled -- see blocked_by")
         add("  shelved/        parked for later")
         add("  closed/YYYY-MM/ archived by close date")
         add("  wishlist/       reclassified wishes -- parked, not work")
-        add("  planning/       planning/roadmap notes and scratch docs -- not tickets")
+        add("  plans/          roadmap notes and scratch docs -- not tickets")
         add("  agents/         one scratchpad file per agent identity")
         add("```")
         add("")
         add(
             "The folders above are status *and* buckets. `raw/`, `open/`, `in_progress/`, "
-            "`blocked/`, `shelved/` and `closed/YYYY-MM/` are status folders: the ticket's "
+            "`review/`, `blocked/`, `shelved/` and `closed/YYYY-MM/` are status folders: the ticket's "
             "frontmatter `status` mirrors the folder, every state-changing command updates both at "
             "once, and when something outside arbite breaks the pairing the folder wins. "
-            "`wishlist/` and `planning/` are buckets, not statuses: a ticket filed in one is out of "
+            "`wishlist/` and `plans/` are buckets, not statuses: a ticket filed in one is out of "
             "the status workflow (so it is never offered by `list next`) but keeps whatever status "
             "it had. Filenames never change on a move, so `git log --follow` on a ticket file "
             "traces its whole lifecycle."
+        )
+        add("")
+        add(
+            "`raw/processed/` is the snapshot area: verbatim copies of raw captures that have "
+            "since been promoted, kept for audit as `<id>.raw.md` (e.g. "
+            "`raw/processed/tic-a1b2.raw.md`). A snapshot is **not** a ticket -- it deliberately "
+            "keeps its original `status: raw` frontmatter, and everything under the directory is "
+            "skipped by path rather than by status -- so it is invisible to `list`, `fetch`, "
+            "`doctor` and the id index, and an already-promoted request is never re-served."
         )
     else:
         add(
@@ -460,7 +476,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("")
     add(
         "**Buckets** are how a ticket is parked outside the status workflow -- `arbite move <id> "
-        "/wishlist` files it in the wishlist bucket, and `arbite move <id> /` brings it back to its "
+        "/plans` files it in the plans bucket, and `arbite move <id> /` brings it back to its "
         "status location. What a bucket physically is belongs to the sink (a folder in the file "
         "sink, a recorded bucket in a database sink), so no command depends on it."
     )
@@ -474,6 +490,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("")
     add(
         "These axes are independent -- don't collapse them: `depends_on` (structural ticket ids) vs "
+        "`references` (plan documents this ticket draws on, root-relative under `.arbite/`) vs "
         "`blocked_by` (freeform prose); `tier` (capability) vs `domain` (specialization) vs "
         "`priority` (urgency) -- an urgent low-tier chore is possible, and a low-tier ticket can "
         "still be audio_gen-only; `domain` (routing) vs `tags` (search). `epic` groups for filtering "
@@ -530,7 +547,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("arbite move tic-a1b2 /wishlist                          # file a reclassified wish")
     add("arbite move tic-a1b2 /                                 # ...and un-file it again")
     add("arbite show tic-a1b2                                    # read it in full")
-    add("arbite claim tic-a1b2 --agent claude.haiku.001          # take it")
+    add("arbite claim tic-a1b2 --agent claude.haiku.001          # take it (status -> in_progress)")
     add('arbite note tic-a1b2 claude.haiku.001 "progress"        # ...do the work, log progress...')
     add('arbite block tic-a1b2 --reason "waiting on tic-c3d4"    # if stalled')
     add("arbite unblock tic-a1b2 --agent claude.haiku.001        # blocker cleared")
@@ -538,7 +555,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add('arbite shelve tic-a1b2 --reason "parked for later"      # if deprioritized')
     add('arbite unshelve tic-a1b2 --reason "back in scope"       # bring it back to open')
     add("arbite close tic-a1b2                                   # when done")
-    add("arbite reopen tic-a1b2                                  # if it turns out not to be done")
+    add('arbite reopen tic-a1b2 --reason "tests fail on ARM"     # --reason is required')
     add("arbite sink info                                        # where do tickets live, and in what")
     add("arbite migrate --to sqlite                              # copy every ticket into another sink")
     add("```")
@@ -584,11 +601,14 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("")
     add(
         "**Claim in one step.** `arbite list next --claim <agent_id>` selects the most urgent workable "
-        "ticket *and* claims it in the same write. Prefer it to running `list next` then `claim`: "
-        "between those two commands another agent can take the ticket you were just handed, and you "
-        "would both work it. A plain `arbite claim` is likewise a compare-and-swap -- it fails if the "
-        "ticket is already assigned to someone else unless you pass `--force`, and it refuses to "
-        "write over a ticket that changed since it was read."
+        "ticket *and* claims it in the same write, and a plain `arbite claim <id> --agent <agent_id>` "
+        "does the same thing for a ticket you already know: either way, claiming sets `status: "
+        "in_progress` and the assignee together (on the file sink the ticket moves to `in_progress/`), "
+        "so do not follow a claim with a separate `set status`. Prefer `--claim` to running `list next` "
+        "then `claim`: between those two commands another agent can take the ticket you were just "
+        "handed, and you would both work it. Any claim is a compare-and-swap -- it fails if the ticket "
+        "is already assigned to someone else unless you pass `--force`, and it refuses to write over a "
+        "ticket that changed since it was read."
     )
     add("")
     add(
@@ -655,8 +675,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     )
     add("")
     add(
-        "**`arbite move <id> <folder>`** files a ticket outside the status workflow: `/wishlist` puts "
-        "it in the wishlist bucket, `/planning/ideas` in a nested one, and `/` returns it to its "
+        "**`arbite move <id> <folder>`** files a ticket outside the status workflow: `/plans` puts "
+        "it in the plans bucket, `/plans/ideas` in a nested one, and `/` returns it to its "
         "status location. It changes no field, so use the status commands (claim/block/close/...) for "
         "anything that should change state -- those un-file the ticket for you."
     )
@@ -691,10 +711,13 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "offers the ticket again; `unblock` clears `blocked_by` and returns the ticket to "
         "`in_progress` (`open` with `--open`), and is preferable to `arbite set status`, which would "
         "leave `blocked_by` populated and the ticket claiming to be stalled; `reopen` clears the "
-        "closed date and any block reason and `unshelve` clears the assignee and any block reason; "
+        "closed date and any block reason and requires `--reason`, which it records as 'Reopened: "
+        "<reason>.' -- it is the rejection path out of review, so a bare `arbite reopen` is an "
+        "error; `unshelve` clears the assignee and any block reason; "
         "`set` takes PROPERTY VALUE pairs (any number per call, quote multi-word values, `''` clears "
-        "a field), is type-aware (`tags`/`depends_on` comma-separated lists, `priority` an integer), "
-        "cannot set the structural `id`, and re-files the ticket when `status` changes; `depend` adds "
+        "a field), is type-aware (`tags`/`depends_on`/`references` comma-separated lists, `priority` "
+        "an integer), cannot set the structural `id`, and re-files the ticket when `status` changes; "
+        "`depend` adds "
         "a dependency (deduplicated), or with one argument clears them all; `search` matches a ticket "
         "if any selected field matches; `migrate` copies every ticket from one sink into another "
         "(the source is left alone); `delete` destroys a ticket and needs `--force`."

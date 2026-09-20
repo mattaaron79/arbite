@@ -1,7 +1,7 @@
 ---
 id: tic-ea0e
 title: Rename the 'planning' bucket to 'plans'
-status: open
+status: closed
 type: refactor
 tier: medium
 domain: sinks
@@ -16,8 +16,8 @@ assignee: null
 depends_on: []
 blocked_by: null
 created: '2026-09-20T12:25:32'
-updated: '2026-09-20T12:25:32'
-closed: null
+updated: '2026-09-20T12:36:36'
+closed: '2026-09-20T12:36:36'
 ---
 
 ## Description
@@ -34,3 +34,4 @@ Hard cut, consistent with the config move: 'planning' is not aliased. An existin
 Acceptance: arbite init creates .arbite/plans/ and not .arbite/planning/; arbite move tic-xxxx /plans files a ticket there.
 
 ## Notes
+- 2026-09-20T12:36:36 zoo.orch.001: Renamed default planning bucket to plans (hard cut, no alias); .gitignore anchored to /plans/ so .arbite/plans/ is tracked; docs/tests/README updated

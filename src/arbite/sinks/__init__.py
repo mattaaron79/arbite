@@ -2,7 +2,7 @@
 
 `build_sink()` is the single place a name ('file', 'sqlite') turns into an
 implementation, so a one-off `--sink`, the `ARBITE_SINK` environment variable and
-the `sink:` key in `arbite.yaml` all funnel through one validated lookup. An
+the `sink:` key in `.arbite/project.yaml` all funnel through one validated lookup. An
 unknown name is reported with the valid options instead of failing inside a
 stack trace.
 

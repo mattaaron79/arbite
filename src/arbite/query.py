@@ -225,7 +225,14 @@ def bucket_matches(bucket: Optional[str], wanted: tuple) -> bool:
 
 def sort_key(order: str, ticket: Ticket):
     """The canonical sort key for `order`. A sink that sorts in SQL must produce
-    the same sequence (see the conformance suite)."""
+    the same sequence (see the conformance suite).
+
+    `flat` orders by the status *label* first (alphabetically, not by workflow
+    position), then by urgency, then id -- `sqlite.ORDER_SQL["flat"]` mirrors
+    exactly that label ordering. The canonical status vocabulary/order lives in
+    `schema.STATUSES`, but flat listing is deliberately not a rank over it, so a
+    new status such as "review" needs no special case here: it simply sorts
+    where its label falls."""
     if order == "flat":
         return (ticket.status, ticket.priority_sort_key(), ticket.id)
     if order == "next":

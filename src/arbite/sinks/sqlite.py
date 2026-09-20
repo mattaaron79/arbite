@@ -10,8 +10,9 @@ What the schema buys:
 
 - `tickets` holds the scalar frontmatter fields, the markdown body and the bucket,
   so a query can be answered by SQL instead of by reading every ticket.
-- `ticket_tags` / `ticket_deps` normalize the two list fields, so `depends_on` is
-  a join rather than a string that has to be parsed back.
+- `ticket_tags` / `ticket_deps` / `ticket_references` normalize the list fields,
+  so `depends_on` and `references` are joins rather than strings that have to be
+  parsed back.
 - `ticket_notes` is a **derived index** of the `## Notes` section, not the
   authority for it: `body` stays the whole markdown body, exactly as a file sink
   holds it, and this table is rebuilt from it on every write by
@@ -43,19 +44,34 @@ from ..query import TicketQuery, sort_tickets
 from ..schema import FIELD_ORDER, Note, Ticket, parse_notes
 from .base import Expect, Problem, TicketSink, enforce_expect
 
-#: Bumped when the DDL changes in a way an existing database cannot satisfy as
-#: it stands. Stored in the database so `doctor` can tell an old store from a
-#: corrupt one.
-SCHEMA_VERSION = 1
+#: Bumped when the stored vocabulary/DDL changes in a way an existing database
+#: cannot satisfy as it stands. Stored in the database so `doctor` can tell an
+#: old store from a corrupt one.
+#:
+#: 2: the status vocabulary grew a value -- "review", between "in_progress" and
+#: "blocked" (see schema.STATUSES). The column type does not change, so no
+#: migration is written: a v1 store still opens and works, and `doctor` reports
+#: it as a version mismatch rather than pretending it is current.
+#: 3: the `references` list field (root-relative plan paths under the arbite
+#: dir, see schema.FIELD_ORDER) joined the schema and needs its own normalized
+#: table, `ticket_references`. The `tickets` columns are unchanged, so no
+#: migration is written either: a v1/v2 store still opens and works, and `doctor`
+#: reports the version mismatch rather than pretending it is current.
+SCHEMA_VERSION = 3
 
-# Scalar columns, in the schema's own field order minus the two list fields.
+# Scalar columns, in the schema's own field order minus the list fields.
 # `body` is a column as well but is deliberately NOT in FIELD_ORDER (it is the
 # freeform half of a ticket, not frontmatter), so the stored set has to be stated
 # explicitly rather than derived from FIELD_ORDER alone -- omitting it silently
 # stored empty bodies, which the sink round-trip test caught.
-SCALAR_FIELDS = tuple(f for f in FIELD_ORDER if f not in ("tags", "depends_on"))
+SCALAR_FIELDS = tuple(f for f in FIELD_ORDER if f not in ("tags", "depends_on", "references"))
 STORED_FIELDS = SCALAR_FIELDS + ("body",)
 
+# `status` is deliberately plain `TEXT` with no CHECK constraint: the vocabulary
+# is `schema.STATUSES`, validated by `schema.validate_field`/`validate_ticket`
+# above the sink, so a hand-edited status is *reported* by `doctor` rather than
+# rejected by the database -- otherwise `doctor` would mean something different
+# per sink (see the module docstring).
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -93,6 +109,13 @@ CREATE TABLE IF NOT EXISTS ticket_deps (
     PRIMARY KEY (ticket_id, dep_id)
 );
 
+CREATE TABLE IF NOT EXISTS ticket_references (
+    ticket_id TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    ref_path  TEXT NOT NULL,
+    ordinal   INTEGER NOT NULL,
+    PRIMARY KEY (ticket_id, ref_path)
+);
+
 CREATE TABLE IF NOT EXISTS ticket_notes (
     ticket_id TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
     ordinal   INTEGER NOT NULL,
@@ -106,6 +129,7 @@ CREATE INDEX IF NOT EXISTS tickets_status_idx   ON tickets(status, priority);
 CREATE INDEX IF NOT EXISTS tickets_epic_idx     ON tickets(epic);
 CREATE INDEX IF NOT EXISTS tickets_assignee_idx ON tickets(assignee);
 CREATE INDEX IF NOT EXISTS ticket_deps_dep_idx  ON ticket_deps(dep_id);
+CREATE INDEX IF NOT EXISTS ticket_references_ref_idx ON ticket_references(ref_path);
 """
 
 # Canonical ordering, expressed in SQL. These must place unset priorities last and
@@ -245,17 +269,25 @@ class SqliteSink(TicketSink):
                 "SELECT dep_id FROM ticket_deps WHERE ticket_id = ? ORDER BY ordinal", (tid,)
             )
         ]
+        refs = [
+            r["ref_path"]
+            for r in conn.execute(
+                "SELECT ref_path FROM ticket_references WHERE ticket_id = ? ORDER BY ordinal",
+                (tid,),
+            )
+        ]
         values = {name: row[name] for name in STORED_FIELDS}
-        return Ticket(tags=tags, depends_on=deps, **values)
+        return Ticket(tags=tags, depends_on=deps, references=refs, **values)
 
     def _write_children(self, conn, ticket: Ticket) -> None:
-        """Rewrite the tag, dependency and note rows for one ticket.
+        """Rewrite the tag, dependency, reference and note rows for one ticket.
 
         Child rows are derived from the Ticket, never merged: the ticket is the
         authority, and a derived index that disagrees with it is a bug that
         `doctor` reports (see `storage_problems`)."""
         conn.execute("DELETE FROM ticket_tags WHERE ticket_id = ?", (ticket.id,))
         conn.execute("DELETE FROM ticket_deps WHERE ticket_id = ?", (ticket.id,))
+        conn.execute("DELETE FROM ticket_references WHERE ticket_id = ?", (ticket.id,))
         conn.execute("DELETE FROM ticket_notes WHERE ticket_id = ?", (ticket.id,))
         conn.executemany(
             "INSERT INTO ticket_tags (ticket_id, tag, ordinal) VALUES (?, ?, ?)",
@@ -264,6 +296,10 @@ class SqliteSink(TicketSink):
         conn.executemany(
             "INSERT INTO ticket_deps (ticket_id, dep_id, ordinal) VALUES (?, ?, ?)",
             [(ticket.id, dep, i) for i, dep in enumerate(ticket.depends_on or [])],
+        )
+        conn.executemany(
+            "INSERT INTO ticket_references (ticket_id, ref_path, ordinal) VALUES (?, ?, ?)",
+            [(ticket.id, ref, i) for i, ref in enumerate(ticket.references or [])],
         )
         conn.executemany(
             "INSERT INTO ticket_notes (ticket_id, ordinal, note_date, agent, message) "
@@ -545,10 +581,14 @@ class SqliteSink(TicketSink):
                 "SELECT COUNT(*) AS n FROM ticket_deps d "
                 "LEFT JOIN tickets t ON t.id = d.ticket_id WHERE t.id IS NULL"
             ).fetchone()["n"]
-            orphans = orphan_notes + orphan_tags + orphan_deps
+            orphan_refs = conn.execute(
+                "SELECT COUNT(*) AS n FROM ticket_references r "
+                "LEFT JOIN tickets t ON t.id = r.ticket_id WHERE t.id IS NULL"
+            ).fetchone()["n"]
+            orphans = orphan_notes + orphan_tags + orphan_deps + orphan_refs
             if orphans:
                 if fix:
-                    for table in ("ticket_notes", "ticket_tags", "ticket_deps"):
+                    for table in ("ticket_notes", "ticket_tags", "ticket_deps", "ticket_references"):
                         conn.execute(
                             f"DELETE FROM {table} WHERE ticket_id NOT IN (SELECT id FROM tickets)"
                         )

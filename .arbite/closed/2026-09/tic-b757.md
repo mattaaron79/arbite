@@ -1,7 +1,7 @@
 ---
 id: tic-b757
 title: Move project config to .arbite/project.yaml (hard cut)
-status: open
+status: closed
 type: refactor
 tier: high
 domain: config
@@ -14,8 +14,8 @@ assignee: null
 depends_on: []
 blocked_by: null
 created: '2026-09-20T12:25:09'
-updated: '2026-09-20T12:25:09'
-closed: null
+updated: '2026-09-20T12:34:11'
+closed: '2026-09-20T12:34:11'
 ---
 
 ## Description
@@ -33,3 +33,4 @@ Note the ordering trap: config lives inside .arbite/ now, but find_arbite_dir() 
 Acceptance: a project configured only via .arbite/project.yaml resolves its sink, agents list and per-sink locations correctly from any subdirectory; a root arbite.yaml is ignored.
 
 ## Notes
+- 2026-09-20T12:34:11 zoo.orch.001: Moved project config to .arbite/project.yaml (hard cut); root arbite.yaml/.arbite.yaml now ignored; config_path resolves through find_arbite_dir; tests updated

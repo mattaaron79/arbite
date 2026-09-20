@@ -150,7 +150,7 @@ it is storage-neutral.
 | Storage | markdown files under `.arbite/` | one database at `.arbite/arbite.db` |
 | Status lives in | the folder the ticket sits in | a `status` column |
 | State change is | a file move + frontmatter rewrite | a row update |
-| Buckets (`arbite move`) | folders (`wishlist/`, `planning/ideas`) | a `bucket` column |
+| Buckets (`arbite move`) | folders (`wishlist/`, `plans/ideas`) | a `bucket` column |
 | History | `git log --follow` per ticket | database backups |
 | Best for | committed, reviewable, greppable tickets | filtering/joining at scale |
 | Runtime dependency | none beyond PyYAML | none (`sqlite3` is in the stdlib) |
@@ -325,7 +325,7 @@ The package exposes the console script `arbite`, providing:
 | Creation | `create` (incl. `--blank` scaffolding), `raw <memo\|feature\|request\|bug\|wish>` plus the one-word shortcuts `bug` / `feature` / `request` / `wish` / `memo` |
 | Triage | `fetch [type]` (oldest raw ticket + injected `derived_note`), `list raw` |
 | Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
-| Lifecycle | `claim`, `release`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen` |
+| Lifecycle | `claim`, `release`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen <id> --reason <text>` |
 | Authoring | `note`, `set`, `depend`, `move` |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
 | Integrity | `doctor [--fix]` |
@@ -347,12 +347,18 @@ Key behaviours worth calling out:
 - **`arbite fetch`** implements the triage queue: it pulls the oldest `raw` ticket
   and prints it with a `derived_note` (a JSON field in `--json` mode, a leading block
   otherwise) telling the caller exactly how to classify it.
-- **`arbite move`** files a ticket in a bucket (`/wishlist`, `/planning/ideas`) or
+- **`arbite move`** files a ticket in a bucket (`/wishlist`, `/plans/ideas`) or
   returns it to its status location (`/`). It changes no field, so it is not a state
   change — status commands un-file a ticket for you.
 - **`arbite delete`** destroys a ticket and refuses to do so without `--force`; it
   records a `Deleted by <agent>` note first and prints a receipt. `close` is usually
   what you want.
+- **`arbite reopen <id> --reason <text>`** is the rejection path back out of
+  `closed` (or any other non-`open` status). The reason is **required** and is
+  recorded in the automatic note as `Reopened: <reason>.` — a bare `arbite reopen`
+  fails with argparse's missing-argument error, deliberately, because a rejection
+  with no stated reason is useless to whoever has to act on it. The `closed` date
+  and any `blocked_by` are cleared, and a ticket that is already `open` is refused.
 - **`arbite doctor`** checks the invariants nothing else enforces and exits `3` when
   problems remain — see [Integrity checking per sink](#integrity-checking-per-sink).
 
@@ -367,12 +373,14 @@ strictness for `domain`/`tags`, the `deps` visualization format, and whether
 ```
 .arbite/
   raw/             unclassified quick captures -- not workable yet
+    processed/     snapshots of promoted captures -- audit copies, not tickets
   open/            actionable, unclaimed
   in_progress/     claimed, being worked
+  review/          finished, awaiting review
   blocked/         stalled, see blocked_by
   shelved/         parked for later
   wishlist/        reclassified wishes (type: feature) -- not work until promoted
-  planning/        planning/roadmap notes and scratch docs -- not tickets
+  plans/           roadmap notes and scratch docs -- not tickets
   closed/
     2026-08/
     2026-07/
@@ -383,13 +391,20 @@ strictness for `domain`/`tags`, the `deps` visualization format, and whether
   AGENTS.md        generated command reference
 ```
 
-- `raw/`, `open/`, `in_progress/`, `blocked/`, `shelved/` are **status folders**.
+- `raw/`, `open/`, `in_progress/`, `review/`, `blocked/`, `shelved/` are **status folders**.
 - `closed/` archives monthly by close date so it doesn't become one flat directory.
-- `wishlist/` and `planning/` are **buckets**, not statuses: a ticket filed in one
+- `wishlist/` and `plans/` are **buckets**, not statuses: a ticket filed in one
   is out of the status workflow (so `list next` never offers it) and keeps whatever
-  status it had. `planning/` is for planning notes that aren't tickets at all;
-  `arbite init` creates both, and a markdown file there is only treated as a ticket
-  if it is named like one (`tic-XXXX.md`).
+  status it had. `plans/` is for roadmap notes and scratch docs that aren't tickets;
+  `arbite init` pre-creates both buckets, and a markdown file in either is only
+  treated as a ticket if it is named like one (`tic-XXXX.md`).
+- `raw/processed/` is the **snapshot area** (`arbite init` creates it too): a verbatim
+  copy of a raw capture that has since been promoted, kept so the original request
+  stays readable for audit. A snapshot is not a ticket — it deliberately keeps its
+  original `status: raw`, and is named `<ticket-id>.raw.md` (e.g.
+  `raw/processed/tic-a1b2.raw.md`) so it can never collide with a ticket filename.
+  Everything under it is skipped by path, not by status, so `list`, `fetch`, `doctor`
+  and the id index never see it and an already-promoted request is never re-served.
 - `agents/` holds one scratchpad file per known agent identity (no required schema),
   pre-created from the `agents:` list in `arbite.yaml` / `.arbite.yaml`. Scratchpads
   stay files whichever sink is active: they are harness-facing state, not tickets.
@@ -406,7 +421,7 @@ with `arbite.db` in place of the status folders.
 ---
 id: tic-a1b2
 title: Fix off-by-one in vertex normal calc
-status: open              # raw | open | in_progress | blocked | shelved | closed — mirrors the folder
+status: open              # raw | open | in_progress | review | blocked | shelved | closed — mirrors the folder
 type: bug                 # bug | feature | request | refactor | chore | memo | wish
 tier: medium              # low | medium | high | frontier — agent capability tier required
 domain: mesh              # routing: mesh, image_gen, audio_gen, ui, io, ...
@@ -416,6 +431,7 @@ tags: [normals, curves]   # freeform, for codebase-area search
 
 assignee: null            # e.g. claude.haiku.001
 depends_on: []            # structural: ticket ids that must close first
+references: [plans/review-workflow.md]  # plan docs under .arbite/plans/, root-relative — omitted when empty
 blocked_by: null          # freeform reason OR a ticket id
 
 created: 2026-08-06T14:32:09
@@ -508,7 +524,7 @@ arbite set tic-a1b2 status open
 
 # 4. Work it
 arbite list next --tier medium        # what's ready at my capability level?
-arbite claim tic-a1b2 --agent claude.haiku.001
+arbite claim tic-a1b2 --agent claude.haiku.001   # -> status in_progress, filed under in_progress/
 arbite note tic-a1b2 claude.haiku.001 "found the LOD cache invalidation bug"
 arbite block tic-a1b2 --reason "waiting on tic-c3d4"
 arbite unblock tic-a1b2 --agent claude.haiku.001
@@ -553,7 +569,9 @@ These exist because agents, not humans, are the main callers:
   with results, `1` error, `2` the query ran but matched nothing, `3` `doctor` found
   problems.
 - **Prefer `list next --claim`** over `list next` followed by `claim`; the two-step
-  version has a race another agent can win.
+  version has a race another agent can win. Either way, claiming sets `status:
+  in_progress` and the assignee in one write (the file sink files the ticket under
+  `in_progress/`), so a claim is never followed by a separate `set status`.
 - **Prefer `arbite note`** over hand-editing a ticket, so attribution and timestamps
   stay consistent.
 - **Resume by verifying, not remembering.** Check your own scratchpad for a

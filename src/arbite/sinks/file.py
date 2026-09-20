@@ -25,6 +25,15 @@ Three ordering decisions are deliberate, and each buys a specific guarantee:
 Filenames never change on a move, so `git log --follow` on a ticket file traces
 its whole lifecycle. That property, and the folder-is-truth invariant, are
 features of *this* sink: a database sink has no files to follow.
+
+One directory in the layout holds something that is deliberately *not* a ticket:
+`raw/processed/`, the snapshot area. A snapshot is a verbatim copy of a raw
+capture that has since been promoted -- an audit record of what was originally
+requested, kept frozen and never read back by a command. Everything under it is
+therefore skipped by *path*, the same way `AGENTS.md` is, because a snapshot keeps
+its original `status: raw` frontmatter on purpose and so no status test could tell
+it apart from a live raw ticket. See `RAW_PROCESSED_DIR` and `raw_snapshot_name()`
+below for the convention `arbite promote` writes with.
 """
 
 from __future__ import annotations
@@ -36,21 +45,68 @@ from typing import Optional
 
 from ..errors import Conflict, TicketError, TicketNotFound
 from ..query import TicketQuery
-from ..schema import ID_PATTERN, Ticket, parse_notes, parse_ticket
+from ..schema import ID_PATTERN, STATUSES, Ticket, parse_notes, parse_ticket
 from .base import Expect, Problem, TicketSink, enforce_expect, filter_tickets
 
-# Status -> folder, for every status except "closed", which archives by month.
-FLAT_STATUS_DIRS = ("raw", "open", "in_progress", "blocked", "shelved")
+# The closed status is the one that does not live in a flat folder: it archives
+# by month, so it is named first and the flat set is derived from the canonical
+# vocabulary minus it. Deriving (rather than restating) keeps `init`, the folder
+# tests and the guide in step with `schema.STATUSES` automatically.
 CLOSED_DIR = "closed"
+FLAT_STATUS_DIRS = tuple(s for s in STATUSES if s != CLOSED_DIR)
 
 # Directories that are part of the layout but hold no tickets, plus non-status
 # buckets `arbite init` creates. A bucket is somewhere a ticket can deliberately
 # be filed *instead of* its status folder.
 RESERVED_DIRS = ("agents",)
-DEFAULT_BUCKETS = ("wishlist", "planning")
+DEFAULT_BUCKETS = ("wishlist", "plans")
 
 # Generated files that merely live under the root: never tickets.
 GENERATED_FILES = ("AGENTS.md",)
+
+# The snapshot area: `raw/processed/`, nested under the raw status folder, holds
+# verbatim snapshots of raw captures that have since been promoted. A snapshot is
+# NOT a ticket -- it is a frozen audit copy of the original capture, and it keeps
+# its original raw frontmatter on purpose (that is what makes it a snapshot). So a
+# status test cannot tell one from a live raw ticket: everything under this
+# directory is excluded from the ticket scan by *path*, exactly as GENERATED_FILES
+# excludes AGENTS.md. If the scan ever saw one, `arbite fetch` would re-serve an
+# already-promoted request forever. `arbite promote` (a later ticket) writes
+# snapshots here; nothing in this module creates one.
+RAW_PROCESSED_DIR = ("raw", "processed")
+
+# A snapshot is a flat file directly inside RAW_PROCESSED_DIR named
+# `<ticket-id>.raw.md`, e.g. `raw/processed/tic-a1b2.raw.md`. The suffix cannot
+# collide with a ticket filename, since ID_PATTERN matches only `tic-XXXX.md`, so a
+# snapshot of a live ticket never looks like a second copy of that ticket. Applying
+# the suffix is idempotent: `tic-a1b2.raw.md` snapshots to itself, never to
+# `tic-a1b2.raw.raw.md`.
+RAW_SNAPSHOT_SUFFIX = ".raw.md"
+
+
+def raw_snapshot_name(ticket_id: str) -> str:
+    """The snapshot filename for a ticket id: `<ticket-id>.raw.md`.
+
+    A snapshot is an audit copy, not a ticket -- `arbite promote` writes one into
+    `raw/processed/` when it promotes a raw capture, and the scan skips that whole
+    directory by path. Exposed here so promote depends on this convention instead
+    of re-deriving it. Idempotent, so snapshotting a name that is already a
+    snapshot yields itself rather than a doubly-suffixed name."""
+    stem = str(ticket_id)
+    if stem.endswith(RAW_SNAPSHOT_SUFFIX):
+        stem = stem[: -len(RAW_SNAPSHOT_SUFFIX)]
+    return f"{stem}{RAW_SNAPSHOT_SUFFIX}"
+
+
+def is_raw_snapshot(name: str) -> bool:
+    """Whether `name` is a snapshot filename (`<ticket-id>.raw.md`) rather than a
+    ticket filename (`<ticket-id>.md`).
+
+    For `arbite promote` and for tests, not for the scan: the scan excludes
+    snapshots by path, because a snapshot must stay invisible even when it is not
+    named like one -- it still carries raw frontmatter."""
+    return str(name).endswith(RAW_SNAPSHOT_SUFFIX)
+
 
 # Temp files staged during an atomic write/move. Dot-prefixed and not suffixed
 # .md, so the ticket scan never mistakes one for a ticket; a leftover is a crash
@@ -120,6 +176,9 @@ class FileSink(TicketSink):
     def init(self) -> None:
         for status in FLAT_STATUS_DIRS:
             (self._root / status).mkdir(parents=True, exist_ok=True)
+        # The snapshot area, nested under raw/: created up front so `arbite promote`
+        # has somewhere to write its audit copy without inventing the layout.
+        self._root.joinpath(*RAW_PROCESSED_DIR).mkdir(parents=True, exist_ok=True)
         (self._root / CLOSED_DIR).mkdir(parents=True, exist_ok=True)
         for bucket in DEFAULT_BUCKETS:
             (self._root / bucket).mkdir(parents=True, exist_ok=True)
@@ -137,8 +196,8 @@ class FileSink(TicketSink):
 
     def buckets(self) -> list:
         """Every bucket currently in use, sorted. A bucket is any directory
-        under the root that isn't a status folder -- `wishlist`, `planning`,
-        `planning/ideas`."""
+        under the root that isn't a status folder -- `wishlist`, `plans`,
+        `plans/ideas`."""
         found = set()
         for path in self._iter_files():
             bucket = self._bucket_for(path)
@@ -165,11 +224,24 @@ class FileSink(TicketSink):
     def _relative_parts(self, path: Path) -> tuple:
         return path.relative_to(self._root).parts
 
+    def _in_raw_processed(self, parts: tuple) -> bool:
+        """Whether a root-relative path sits in the snapshot area (`raw/processed/`,
+        at any depth).
+
+        A *path* test, not a status or filename one: a snapshot deliberately keeps
+        its original raw frontmatter, so the only reliable way to tell snapshots
+        from tickets is where they live."""
+        return parts[: len(RAW_PROCESSED_DIR)] == RAW_PROCESSED_DIR
+
     def _bucket_for(self, path: Path) -> Optional[str]:
         """Where this file is filed: None when the folder already implies a
         status (a status folder or the closed archive), otherwise the
         root-relative bucket ('' meaning the root itself)."""
         parts = self._relative_parts(path)
+        if self._in_raw_processed(parts):
+            # `raw/processed/` is the snapshot area, not a bucket of the raw
+            # status: a snapshot is filed nowhere, because it is not a ticket.
+            return None
         if len(parts) == 2 and parts[0] in FLAT_STATUS_DIRS:
             return None
         if parts[0] == CLOSED_DIR:
@@ -180,6 +252,10 @@ class FileSink(TicketSink):
         """The status this file's location implies, or None if its location
         implies none (a bucket: legitimate filing, not a state)."""
         parts = self._relative_parts(path)
+        if self._in_raw_processed(parts):
+            # A snapshot's folder implies no status: it is an audit copy, not a
+            # ticket sitting in raw/processed/.
+            return None
         if len(parts) == 2 and parts[0] in FLAT_STATUS_DIRS:
             return parts[0]
         if len(parts) == 3 and parts[0] == CLOSED_DIR:
@@ -190,12 +266,19 @@ class FileSink(TicketSink):
         """Whether a file under the root must be treated as a ticket.
 
         Everything in a status folder or the closed archive must be one. Anywhere
-        else only a ticket-shaped filename counts, because `planning/` is
+        else only a ticket-shaped filename counts, because `plans/` is
         documented to hold non-ticket markdown notes and scanning those as
-        tickets would report them as unreadable."""
+        tickets would report them as unreadable.
+
+        The snapshot area is excluded up front, by path and at any depth: a
+        snapshot is an audit copy that keeps its original `status: raw`, so a status
+        check would read it as a ticket and `fetch` would re-serve a request that was
+        already promoted."""
         try:
             parts = self._relative_parts(path)
         except ValueError:
+            return False
+        if self._in_raw_processed(parts):
             return False
         if parts[0] in RESERVED_DIRS or path.name in GENERATED_FILES:
             return False

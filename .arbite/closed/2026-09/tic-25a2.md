@@ -1,7 +1,7 @@
 ---
 id: tic-25a2
 title: Lock in claim -> in_progress with a test and documentation
-status: open
+status: closed
 type: chore
 tier: low
 domain: cli
@@ -15,8 +15,8 @@ assignee: null
 depends_on: []
 blocked_by: null
 created: '2026-09-20T12:26:17'
-updated: '2026-09-20T12:26:17'
-closed: null
+updated: '2026-09-20T12:56:40'
+closed: '2026-09-20T12:56:40'
 ---
 
 ## Description
@@ -29,3 +29,4 @@ Do:
 Acceptance: the test exists and passes; 'arbite claim --help' states the status transition.
 
 ## Notes
+- 2026-09-20T12:56:40 zoo.orch.001: Pinned the claim -> in_progress contract with a direct file-sink test (including --force takeover and the refused-race path); claim help text and rendered agent guide now state the transition explicitly
