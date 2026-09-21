@@ -1,7 +1,9 @@
 {
   "schema_version": 1,
   "planning_date": "2026-09-18",
-  "status": "created",
+  "status": "superseded",
+  "superseded_by": "ticket-index.md (the 2026-09-21 cut: C01-C15, B01-B08)",
+  "superseded_note": "Failed run. These 20 tickets were created in a SQLite store on 2026-09-18 and its 12 shared-directory-coordination tickets were closed the same day, implementing the epic as roughly 30 modules and ~17,400 lines on branch temp-checkin. The owner judged it overengineered and unintuitive, so it was abandoned. Nothing here is on main, every id below is dead, and the live tickets are the ones in ticket-index.md.",
   "tickets": [
     {
       "key": "C01",

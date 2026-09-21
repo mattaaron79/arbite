@@ -39,9 +39,11 @@ first-class epic implementation is presumed.
 
 - The configured sink remains authoritative. `.arbite/project.yaml` selects the
   `file` sink in this checkout, and `.arbite/` is tracked in git, so tickets are
-  version-controlled documents; the previously indexed tickets were never
-  materialized here and the SQLite store that briefly held them is gone. Existing
-  closed tickets are untouched.
+  version-controlled documents. Existing closed tickets are untouched. The
+  2026-09-18 attempt at this epic did not live on `main`: its SQLite store and its
+  implementation travelled on branch `temp-checkin`, which was abandoned as
+  overengineered, deleted on 2026-09-21, and is not a foundation to build on — see
+  the "Rejected approach" section of [ticket-index.md](ticket-index.md).
 - File and SQLite sinks must implement the same coordination semantics. A file
   sink may use process locks and a journal; it must not secretly require SQLite.
 - Add a storage-neutral application layer for operations that span tickets,

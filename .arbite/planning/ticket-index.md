@@ -1,7 +1,9 @@
 # Implementation ticket index
 
 Revised 2026-09-21. Cut: `C01`–`C15` for the epic `shared-directory-coordination`,
-and `B01`–`B08` for `multi-provider-job-board`, plus one wishlist item.
+and `B01`–`B08` for `multi-provider-job-board`, plus one wishlist item. The
+coordination cut is active; the job-board cut is **shelved** and is not part of the
+current commitment — see "Deferred epic" below.
 
 Epics are existing arbite grouping labels, not parent execution tickets. Sibling
 dependencies specify safe *order*, not safe concurrent source edits — see the note
@@ -9,16 +11,38 @@ at the end.
 
 ## Store status, read this first
 
-The 2026-09-18 version of this index said these tickets had been created in the
-configured SQLite sink. That store does not exist in this checkout: `.arbite/project.yaml`
-selects the `file` sink, `.arbite/open/` is empty, and there is no `.arbite/arbite.db`
-anywhere in the tree. `.arbite/` *is* tracked in git (no ignore rules matched it), and
-the 18 closed tickets are present as files — but none of the planned tickets were ever
-materialized here.
+The cut below was created on 2026-09-21 in this checkout's live store: the `file` sink
+selected by `.arbite/project.yaml`, with `.arbite/` tracked in git. The 18 closed
+tickets filed before it are untouched, nothing is assigned, and `arbite doctor` reports
+no problems.
 
-So the tickets below are a cut to be created, not a queue to be worked.
-[`ticket-manifest.json`](ticket-manifest.json) survives as the full-text record of the
-2026-09-18 cut; the cut below supersedes it, and its keys are the ones to use.
+## Rejected approach, do not rebuild it
+
+An earlier attempt at this epic ran on 2026-09-18 and was abandoned. It is worth knowing
+about, because the debris is easy to mistake for prior art and resume.
+
+- It created 20 tickets — 12 for `shared-directory-coordination`, 8 for
+  `multi-provider-job-board` — in a **SQLite store**, and closed all 12 coordination
+  tickets the same day. All 8 job-board tickets were left `open` and unassigned.
+- It implemented coordination as roughly 30 new modules and ~17,400 lines on a branch,
+  against an older main lineage: an application layer, a coordination storage layer,
+  two coordination sink backends, plus separate modules for paths, locking, claims,
+  reads, mutations, lifecycle, mutation journaling, artifacts, changes, workspace,
+  doctor and export, with about sixteen test modules and a proxy recipe script.
+- It also carried a `workspace.py` and a binding concept, which this cut deliberately
+  drops.
+- Verdict from the owner: overengineered and unintuitive. Treat it as the failure mode
+  to avoid, not as a foundation.
+
+None of it is on `main`. The store travelled on branch `temp-checkin` (commit `5f70f03`,
+"Apply stashed changes to temp-checkin", parent `c80cc63`), the only ref that reached it,
+with no remote copy. That branch was deleted on 2026-09-21, so its objects are now
+unreferenced and will go at git's next gc. There is nothing left to recover, nothing to
+check out, and no reason to re-derive the cut from those closed tickets: the live tickets
+of this epic are the ones listed below.
+
+[`ticket-manifest.json`](ticket-manifest.json) is the full-text record of that abandoned
+cut, kept only so this note has provenance. Its ids are dead.
 
 ## The cut
 
@@ -64,7 +88,8 @@ nothing needs that yet.
 
 ## Minted ids
 
-Created 2026-09-21 in the file sink (`sink: file`), all `open` and unclaimed.
+Created 2026-09-21 in the file sink (`sink: file`). The fifteen coordination tickets
+are `open` and unclaimed; the eight job-board tickets were shelved on 2026-09-21.
 
 | Key | Ticket | Key | Ticket |
 | --- | --- | --- | --- |
@@ -87,7 +112,29 @@ triage queues until its evidence exists.
 
 Verified after creation: `arbite doctor` reports no problems, `arbite list next
 --epic shared-directory-coordination` offers `tic-7918` (C01) and nothing else, and
-the raw queue is empty.
+the raw queue is empty. After shelving: 15 open, 8 shelved, 18 closed, 41 total, and
+`arbite list next` offers `tic-7918` alone — shelved work is excluded from `next` and
+from `progress`, while `arbite list --epic multi-provider-job-board` still shows the
+eight, labelled `shelved`.
+
+## Deferred epic: multi-provider-job-board
+
+`B01`–`B08` are shelved (`tic-ada8`, `tic-0cdb`, `tic-f576`, `tic-e59a`, `tic-b82e`,
+`tic-8c9a`, `tic-4178`, `tic-920d`). Each carries the reason in its notes: the design
+was inherited from the abandoned 2026-09-18 run and has to be re-cut against the
+coordination primitives that actually land before any work starts. Nothing failed —
+the epic was simply never started, and its eight tickets were left open by that run.
+
+Two things make deferring it the right call rather than merely cautious. The design
+was written against the rejected coordination API, so its vocabulary (reservations,
+offers, packages, continuity) describes records this cut has not defined. And the
+simple half — provider-neutral worker profiles with declared tier and capacity — is
+defensible, while the packaged-workflow half is exactly the kind of ambition that
+made the earlier attempt overengineered for one checkout and two hand-started agents.
+
+Re-cut it after the coordination core has been used in anger. The plan document
+[multi-provider-job-board.md](multi-provider-job-board.md) stays as the reference, and
+`shelve`/`unshelve` are reversible, so nothing here is a dead end.
 
 ## How this cut was materialized
 
@@ -152,7 +199,8 @@ dependency noted in the body, and deliberately do not schedule it.
 arbite list --epic shared-directory-coordination --topo
 arbite list next --epic shared-directory-coordination
 arbite progress --epic shared-directory-coordination
-arbite list --epic multi-provider-job-board --topo
+arbite list --status shelved                      # the deferred job-board cut
+arbite list --epic multi-provider-job-board --topo # same eight, labelled shelved
 ```
 
 Do not interpret sibling dependencies as safe concurrent source edits. Until the
