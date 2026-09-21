@@ -632,11 +632,12 @@ class CoordinationStore(ABC):
     def active_claims(self) -> list:
         """The current claim index: every claim that currently owns a path.
 
-        Derived by filtering the stored claims rather than kept in a separate
-        index, because the index the plan describes (a current-state claim set that
-        a claim check does not rebuild from the log) is only worth its own file
-        once acquisition exists (tic-9b57); the claim set itself is small, and the
-        released records must stay regardless."""
+        Derived by filtering the stored claims, which *is* the current-state index the
+        plan asks for now that acquisition exists (tic-9b57): a path has exactly one
+        claim record, whose id is derived from the workspace and the path, so a claim
+        check never has to replay a log -- and the released records stay beside it as
+        that path's history. The order is by record id, which is opaque; a report that
+        a human reads sorts by path."""
         return [claim for claim in self.records("claim") if claim.state == CLAIM_ACTIVE]
 
     def claims_for_path(self, path: str) -> list:

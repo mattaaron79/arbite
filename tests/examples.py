@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -61,6 +62,13 @@ NOTE_PREFIX = "note:"
 REFUSAL_LABELS = ("error:", "busy:", "stale_read:")
 
 ID_RE = re.compile(r"\b(tic|ws|att|clm|op|art|evt)-[0-9a-f]{4}\b")
+#: A content digest, shortened for text or whole (`sha256:<hex>`). Normalised because a
+#: digest is a fact about *bytes*: the document's blocks were written against an earlier
+#: revision of this repo's own files (its `sinks/file.py` is 412 lines, the file here is
+#: not), so a literal digest can never be reproduced by a fixture that must also keep the
+#: line counts, paths and dates the same block asserts. The relationship the digest
+#: stands for is asserted directly instead, against the store (see the claim scenarios).
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{12,64}\b")
 UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 LOCAL_TIME_RE = re.compile(r"\b\d{2}:\d{2}:\d{2}\b")
 DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
@@ -207,7 +215,11 @@ def scenario_block(scenario_id: str, path: Path = EXAMPLES_DOC) -> Scenario:
         return Scenario(
             id=scenario_id,
             title=title,
-            command=tuple(commands[0].split()[1:]),  # drop the leading `arbite`
+            # Split the way a shell would, so a frozen command that quotes an argument
+            # (`--reason "edits complete"`) reaches the CLI as one argument rather than
+            # three. Splitting on whitespace alone would only work while no block quoted
+            # anything.
+            command=tuple(shlex.split(commands[0])[1:]),  # drop the leading `arbite`
             exit_code=exit_code,
             stdout="" if payload is not None else text,
             json_payload=payload,
@@ -238,6 +250,7 @@ def normalise(text: str, root=None) -> str:
     result = result.replace(DOC_ROOT, "<ROOT>")
     result = ARBITE_PATH_RE.sub(lambda m: "<ARBITE>" + m.group(1).replace("\\", "/"), result)
     result = ID_RE.sub(lambda m: f"{m.group(1)}-XXXX", result)
+    result = DIGEST_RE.sub("sha256:<DIGEST>", result)
     result = UTC_TIMESTAMP_RE.sub("YYYY-MM-DDTHH:MM:SSZ", result)
     result = LOCAL_TIME_RE.sub("HH:MM:SS", result)
     result = DATE_RE.sub("YYYY-MM-DD", result)

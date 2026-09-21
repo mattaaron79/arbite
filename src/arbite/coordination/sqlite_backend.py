@@ -20,9 +20,10 @@ rather than laziness:
   the same reason the ticket sink pushes structured predicates into SQL but keeps
   text matching in the shared matcher.
 
-Claim lookups by path, and the current-state claim index the plan describes, are
-the exclusive-claim slice's (tic-9b57) and can be added as a projection beside this
-table without changing what is stored.
+Claim lookups by path need no projection here: the exclusive-claim slice (tic-9b57)
+derives one claim record per path from the workspace and the path, so "who holds this
+path" is a primary-key read of the table above and that record's revision is the
+compare-and-swap two racing acquisitions contend on.
 
 One thing is *not* here: nothing recovers a staged *file* operation (tic-b03b).
 A multi-record unit of work, on the other hand, is exactly what this backend now

@@ -149,6 +149,44 @@ class Stale(ArbiteError):
         self.reason = reason or "stale_read"
 
 
+class NotOwner(ArbiteError):
+    """A file operation named an attempt that does not own the ticket.
+
+    An error rather than a busy or stale outcome: the caller's attempt is not the one
+    the ticket belongs to, so the *path's* ownership was never even reached, and the
+    command has to be corrected -- name the attempt the ticket actually has, or take
+    the ticket over deliberately with `claim --force --reason`.
+    """
+
+    reason = "not_owner"
+
+    def __init__(self, message: str, next_actions=()):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+
+
+class PathRefused(ArbiteError):
+    """A path is not one arbite will manage, so the command is refused before anything
+    is written or read.
+
+    One class for the whole family -- outside the project root, protected arbite state
+    or `.git` metadata, a directory, a special file, a symlink component, a
+    hard-linked mutation target, a path a read required to exist -- because the
+    caller's response is the same for all of them: fix the command. The message and
+    the `next:` line are built where the rule lives, which is what makes the escape
+    and `.git` refusals print exactly the frozen LS6 text.
+    """
+
+    reason = "path_refused"
+
+    def __init__(self, message: str, next_actions=(), text_hint: Optional[str] = None):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+        #: The exact `next:` sentence to print, when the frozen block joins its hints its
+        #: own way. `next_actions` stays the branchable list (see `results.text_hint_of`).
+        self.text_hint = text_hint
+
+
 class StaleGeneration(Stale):
     """Outcome 5: the attempt generation a command named is no longer current.
 

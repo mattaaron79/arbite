@@ -657,9 +657,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("")
     add(
         "**Exit codes**, so a shell loop can branch without matching on message text: 0 success with "
-        "results; 1 error (bad arguments, ambiguous ticket id, refused claim, ...); 2 the query ran "
-        "fine but matched nothing (e.g. no workable ticket right now); 3 `arbite doctor` found "
-        "integrity problems."
+        "results; 1 error (bad arguments, ambiguous ticket id, a refused path, a claim naming the "
+        "wrong attempt, ...); 2 the query ran fine but matched nothing (e.g. no workable ticket "
+        "right now); 3 `arbite doctor` found integrity problems; 4 busy -- a live claim or attempt "
+        "holds it and **nothing changed**, so pick other work rather than retrying; 5 stale -- a "
+        "token, digest or generation is no longer current and **nothing changed**, so re-read and "
+        "retry. `arbite cmd` is the one exception: it returns the wrapped command's own code."
     )
     add("")
     add("```")

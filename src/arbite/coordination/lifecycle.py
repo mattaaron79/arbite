@@ -75,7 +75,7 @@ from .records import (
     parse_utc,
     utc_now,
 )
-from .results import register_next_actions, succeeded
+from .results import REFUSAL_INDENT, register_next_actions, succeeded
 
 # Event kinds this module appends. The convention is `<subject>.<verb>`, and the
 # category names the stream the event belongs to (see `records.EVENT_CATEGORIES`):
@@ -107,11 +107,8 @@ SETTER_STATUS_OWNERS = {
     "shelved": ("shelve", 'arbite shelve {id} --reason "<why>"'),
 }
 
-#: How much of the refusal message a continuation line is indented by: the width of
-#: the `error: ` label the CLI prints in front of the first line, so a two-line
-#: refusal reads as one paragraph. Both frozen transcripts that show a wrapped
-#: refusal (CL3, LC5) indent by exactly this.
-REFUSAL_INDENT = " " * len("error: ")
+# The indent a wrapped refusal's continuation line uses lives in `results`, beside the
+# label it comes from, so this module and the path validation both wrap the same way.
 
 # Hints for the three refusals this module raises, registered so a bare raise still
 # carries a `next:` line. Every operation here attaches its own, computed from the

@@ -200,6 +200,26 @@ def derived_workspace_id(root, store_kind: str, store_root) -> str:
     return f"ws-{hashlib.sha256(material.encode('utf-8')).hexdigest()[:4]}"
 
 
+def claim_id_for(workspace_id: str, path: str) -> str:
+    """The id of the claim record for one path in one workspace.
+
+    **Derived rather than random**, and that is what makes the claim set its own
+    current-state index: a path has exactly one claim record -- active or released --
+    so re-acquiring a path is replacing that record, and its stored *revision* is the
+    compare-and-swap two racing acquisitions contend on. A second claim of a live path
+    therefore cannot be written at all, whatever route it arrives by, and no log has to
+    be replayed to find out who holds what.
+
+    History is not lost with it: every acquisition and release appends an event, so the
+    stream still answers "this path was held until 13:20". The id stays opaque like
+    every other one -- nothing decodes it -- and the derivation is never an
+    authorisation, only a way to find the one record that speaks for a path. A caller
+    that finds this id already used by a *different* path has a digest collision and
+    must say so rather than overwrite it (see the file claims module)."""
+    material = f"{workspace_id}\n{path}"
+    return f"clm-{hashlib.sha256(material.encode('utf-8')).hexdigest()[:4]}"
+
+
 def digest_bytes(data: bytes) -> str:
     """The stored content digest of `data`: `sha256:<full hex>`."""
     return f"sha256:{hashlib.sha256(data).hexdigest()}"

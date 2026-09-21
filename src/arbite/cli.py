@@ -28,6 +28,7 @@ from typing import Optional
 
 from . import __version__, config, docs, graph, schema
 from .coordination import app as coordination_app
+from .coordination import claims as coordination_claims
 from .coordination import lifecycle as coordination_lifecycle
 from .coordination import results as outcomes
 from .coordination.scratch import ensure_scratch_dir
@@ -243,6 +244,35 @@ def _lifecycle(args, sink):
     needs a reason -- cannot differ between `claim`, `list next --claim`, `set` and
     the rest. Nothing about them is decided here."""
     return coordination_lifecycle.TicketLifecycle(sink, _coordination_app(args, sink))
+
+
+def _claims(args, sink):
+    """The file-claim operations for this command's sink and coordination store.
+
+    Claims are the durable half of the file proxy: what C06's reads, C07's writes and
+    the rename path are all checked against later. The rules -- canonical paths,
+    all-or-nothing acquisition, generation revocation -- live in
+    `coordination.claims`, so every surface that acquires or releases a path goes
+    through the same ones."""
+    return coordination_claims.FileClaims(sink, _lifecycle(args, sink))
+
+
+def _emit_file_result(result, as_json):
+    """Print a file operation's result, and exit with the code its outcome carries.
+
+    A refusal goes to **stderr** with the word its outcome prints (`busy:`,
+    `stale_read:`), because that is where the exit-code vocabulary has always been
+    reported and where a caller reading a single stream finds the branch it has to
+    take; a success goes to stdout. `--json` is the machine's form and carries the
+    same facts, so it is printed wherever it is asked for."""
+    if as_json:
+        _print_json(result.to_json())
+    elif result.kind == outcomes.OK:
+        print(result.to_text())
+    else:
+        print(result.to_text(), file=sys.stderr)
+    if result.exit_code:
+        sys.exit(result.exit_code)
 
 
 def _all_tickets(sink):
@@ -1546,6 +1576,53 @@ def cmd_attempt_adopt(args):
     _emit_result(_lifecycle(args, sink).adopt(t, args.agent), args.json)
 
 
+def cmd_file_claim(args):
+    """Claim whole files for one attempt: exclusive writer ownership, all-or-nothing.
+
+    The acquisition is the application layer's (`coordination.claims`): every path is
+    canonicalised against the project root, checked against the ticket's own attempt
+    and the current claim index, and then written in **one** commit, in canonical path
+    order. A path held by another attempt refuses the whole request with the holder
+    named and nothing claimed, because the rule the ordering exists for is that two
+    agents never end up each holding half of a pair. Nothing here waits, steals or
+    retries: contention is a structured answer with exit code 4.
+
+    A claimed path is a *mutation* window, not a lock: the durable claim record is what
+    the later write checks, so no process lock is ever held for an agent's work."""
+    sink = _require_sink(args)
+    result = _claims(args, sink).claim(args.ticket, args.attempt, args.paths)
+    _emit_file_result(result, args.json)
+
+
+def cmd_file_release(args):
+    """Release this attempt's claims on whole files, keeping the bytes.
+
+    The explicit, per-file counterpart to the claim: the attempt stays active (this is
+    a decision about one file, not about the ticket), the generation is revoked, and
+    the released record stays as that path's history. Bytes on disk are never reverted
+    by a release -- partial work stays visible to the next worker, who must re-read it.
+    A re-acquisition mints a new generation, so any read token from the old one is dead."""
+    sink = _require_sink(args)
+    result = _claims(args, sink).release(
+        args.ticket, args.attempt, args.paths, args.reason
+    )
+    _emit_file_result(result, args.json)
+
+
+def cmd_file_claims(args):
+    """Report what is held right now: one line per claimed path.
+
+    Read-only and one-shot, so an agent never has to infer ownership from `ls` or from
+    a refusal. The active claims by default; `--all` adds the released records, which is
+    how "this path was held by att-XXXX until 13:20" stays answerable from the store.
+    No claims is an ordinary answer with its own exit code (2), not an error."""
+    sink = _require_sink(args)
+    result = _claims(args, sink).claims(include_released=args.all)
+    _emit_result(result, args.json)
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
 def cmd_close(args):
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
@@ -2381,6 +2458,107 @@ def build_parser():
     _json_flag(p_attempt_adopt)
     _sink_flag(p_attempt_adopt)
     p_attempt_adopt.set_defaults(func=cmd_attempt_adopt)
+
+    p_file = sub.add_parser(
+        "file",
+        help="file ownership: claim whole files, release them, list what is held",
+        description="The durable half of the file proxy: which work attempt owns which whole "
+        "file. A claim is what a later read, write, edit or rename is checked against -- it is "
+        "a record, not a lock, so no lock is ever held for the length of an agent's work. "
+        "Acquisition is all-or-nothing and in canonical path order, so two attempts can never "
+        "end up each holding half of a pair; contention is a structured busy answer (exit 4) "
+        "naming the holder, never a wait. Paths are validated against the project root: escapes, "
+        "arbite's own state and `.git` metadata are refused. Reads, writes, edits, renames and "
+        "removes are not here yet -- they arrive with their own slices.",
+    )
+    file_sub = p_file.add_subparsers(
+        dest="file_action", required=True, metavar="SUBCOMMAND"
+    )
+    _sink_flag(p_file)
+    p_file_claim = file_sub.add_parser(
+        "claim",
+        help="claim one or more whole files for an attempt (all-or-nothing)",
+        description="Acquire exclusive ownership of every named path for one work attempt, or "
+        "none of them. The set is canonicalised and sorted first, then written in one commit: a "
+        "path another attempt holds refuses the whole request with the holder named and nothing "
+        "claimed. A path that does not exist yet may be claimed -- creating a file is an "
+        "explicit, claimable act, and the claim records the absent version. A claim is required "
+        "before any mutation, and the read that authorises the mutation must happen *after* the "
+        "claim.",
+    )
+    p_file_claim.add_argument(
+        "paths",
+        nargs="+",
+        metavar="PATH",
+        help="one or more paths relative to the project root (absolute paths inside the root are "
+        "accepted and canonicalised; escapes, `.git` metadata and arbite's own state are refused)",
+    )
+    p_file_claim.add_argument(
+        "--ticket",
+        required=True,
+        metavar="TICKET_ID",
+        help="the ticket the claiming attempt owns; the claim is recorded against it and its "
+        "attempt (required)",
+    )
+    p_file_claim.add_argument(
+        "--attempt",
+        required=True,
+        metavar="ATTEMPT_ID",
+        help="the attempt (`att-XXXX`) that owns the ticket and will own the claim; `arbite claim "
+        "` prints it, and an attempt that does not own the ticket is refused (required)",
+    )
+    _json_flag(p_file_claim)
+    _sink_flag(p_file_claim)
+    p_file_claim.set_defaults(func=cmd_file_claim)
+
+    p_file_release = file_sub.add_parser(
+        "release",
+        help="release this attempt's claim on whole files, keeping the bytes",
+        description="Revoke the claim generation on each named path and leave the file where it "
+        "is. The attempt stays active: releasing a file is a decision about that file, not about "
+        "the ticket. Nothing on disk is reverted and the released record stays as the path's "
+        "history, so the next worker reads current bytes rather than an assumed clean tree. "
+        "Re-claiming the path later mints a new generation, which is what makes a read token "
+        "from the old one dead.",
+    )
+    p_file_release.add_argument("paths", nargs="+", metavar="PATH", help="paths this attempt holds")
+    p_file_release.add_argument(
+        "--ticket", required=True, metavar="TICKET_ID", help="the ticket the attempt owns (required)"
+    )
+    p_file_release.add_argument(
+        "--attempt",
+        required=True,
+        metavar="ATTEMPT_ID",
+        help="the attempt holding the claims; only the holder may release them (required)",
+    )
+    p_file_release.add_argument(
+        "--reason",
+        required=True,
+        metavar="TEXT",
+        help="why the path is being handed back; recorded with the released claim and in its "
+        "event, so the next worker knows what to re-read (required)",
+    )
+    _json_flag(p_file_release)
+    _sink_flag(p_file_release)
+    p_file_release.set_defaults(func=cmd_file_release)
+
+    p_file_claims = file_sub.add_parser(
+        "claims",
+        help="list the file claims in this workspace (who holds what, right now)",
+        description="Report the current claim index in canonical path order: per path the holder "
+        "ticket and attempt, the worker, the claim generation, when it was taken and the version "
+        "it was taken against. `--all` adds the released records. Read-only and one-shot, so "
+        "'who holds what' never has to be inferred from `ls` or from a refusal; no active claims "
+        "exits 2.",
+    )
+    p_file_claims.add_argument(
+        "--all",
+        action="store_true",
+        help="include released claims (the path's history) as well as the active ones",
+    )
+    _json_flag(p_file_claims)
+    _sink_flag(p_file_claims)
+    p_file_claims.set_defaults(func=cmd_file_claims)
 
     p_events = sub.add_parser(
         "events",
@@ -3360,7 +3538,7 @@ def main():
         # always has (`error: <message>`, exit 1) and gains no hint it never had.
         outcome = outcomes.outcome_of(e)
         print(f"{outcome.label}: {e}", file=sys.stderr)
-        hint = outcomes.render_next_line(outcomes.next_actions_of(e))
+        hint = outcomes.text_hint_of(e)
         if hint:
             print(hint, file=sys.stderr)
         sys.exit(outcome.exit_code)

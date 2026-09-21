@@ -400,11 +400,29 @@ Key behaviours worth calling out:
   live**: claiming a ticket (directly, through `list next --claim`, or with
   `promote --agent`) records one, the lifecycle commands end it, and a takeover
   revokes the attempt it replaces — all of it through the application layer, so a
-  setter or a batch cannot route around those rules. What does **not** exist yet is
-  file ownership itself: `arbite file …` (claims, reads, writes, edits) and the
-  recovery of an interrupted operation arrive with the remaining slices, so no command
-  claims ownership of a *file* today, and the `next:` line a claim prints is the step
-  that will. `arbite doctor --json` names the coordination backend and its counts.
+  setter or a batch cannot route around those rules. **File ownership is live as well**
+  (see the `arbite file` entry below): a claim is a durable record rather than a lock,
+  it carries a generation that a release revokes, and a path another attempt holds is
+  refused with exit `4` naming the holder instead of waiting. What does **not** exist
+  yet are the reads, writes, edits, renames and removes that a claim is checked
+  against, and the recovery of an interrupted operation — so no command changes a
+  file's *bytes* through arbite today. `arbite doctor --json` names the coordination
+  backend and its counts.
+- **`arbite file claim|release|claims`** is file ownership. `claim PATH... --ticket T
+  --attempt A` acquires exclusive writer ownership of whole files for one work attempt,
+  all-or-nothing and in canonical path order, so two agents can never each end up
+  holding half of a pair; a path another attempt holds refuses the whole request, claims
+  nothing and exits `4` with the holder, its generation and its age named. A path that
+  does not exist yet may be claimed — creating a file is an explicit, claimable act —
+  and re-acquiring a released one mints a new generation, so a read token from the old
+  one is dead. `release PATH... --reason TEXT` revokes that path's generation, keeps the
+  attempt active and leaves the bytes exactly where they are, because partial work must
+  stay visible to the next worker; `claims [--all]` reports who holds what right now
+  (with `--all`, the released history too). Paths are validated against the project
+  root: escapes, `.git` metadata, arbite's own runtime state and configuration,
+  directories, special files, symlinked components and hard-linked targets are refused
+  before anything is written. Reads, writes, edits, renames and removes are not here
+  yet.
 - **`arbite events [--after CURSOR | --tail N] [--include-reads]`** reads the event
   stream in cursor order, one line per event: the cursor, kind, subject, operation,
   ticket/attempt, actor, local time and outcome, then the cursor to resume from. It

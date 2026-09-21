@@ -98,6 +98,13 @@ OUTCOME_LABELS = {
 #: examples document renders two hints as one `next:` line continued under it.
 NEXT_CONTINUATION = ",\n      or "
 
+#: The width of the `error: ` label the CLI prints in front of a refusal's first line.
+#: A refusal that wraps continues under its own message by exactly this much, so a
+#: two-line refusal reads as one paragraph -- whether it was raised by a lifecycle
+#: guard (CL3, LC5) or by path validation (LS6). Derived from the label so the indent
+#: cannot drift from the word in front of it.
+REFUSAL_INDENT = " " * (len(OUTCOME_LABELS[ERROR]) + 2)
+
 
 class _Hints:
     """Reason-keyed next actions, registered by the slice that owns the outcome."""
@@ -304,6 +311,21 @@ def next_actions_of(exc: ArbiteError) -> list:
         return actions
     outcome = outcome_of(exc)
     return next_actions_for(outcome.kind, outcome.reason)
+
+
+def text_hint_of(exc: ArbiteError) -> str:
+    """The `next:` line a refusal prints: the sentence it carries, or the rendering.
+
+    A failure may carry one, exactly as `OperationResult.text_hint` lets a *success*
+    carry the sentence its actions read as (`releases` end with a sentence rather than a
+    command, and the frozen FC3/RD5 blocks put the joining word at the end of the
+    previous hint while CL2/CL5/FC5 put it at the start). That is a difference in
+    *printing*, not in which commands follow, so the same failure still publishes the
+    bare commands as its `next_actions` for JSON."""
+    explicit = getattr(exc, "text_hint", None)
+    if explicit:
+        return explicit
+    return render_next_line(next_actions_of(exc))
 
 
 # Hints that belong to the vocabulary itself rather than to one command. Each is a

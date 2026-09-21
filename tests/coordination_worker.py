@@ -235,6 +235,20 @@ def op_claim_crash(store, ticket: str, agent: str, boundary: str) -> int:
     return _run_cli(["arbite", "claim", ticket, "--agent", agent])
 
 
+def op_file_claim(store, ticket: str, attempt: str, go: str, paths: str) -> int:
+    """Claim a path set through the real CLI, released by a shared starting gun.
+
+    Nothing here re-implements acquisition: what races is `arbite file claim`, which is
+    exactly what an agent runs, and the parent asserts on the exit codes and on what the
+    store holds afterwards. `paths` is comma-separated because the operation table gives
+    every handler a fixed number of arguments."""
+    if not _wait_for_go(go):
+        return 4
+    return _run_cli(
+        ["arbite", "file", "claim", *paths.split(","), "--ticket", ticket, "--attempt", attempt]
+    )
+
+
 def op_report(store) -> int:
     """What the store holds, for the parent to assert against."""
     journal_reader = getattr(store, "read_commit_journal", None)
@@ -269,6 +283,7 @@ OPERATIONS = {
     "report": (op_report, 0),
     "claim": (op_claim, 3),
     "claim-crash": (op_claim_crash, 3),
+    "file-claim": (op_file_claim, 4),
 }
 
 
