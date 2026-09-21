@@ -48,6 +48,58 @@ class Conflict(ArbiteError):
     instead of silently overwriting the winner's work."""
 
 
+# The lifecycle refusals below carry a `reason` and the exact commands that follow
+# from them. `coordination.results.outcome_of` reads `reason` (which is what keys a
+# `next:` line) and `next_actions_of` prefers the actions carried here over the
+# registered ones, so a refusal computed from the state at failure time -- "the
+# ticket you lost is held by att-XXXX, take other work" -- is stated once, where the
+# rule lives, instead of being guessed back at the CLI.
+
+
+class NotReady(ArbiteError):
+    """A ticket cannot be claimed yet: something it depends on is not closed.
+
+    The rule this protects is the one `arbite list next` only *filters* on: list-next
+    is a convenience over the same acquisition operation, so readiness has to hold
+    inside the claim as well, or a caller could bypass the queue by naming the ticket
+    directly."""
+
+    reason = "not_ready"
+
+    def __init__(self, message: str, next_actions=()):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+
+
+class LostRace(Conflict):
+    """A ticket acquisition lost its race: it is no longer in the state a claim
+    requires, because another worker (or another command) got there first.
+
+    A `Conflict`, so a batch that is walking candidates recognises it as "skip this
+    one and try the next" without knowing anything about claims."""
+
+    reason = "lost_race"
+
+    def __init__(self, message: str, next_actions=()):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+
+
+class LifecycleRequired(ArbiteError):
+    """A generic setter was asked to make a change that a lifecycle command owns.
+
+    The plan's "no backdoor through force": `arbite set` may edit fields, but a
+    change that must end or start an attempt -- closing claimed work, resurrecting a
+    released ticket -- routes to the command that does that, or it is refused with
+    the command named."""
+
+    reason = "lifecycle_required"
+
+    def __init__(self, message: str, next_actions=()):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+
+
 class CoordinationError(ArbiteError):
     """The coordination layer failed: a record that cannot be stored or read, a
     store whose backend cannot be reached.
@@ -95,6 +147,21 @@ class Stale(ArbiteError):
     def __init__(self, message: str, reason: Optional[str] = None):
         super().__init__(message)
         self.reason = reason or "stale_read"
+
+
+class StaleGeneration(Stale):
+    """Outcome 5: the attempt generation a command named is no longer current.
+
+    The check every operation that carries an attempt id needs, and the reason a
+    takeover cannot be papered over: a revoked generation stays revoked, and a
+    command that presents an old one is told to re-read rather than being allowed to
+    act under an owner that has been replaced. Nothing was changed."""
+
+    reason = "stale_generation"
+
+    def __init__(self, message: str, next_actions=()):
+        super().__init__(message, reason="stale_generation")
+        self.next_actions = tuple(next_actions)
 
 
 class SinkError(ArbiteError):

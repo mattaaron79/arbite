@@ -28,9 +28,10 @@ from typing import Optional
 
 from . import __version__, config, docs, graph, schema
 from .coordination import app as coordination_app
+from .coordination import lifecycle as coordination_lifecycle
 from .coordination import results as outcomes
 from .coordination.scratch import ensure_scratch_dir
-from .errors import ArbiteError, Conflict, TicketError
+from .errors import ArbiteError, Busy, Conflict, NotReady, TicketError
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
 from .sinks import (
@@ -232,6 +233,37 @@ def _coordination_app(args, sink, project_root=None):
         project_root / config.ARBITE_DIRNAME,
         store_source=_store_source(args, project_root),
     )
+
+
+def _lifecycle(args, sink):
+    """The ticket lifecycle operations for this command's sink and coordination store.
+
+    Every command that acquires, ends or guards a *ticket transition* goes through
+    this, so the rules -- readiness, one active attempt per ticket, an override that
+    needs a reason -- cannot differ between `claim`, `list next --claim`, `set` and
+    the rest. Nothing about them is decided here."""
+    return coordination_lifecycle.TicketLifecycle(sink, _coordination_app(args, sink))
+
+
+def _all_tickets(sink):
+    """Every ticket, bucketed ones included.
+
+    Readiness is a property of the whole set, never of a filtered subset: a blocker
+    parked in the wishlist still blocks, so the acquisition paths judge against this
+    list rather than against the tickets their own filters happen to select."""
+    return sink.query(TicketQuery(buckets=("*",)))
+
+
+def _emit_result(result, as_json):
+    """Print an application-layer result: JSON when asked, otherwise its lines.
+
+    A result carries its own `next:` line, which is what lets a *successful* command
+    hand the caller the step that follows -- claiming a ticket names the attempt a
+    file command needs -- without the CLI having to know why."""
+    if as_json:
+        _print_json(result.to_json())
+    else:
+        print(result.to_text())
 
 
 def _has_tickets(sink) -> bool:
@@ -1007,6 +1039,15 @@ def cmd_promote(args):
         # that makes the wish stop being served by `fetch`/`list raw`.
         sink.move_to_bucket(t.id, WISHLIST_BUCKET)
 
+    # Classifying and claiming in one write is an acquisition path too, so it creates
+    # the attempt here: without it the worker this ticket was just assigned to would
+    # have no attempt to claim its files with (the lifecycle operation refuses a
+    # second one, so this cannot double up with a later claim).
+    lifecycle = _lifecycle(args, sink)
+    attempt = (
+        lifecycle.begin_attempt(t, args.agent) if args.agent and not is_wish else None
+    )
+
     if is_wish:
         print(
             f"promoted {t.id} -> {sink.location(t.id)} (reclassified as feature and filed in "
@@ -1017,6 +1058,12 @@ def cmd_promote(args):
         owner = f", assigned to {args.agent}" if args.agent else ""
         print(f"promoted {t.id} -> {sink.location(t.id)} (status {t.status}{owner})")
     print(f"snapshot of the raw capture: {snapshot}")
+    if attempt is not None:
+        print(
+            f"attempt: {attempt.id} (generation {attempt.generation}, ticket {t.id}, "
+            f"workspace {attempt.workspace_id})"
+        )
+        print(lifecycle.file_hint_text(t.id, attempt.id))
 
 
 def _filter_labels(args) -> list:
@@ -1164,15 +1211,16 @@ def _cmd_list_next(args, sink, every):
     dependency holds a ticket back whatever tier/domain/epic its blocker sits
     at; --tier/--domain/--epic then narrow the workable candidates, and
     anything that isn't `open` is never considered. If nothing workable matches
-    the filters, that's an answer: nothing at that tier/domain/epic is ready
-    yet, and the exit code is 2.
+    the filters, that's an answer with the reason and the exit code 2 (CL4).
 
-    With --claim, the single most urgent candidate is claimed in the same
-    command. That closes the race in the obvious two-step version (`list next`
-    then `claim`): between those two commands another agent can claim the
-    ticket you were just handed, and both agents then work it."""
+    With --claim, the most urgent candidates are claimed in the same command, each
+    through the same acquisition operation `arbite claim` uses -- so a ticket this
+    queue hands out gets its attempt here too, and a ticket that already has one is
+    never offered. That closes the race in the obvious two-step version (`list next`
+    then `claim`): between those two commands another agent can claim the ticket you
+    were just handed, and both agents then work it."""
     by_id = {t.id: t for t in every}
-    candidates = sink.query(
+    open_matching = sink.query(
         TicketQuery(
             status=("open",),
             tier=args.tier,
@@ -1181,25 +1229,35 @@ def _cmd_list_next(args, sink, every):
             order="next",
         )
     )
-    candidates = [t for t in candidates if graph.is_workable(t, by_id)]
+    workable = [t for t in open_matching if graph.is_workable(t, by_id)]
+    lifecycle = _lifecycle(args, sink)
+    # Work that already has an active attempt is not offered: it is being done, and
+    # the attempt is the fact that says so.
+    candidates = [t for t in workable if lifecycle.active_attempt(t.id) is None]
+
+    # `next` answers "what should I work on", so it returns one ticket unless
+    # the caller asks for a batch.
+    wanted = 1 if args.count is None else args.count
 
     if not candidates:
         # "Nothing is ready" and "everything is deadlocked" look identical from
         # the outside, so say which one it is rather than leaving an agent to
         # poll a queue that can never produce work.
         _warn_cycles(by_id)
-
-    # `next` answers "what should I work on", so it returns one ticket unless
-    # the caller asks for a batch.
-    wanted = 1 if args.count is None else args.count
+        if not args.claim:
+            if args.json:
+                # JSON stays a document whatever the answer is: the two-line report
+                # below is the *text* form of "nothing is ready yet".
+                _emit_tickets([], True, sink)
+            else:
+                _report_nothing_workable(args, by_id, open_matching)
+            return
+        # Nothing to claim is not an error; the exit code carries it.
+        _emit_tickets([], args.json, sink)
+        return
 
     if not args.claim:
         _emit_tickets(candidates[:wanted], args.json, sink)
-        return
-
-    if not candidates:
-        # Nothing to claim is not an error; the exit code carries it.
-        _emit_tickets([], args.json, sink)
         return
 
     # Walk candidates in order, claiming until we have `wanted` of them: if
@@ -1211,21 +1269,26 @@ def _cmd_list_next(args, sink, every):
     for candidate in candidates:
         if len(claimed) == wanted:
             break
-        # The expectation is taken from the ticket as read, *before* the mutation
-        # below: taken afterwards it would describe the new state rather than the
-        # state the write has to replace.
-        expect = _expect_from(candidate)
-        candidate.status = "in_progress"
-        candidate.assignee = args.claim
-        candidate.updated = schema.now()
         try:
-            sink.update(candidate, expect=expect)
+            result = lifecycle.claim(candidate, args.claim)
         except Conflict as e:
             # Lost the race for this one. The next candidate is untouched, so the
             # loop simply moves on to it.
             errors.append(str(e))
             continue
-        claimed.append(candidate)
+        except NotReady as e:
+            # The queue filtered on readiness, but the guard is the rule; a
+            # dependency that changed in between means this candidate is not ours.
+            errors.append(str(e))
+            continue
+        except Busy as e:
+            if e.reason == "store_locked":
+                # The store itself is unavailable: that is not "this candidate
+                # was taken", it is "this dispatch cannot proceed".
+                raise
+            errors.append(str(e))
+            continue
+        claimed.append((candidate, result))
 
     if not claimed:
         raise TicketError(
@@ -1233,19 +1296,15 @@ def _cmd_list_next(args, sink, every):
         )
 
     if args.json:
-        locations = sink.location_map(claimed)
-        _print_json([t.to_dict(locations.get(t.id)) for t in claimed])
+        _print_json([result.data for _, result in claimed])
     else:
-        _print_flat(claimed)
-        # The table is the result; the claim receipts are commentary on stderr.
-        # Flush first so the two streams stay in order when stdout is a pipe.
-        sys.stdout.flush()
-        for t in claimed:
-            print(f"claimed {t.id} for {args.claim} -> {sink.location(t.id)}", file=sys.stderr)
+        _print_flat([ticket for ticket, _ in claimed])
     if len(claimed) < wanted:
         # Say so explicitly, and say why: a dispatcher that asked for 3 and got
         # 2 needs to know whether the queue ran dry or it lost races, because
-        # those call for different responses (wait vs. retry immediately).
+        # those call for different responses (wait vs. retry immediately). The
+        # table is the result; this note is the one line of commentary, on stderr
+        # so a pipe reading the table is not disturbed mid-row.
         if errors:
             reason = f"{len(errors)} were claimed by another agent first"
         else:
@@ -1255,6 +1314,38 @@ def _cmd_list_next(args, sink, every):
             f"note: asked for {wanted} ticket(s), claimed {len(claimed)} -- {reason}",
             file=sys.stderr,
         )
+
+
+def _report_nothing_workable(args, by_id, open_matching):
+    """Answer "nothing is ready yet" with *why*, and exit 2.
+
+    `list next` is the queue an agent drives itself from, so its empty answer has to
+    distinguish the three cases that look identical from the outside: the filters
+    match nothing at all (the existing message), they match tickets whose
+    dependencies are unmet (CL4: say how many, and name the command that shows the
+    chain), or they match work someone is already doing. Only the second gets the
+    two-line report, because a count of blocked tickets is the fact a caller can act
+    on; "no tickets found" stays for the third and for an empty queue.
+
+    The frozen CL4 shape is followed literally: the filter list is `tier=value
+    epic=value` in tier-then-epic order, and the command it suggests carries
+    `--status open` plus the epic filter."""
+    blocked = [t for t in open_matching if not graph.is_workable(t, by_id)]
+    if not blocked:
+        print("no tickets found")
+        sys.exit(EXIT_EMPTY)
+    labels = [
+        f"{name}={value}"
+        for name, value in (("tier", args.tier), ("domain", args.domain), ("epic", args.epic))
+        if value
+    ]
+    print("no workable open tickets" + (f" matching {' '.join(labels)}" if labels else ""))
+    epic = f" --epic {args.epic}" if args.epic else ""
+    print(
+        f"blocked by dependencies: {len(blocked)} "
+        f"(run 'arbite list --topo --status open{epic}')"
+    )
+    sys.exit(EXIT_EMPTY)
 
 
 def cmd_list(args):
@@ -1361,29 +1452,23 @@ def _print_tree(scope, roots):
 
 
 def cmd_claim(args):
-    """Claim a ticket for an agent: this sets `status` to `in_progress` and the
-    assignee in the same write (on the file sink the ticket is filed under
-    `in_progress/`), so no separate `set status` call is needed. Claiming is a
-    compare-and-swap, not a blind write: a ticket already assigned to somebody
-    else is refused unless --force, and the write carries the expectation that
-    the ticket is still in the state it was read in, so two agents racing for
-    the same ticket can't both come away believing they own it."""
+    """Claim a ticket for an agent: assign it, mark it in_progress and start its attempt.
+
+    The acquisition itself is the lifecycle operation's (see
+    `coordination.lifecycle`): the ticket write is the compare-and-swap that decides
+    which of two racing claims wins, and the attempt that owns the work is recorded
+    right after it, so a caller never needs a second command and every later file
+    operation has the attempt id it must present.
+
+    `--force` is the administrative takeover and therefore takes a `--reason`: it
+    revokes the attempt that held the ticket and starts a new one, and the reason is
+    the only record of why the previous worker lost it."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
-    previous = t.assignee
-    if previous and previous != args.agent and not args.force:
-        raise TicketError(
-            f"ticket {t.id} is already assigned to {previous} (status: {t.status}); "
-            "pass --force to take it over"
-        )
-    if previous and previous != args.agent:
-        schema.append_note(t, args.agent, f"Claim taken over from {previous} (--force).")
-    expect = _expect_from(t)
-    t.status = "in_progress"
-    t.assignee = args.agent
-    t.updated = schema.now()
-    sink.update(t, expect=expect)
-    print(f"claimed {t.id} for {args.agent} -> {sink.location(t.id)}")
+    result = _lifecycle(args, sink).claim(
+        t, args.agent, force=args.force, reason=args.reason
+    )
+    _emit_result(result, args.json)
 
 
 def cmd_release(args):
@@ -1392,33 +1477,24 @@ def cmd_release(args):
     The counterpart to claim: an agent that stops work part-way (out of scope, out of
     context, wrong capability tier) needs one command that unassigns and
     reopens together, so the ticket becomes visible to `list next` again rather
-    than sitting in_progress owned by nobody who is still working it."""
+    than sitting in_progress owned by nobody who is still working it. The attempt
+    that was doing the work ends with it, and receives the reason as its handoff."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     if t.status == "open" and t.assignee is None:
         raise TicketError(f"ticket {t.id} is already open and unassigned")
-    previous = t.assignee
-    expect = _expect_from(t)
-    message = "Released." if not args.reason else f"Released: {args.reason}"
-    schema.append_note(t, args.agent, message)
-    t.assignee = None
-    t.blocked_by = None
-    t.status = "open"
-    t.updated = schema.now()
-    sink.update(t, expect=expect)
-    owner = f" (was {previous})" if previous else ""
-    print(f"released {t.id}{owner} -> {sink.location(t.id)}")
+    _emit_result(_lifecycle(args, sink).release(t, args.agent, args.reason), False)
 
 
 def cmd_block(args):
+    """Block a ticket, ending the attempt that was working it.
+
+    The attempt is *interrupted* rather than released: what stopped the work came from
+    outside the worker. Nothing is undone, and the receipt says so, because the next
+    worker has to re-read whatever is on disk rather than assume a clean tree."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
-    expect = _expect_from(t)
-    t.blocked_by = args.reason
-    t.status = "blocked"
-    t.updated = schema.now()
-    sink.update(t, expect=expect)
-    print(f"blocked {t.id} ({args.reason}) -> {sink.location(t.id)}")
+    _emit_result(_lifecycle(args, sink).block(t, args.reason), False)
 
 
 def cmd_unblock(args):
@@ -1427,7 +1503,11 @@ def cmd_unblock(args):
     The symmetric counterpart to `block`. Doing this with `set status` leaves
     blocked_by populated, so the ticket claims to be stalled by something in
     every listing while sitting in open -- exactly the frontmatter drift the
-    folder-is-truth rule exists to prevent."""
+    folder-is-truth rule exists to prevent.
+
+    Resuming an assigned ticket starts a *fresh* attempt: blocking ended the one
+    that was running, so the worker it goes back to is starting again now, and an
+    attempt that resumed under the old id would claim activity it never had."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     if t.status != "blocked":
@@ -1447,7 +1527,23 @@ def cmd_unblock(args):
     if dest == "open":
         t.assignee = None
     sink.update(t, expect=expect)
+    if dest == "in_progress":
+        lifecycle = _lifecycle(args, sink)
+        if lifecycle.active_attempt(t.id) is None:
+            lifecycle.begin_attempt(t, t.assignee, ticket_event=None)
     print(f"unblocked {t.id}{was} -> {sink.location(t.id)}")
+
+
+def cmd_attempt_adopt(args):
+    """Adopt a ticket that was already in_progress when attempt tracking began.
+
+    The migration path, and deliberately the only way in: a legacy ticket gets an
+    attempt *now*, with no invented history, and the receipt says so. Reconstructing
+    activity that never happened would poison every later staleness decision these
+    timestamps exist to feed."""
+    sink = _require_sink(args)
+    t = sink.get(args.id, unique=True)
+    _emit_result(_lifecycle(args, sink).adopt(t, args.agent), args.json)
 
 
 def cmd_close(args):
@@ -1471,19 +1567,22 @@ def cmd_reopen(args):
     any of this runs, and the note it writes is exactly 'Reopened: <reason>.'
     (timestamped and attributed like every other automatic note). The ticket goes
     back to open with its closed date and any block reason cleared; a ticket that
-    is already open is still refused."""
+    is already open is still refused.
+
+    An attempt that is still active ends here, and old attempts and file claims stay
+    historical: nothing is re-acquired. Reopening a *prerequisite* is the interesting
+    case, so the tickets that depend on this one are handed to the operation as facts
+    -- the policy that only a *running* dependent is flagged lives there, and the flag
+    is an event rather than an undo."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     if t.status == "open":
         raise TicketError(f"ticket {t.id} is already open")
-    expect = _expect_from(t)
-    t.closed = None
-    t.blocked_by = None
-    t.status = "open"
-    t.updated = schema.now()
-    schema.append_note(t, args.agent, f"Reopened: {args.reason}.")
-    sink.update(t, expect=expect)
-    print(f"reopened {t.id} -> {sink.location(t.id)}")
+    dependents = [other for other in _all_tickets(sink) if t.id in other.depends_on]
+    result = _lifecycle(args, sink).reopen(
+        t, args.agent, args.reason, dependents=dependents
+    )
+    _emit_result(result, False)
 
 
 def cmd_submit(args):
@@ -1556,15 +1655,13 @@ def cmd_accept(args):
 
 
 def cmd_shelve(args):
+    """Park a ticket, ending the attempt that was working it.
+
+    Shelving is the worker's own decision to stop, so the attempt is *released*
+    rather than interrupted -- and nothing on disk is undone."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
-    expect = _expect_from(t)
-    t.status = "shelved"
-    t.updated = schema.now()
-    message = "Shelved." if not args.reason else f"Shelved: {args.reason}"
-    schema.append_note(t, "system", message)
-    sink.update(t, expect=expect)
-    print(f"shelved {t.id} -> {sink.location(t.id)}")
+    _emit_result(_lifecycle(args, sink).shelve(t, args.reason), False)
 
 
 def cmd_unshelve(args):
@@ -1848,6 +1945,16 @@ def cmd_set(args):
             )
         schema.validate_field(prop, value)
 
+    # The lifecycle guards come next, still before any write: a status or assignee
+    # change that would strand an active attempt is refused with the command that
+    # owns the transition (LC5's rule, and the reason `force` has no backdoor).
+    lifecycle = _lifecycle(args, sink)
+    for prop, value in pairs:
+        if prop == "status":
+            lifecycle.guard_status_change(t, value)
+        elif prop == "assignee":
+            lifecycle.guard_assignee_change(t, schema.coerce_field_value("assignee", value))
+
     expect = _expect_from(t)
     new_status = None
     updated_given = False
@@ -1902,9 +2009,15 @@ def cmd_set_status(args):
     vocabulary -- notably `review`, which no other command sets yet -- and
     `arbite doctor` is what catches the drift those dedicated commands prevent. The
     status vocabulary comes from `schema.STATUSES`, so a status added later is
-    accepted here without this command changing."""
+    accepted here without this command changing.
+
+    One thing it is not is a backdoor around a *running* attempt: a status whose
+    lifecycle command exists is refused when an attempt is active, with that command
+    named, because the attempt has to end with the ticket rather than being left
+    behind by a setter."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
+    _lifecycle(args, sink).guard_status_change(t, args.status)
     expect = _expect_from(t)
     t.updated = schema.now()
     _apply_status_change(t, args.status)
@@ -2231,6 +2344,43 @@ def build_parser():
     _json_flag(p_workspace_show)
     _sink_flag(p_workspace_show)
     p_workspace_show.set_defaults(func=cmd_workspace_show)
+
+    p_attempt = sub.add_parser(
+        "attempt",
+        help="work-attempt operations: record the attempt for already-started work",
+        description="Report the *attempt* side of a ticket: the durable record of one "
+        "worker's run at it, which is what file ownership and change evidence hang off. "
+        "'adopt' is the migration path for a ticket that was already in_progress when "
+        "arbite began tracking attempts -- it records an attempt starting *now*, and says "
+        "so, because inventing activity that happened before tracking would poison every "
+        "later staleness decision these timestamps exist to feed. Every other attempt is "
+        "created by the command that acquires the work ('claim', 'list next --claim', "
+        "'promote --agent'), which is where readiness and the one-active-attempt rule are "
+        "enforced.",
+    )
+    attempt_sub = p_attempt.add_subparsers(
+        dest="attempt_action", required=True, metavar="SUBCOMMAND"
+    )
+    _sink_flag(p_attempt)
+    p_attempt_adopt = attempt_sub.add_parser(
+        "adopt",
+        help="record the attempt for a ticket that was already in_progress",
+        description="Create the attempt that owns work already underway. The ticket has to be "
+        "in_progress, and it must not already have an active attempt or be assigned to a "
+        "different worker -- that is the takeover, and 'arbite claim --force --reason' is "
+        "what owns it. The attempt's timestamps start now, and the receipt states that no "
+        "earlier activity is implied by it.",
+    )
+    p_attempt_adopt.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_attempt_adopt.add_argument(
+        "--agent",
+        required=True,
+        help="agent id the adopted attempt is attributed to; when the ticket has an "
+        "assignee it must be that id (required)",
+    )
+    _json_flag(p_attempt_adopt)
+    _sink_flag(p_attempt_adopt)
+    p_attempt_adopt.set_defaults(func=cmd_attempt_adopt)
 
     p_events = sub.add_parser(
         "events",
@@ -2666,25 +2816,36 @@ def build_parser():
 
     p_claim = sub.add_parser(
         "claim",
-        help="claim a ticket: assign it and set its status to in_progress (the file sink "
-        "moves it to in_progress/), so no separate status call is needed",
+        help="claim a ticket: assign it, set it in_progress and start its work attempt",
         description="Set a ticket's assignee, status and updated together: claiming sets "
         "status to 'in_progress' and the assignee in one write (the file sink files the "
         "ticket under in_progress/), so a caller never needs a separate 'set status' after "
-        "claiming. The claim is a compare-and-swap: a ticket already assigned to another "
-        "agent is refused unless --force, and the write only lands if the ticket is still "
-        "in the state it was read in, so two agents racing for the same ticket cannot both "
-        "end up believing they own it. (Identity assignment and liveness remain the agent "
-        "harness's job.)",
+        "claiming -- and it records the attempt that owns the work, printing its id because "
+        "every later file command presents it. The claim is a compare-and-swap: a ticket "
+        "already assigned to another agent is refused unless --force, and the write only "
+        "lands if the ticket is still in the state it was read in, so two agents racing for "
+        "the same ticket cannot both end up believing they own it. Readiness (every "
+        "dependency closed), a real classification and the one-active-attempt rule are "
+        "checked by the acquisition itself, not by the queue that suggested the ticket, so "
+        "naming a ticket directly cannot bypass them. (Identity assignment and liveness "
+        "remain the agent harness's job.)",
     )
     p_claim.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     p_claim.add_argument("--agent", required=True, help="agent id claiming the ticket, e.g. claude.haiku.001 (required)")
     p_claim.add_argument(
         "--force",
         action="store_true",
-        help="take over a ticket already assigned to another agent (records the takeover "
-        "as a note); without this, claiming someone else's ticket is an error",
+        help="take over a ticket another worker holds (needs --reason): ends their attempt "
+        "as interrupted, records the revocation and starts a new attempt for you; without "
+        "this, claiming someone else's ticket is an error",
     )
+    p_claim.add_argument(
+        "--reason",
+        default=None,
+        help="why the takeover is justified; required with --force, because an "
+        "administrative override keeps its reason",
+    )
+    _json_flag(p_claim)
     _sink_flag(p_claim)
     p_claim.set_defaults(func=cmd_claim)
 

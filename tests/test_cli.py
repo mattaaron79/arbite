@@ -983,10 +983,18 @@ def test_list_next_claims_in_one_step_and_reports_a_dry_queue(project, cli):
 
 
 def test_claim_refuses_another_agents_ticket_unless_forced(project, cli):
+    """Losing a race is refused with the holder's attempt named (CL3); `--force` is the
+    administrative takeover and therefore takes a reason, because that reason is the
+    only record of why the previous worker lost the ticket."""
     tid = create(cli, "contested")
     cli("claim", tid, "--agent", "claude.haiku.001")
-    cli("claim", tid, "--agent", "claude.opus.001", expect=1)
-    cli("claim", tid, "--agent", "claude.opus.001", "--force")
+    proc = cli("claim", tid, "--agent", "claude.opus.001", expect=1)
+    assert tid in proc.stderr and "claude.haiku.001" in proc.stderr
+    # --force without a reason is refused before anything is written: an override
+    # without a "why" is exactly what the design rule forbids.
+    cli("claim", tid, "--agent", "claude.opus.001", "--force", expect=1)
+    assert json.loads(cli("show", tid, "--json").stdout)["assignee"] == "claude.haiku.001"
+    cli("claim", tid, "--agent", "claude.opus.001", "--force", "--reason", "user reassigned it")
     payload = json.loads(cli("show", tid, "--json").stdout)
     assert payload["assignee"] == "claude.opus.001"
     assert payload["status"] == "in_progress"  # a takeover does not re-open the ticket
@@ -1017,8 +1025,13 @@ def test_claim_sets_in_progress_and_files_the_ticket_under_in_progress(project, 
     cli("doctor")  # one ticket, one location: a move, not a duplicate
 
     # A claim that loses the race is refused, and the winner's ticket is untouched.
+    # The refusal is the compare-and-swap text plus the holder's attempt (CL3), which
+    # is the fact the old "already assigned to" message was missing.
     proc = cli("claim", tid, "--agent", "claude.opus.001", expect=1)
-    assert "already assigned to claude.haiku.001" in proc.stderr
+    assert "is not in the expected state" in proc.stderr
+    assert "assignee is claude.haiku.001, expected unassigned" in proc.stderr
+    assert "attempt held by: att-" in proc.stderr and "(claude.haiku.001)" in proc.stderr
+    assert "next: 'arbite list next --claim claude.opus.001'" in proc.stderr
     payload = json.loads(cli("show", tid, "--json").stdout)
     assert payload["assignee"] == "claude.haiku.001"
     assert payload["status"] == "in_progress"
@@ -1028,7 +1041,7 @@ def test_claim_sets_in_progress_and_files_the_ticket_under_in_progress(project, 
     # --force takes over: the assignee changes, the status stays in_progress (a
     # takeover is not a re-open), the ticket stays in in_progress/, and the
     # takeover is recorded as a note.
-    cli("claim", tid, "--agent", "claude.opus.001", "--force")
+    cli("claim", tid, "--agent", "claude.opus.001", "--force", "--reason", "user reassigned it")
     payload = json.loads(cli("show", tid, "--json").stdout)
     assert payload["assignee"] == "claude.opus.001"
     assert payload["status"] == "in_progress"

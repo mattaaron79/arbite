@@ -17,6 +17,17 @@ Text scenarios are compared byte for byte after normalisation. A scenario whose
 output is a JSON document is compared as *parsed* JSON with its string leaves
 normalised, because the document indents its blocks for reading while `--json`
 prints one key per line: the facts are the assertion, not the whitespace.
+
+Which stream a transcript's body belongs to is a fact about the outcome, not a
+choice a test makes:
+
+- A body that begins with an outcome label (`error:`, `busy:`, `stale_read:`) is a
+  *refusal*, and the CLI prints those on stderr -- that is where the exit-code
+  vocabulary has always been reported, whichever command produced it.
+- A block annotated `# exit N, note on stderr` says so explicitly (the batch-claim
+  transcript does: a table on stdout, one commentary line on stderr), and the trailing
+  `note:` lines are compared against stderr while the rest is compared against stdout.
+- Everything else is stdout, and the other stream must be empty.
 """
 
 from __future__ import annotations
@@ -26,7 +37,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -39,8 +50,15 @@ EXAMPLES_DOC = REPO_ROOT / ".arbite" / "planning" / "interaction-examples.md"
 DOC_ROOT = "/media/matt/m2tb/projects/arbite"
 
 SCENARIO_HEADING = re.compile(r"^## (?P<id>[A-Z]{2}[0-9]+) · (?P<title>.+?)\s*$")
-EXIT_LINE = re.compile(r"^#\s*exit\s+(?P<code>\d+)\s*$")
+#: `# exit N` ends the transcript; the document may annotate which stream the body
+#: went to (`# exit 0, note on stderr`), which is part of the frozen block.
+EXIT_LINE = re.compile(r"^#\s*exit\s+(?P<code>\d+)\s*(?P<annotation>.*)$")
 COMMAND_PREFIX = "$ "
+NOTE_PREFIX = "note:"
+#: The labels a refusal prints in front of its message. A transcript that starts with
+#: one of these says "this is what the command printed on stderr", so the harness does
+#: not have to guess which stream to compare (see the module docstring).
+REFUSAL_LABELS = ("error:", "busy:", "stale_read:")
 
 ID_RE = re.compile(r"\b(tic|ws|att|clm|op|art|evt)-[0-9a-f]{4}\b")
 UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -51,7 +69,11 @@ ARBITE_PATH_RE = re.compile(r"(?:[^\s\"'()]*[/\\])?\.arbite((?:[/\\][^\s\"'(),]*
 
 @dataclass(frozen=True)
 class Scenario:
-    """One frozen block: the command, what it must print, and its exit code."""
+    """One frozen block: the command, what it must print, and its exit code.
+
+    `stdout` is the transcript's body, which -- for a refusal, or for a block the
+    document annotates as writing a note to stderr -- is what the command printed on
+    stderr; `stderr` holds the note lines the annotation moved out of the body."""
 
     id: str
     title: str
@@ -59,10 +81,27 @@ class Scenario:
     exit_code: int
     stdout: str
     json_payload: Optional[dict] = None
+    stderr: str = ""
 
     @property
     def is_json(self) -> bool:
         return self.json_payload is not None
+
+    @property
+    def on_stderr(self) -> bool:
+        """Whether the body is a refusal, which the CLI reports on stderr."""
+        first = self.stdout.lstrip().splitlines()
+        return bool(first) and first[0].startswith(REFUSAL_LABELS)
+
+    def with_ticket(self, ticket_id: str, illustrative: str = "tic-cf9f") -> "Scenario":
+        """The frozen command with the document's illustrative ticket id replaced.
+
+        The document's ids are illustrative holders in its own words -- "the harness
+        substitutes every id before comparing output" -- and a command that *names* a
+        ticket has to point at the fixture's real ticket to be runnable at all."""
+        return replace(
+            self, command=tuple(ticket_id if arg == illustrative else arg for arg in self.command)
+        )
 
 
 def _blocks(text: str) -> list:
@@ -125,11 +164,14 @@ def scenario_block(scenario_id: str, path: Path = EXAMPLES_DOC) -> Scenario:
 
     Only the first fenced block under the heading is read: that is the transcript.
     A block whose body is a JSON document becomes a JSON scenario, and its `# exit N`
-    comment is the exit code, exactly as the text blocks carry theirs."""
+    comment is the exit code, exactly as the text blocks carry theirs. An annotation
+    after the code (`# exit 0, note on stderr`) moves the body's trailing `note:`
+    lines into `Scenario.stderr`, which is what makes a transcript that writes to both
+    streams assertable instead of half-checked."""
     for found_id, title, lines in _blocks(path.read_text(encoding="utf-8")):
         if found_id != scenario_id:
             continue
-        commands, body, exit_code = [], [], 0
+        commands, body, exit_code, annotation = [], [], 0, ""
         in_fence = False
         for line in lines:
             if line.startswith("```"):
@@ -145,10 +187,15 @@ def scenario_block(scenario_id: str, path: Path = EXAMPLES_DOC) -> Scenario:
             exit_match = EXIT_LINE.match(line.strip())
             if exit_match:
                 exit_code = int(exit_match.group("code"))
+                annotation = exit_match.group("annotation")
                 continue
             body.append(line)
         if not commands:
             raise AssertionError(f"scenario {scenario_id} has no command line in its block")
+        stderr = ""
+        if "stderr" in annotation:
+            body, notes = _split_trailing_notes(body)
+            stderr = "\n".join([*notes, ""]).strip("\n")
         text = "\n".join(body).strip("\n")
         payload = None
         stripped = text.lstrip()
@@ -164,8 +211,20 @@ def scenario_block(scenario_id: str, path: Path = EXAMPLES_DOC) -> Scenario:
             exit_code=exit_code,
             stdout="" if payload is not None else text,
             json_payload=payload,
+            stderr=stderr,
         )
     raise AssertionError(f"no scenario {scenario_id} in {path}")
+
+
+def _split_trailing_notes(body: list) -> tuple:
+    """`(body_without_notes, notes)`: the run of `note:` lines at the end of a block.
+
+    Only a *trailing* run is taken, so a transcript may still quote the word -- and a
+    block that prints notes in the middle keeps them where the document put them."""
+    cut = len(body)
+    while cut > 0 and body[cut - 1].strip().startswith(NOTE_PREFIX):
+        cut -= 1
+    return body[:cut], body[cut:]
 
 
 def normalise(text: str, root=None) -> str:
@@ -219,26 +278,52 @@ def run_scenario(scenario: Scenario, cwd, sink: Optional[str] = None):
     return run_cli(cwd, *scenario.command, sink=sink)
 
 
-def assert_scenario(scenario: Scenario, cwd, sink: Optional[str] = None) -> str:
-    """Run `scenario` and assert it matches its frozen transcript exactly."""
+def assert_scenario(scenario: Scenario, cwd, sink: Optional[str] = None, stream: Optional[str] = None) -> str:
+    """Run `scenario` and assert it matches its frozen transcript exactly.
+
+    Exit code, the body and the *other* stream are all asserted: a transcript that
+    belongs on stderr must not also appear on stdout (and the reverse), and a block the
+    document annotates as writing a note to stderr is checked on both streams.
+
+    `stream` overrides *which* stream the body belongs to, for the one refusal that is
+    deliberately not where refusals normally go: EV7's `--follow` refusal is printed on
+    stdout (the application layer says why), and the document records neither stream.
+    Everything else is decided by the body's own label (see the module docstring)."""
     proc = run_scenario(scenario, cwd, sink=sink)
     where = f"scenario {scenario.id} ('arbite {' '.join(scenario.command)}')"
     assert proc.returncode == scenario.exit_code, (
         f"{where} exited {proc.returncode}, expected {scenario.exit_code}\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
-    assert proc.stderr == "", f"{where} wrote to stderr:\n{proc.stderr}"
+    if scenario.stderr:
+        _assert_text(scenario, where, proc.stdout, scenario.stdout, cwd, "stdout")
+        _assert_text(scenario, where, proc.stderr, scenario.stderr, cwd, "stderr")
+        return proc.stdout
+    on_stderr = scenario.on_stderr if stream is None else stream == "stderr"
+    if on_stderr:
+        assert proc.stdout == "", f"{where} also wrote to stdout:\n{proc.stdout}"
+        actual_text, carrier = proc.stderr, proc.stderr
+    else:
+        assert proc.stderr == "", f"{where} wrote to stderr:\n{proc.stderr}"
+        actual_text, carrier = proc.stdout, proc.stdout
+    expected_text = scenario.stdout
     if scenario.is_json:
-        actual = normalise_payload(json.loads(proc.stdout), cwd)
+        assert carrier is proc.stdout, f"{where} is JSON, so it cannot be a refusal"
+        actual = normalise_payload(json.loads(actual_text), cwd)
         expected = normalise_payload(scenario.json_payload, cwd)
         assert actual == expected, (
             f"{where} JSON differs\nactual:   {json.dumps(actual, indent=2, sort_keys=True)}\n"
             f"expected: {json.dumps(expected, indent=2, sort_keys=True)}"
         )
     else:
-        actual = normalise(proc.stdout, cwd).strip("\n")
-        expected = normalise(scenario.stdout, cwd).strip("\n")
-        assert actual == expected, (
-            f"{where} text differs\n--- actual ---\n{actual}\n--- expected ---\n{expected}"
-        )
-    return proc.stdout
+        _assert_text(scenario, where, actual_text, expected_text, cwd, "text")
+    return carrier
+
+
+def _assert_text(scenario: Scenario, where: str, actual_text: str, expected_text: str, cwd, what: str):
+    """One stream compared after normalisation, with both sides printed on failure."""
+    actual = normalise(actual_text, cwd).strip("\n")
+    expected = normalise(expected_text, cwd).strip("\n")
+    assert actual == expected, (
+        f"{where} {what} differs\n--- actual ---\n{actual}\n--- expected ---\n{expected}"
+    )

@@ -372,6 +372,7 @@ The package exposes the console script `arbite`, providing:
 | Triage | `fetch [type]` (oldest raw ticket + injected `derived_note`), `promote <id>` (classify in place + freeze a `raw/processed/` snapshot, optionally `--agent` to claim it), `list raw` |
 | Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
 | Lifecycle | `claim`, `release`, `submit`, `accept`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen <id> --reason <text>` |
+| Attempts | `attempt` — `adopt <id> --agent <id>` records the attempt for a ticket that was already `in_progress`; every other attempt is created by the command that acquires the work |
 | Authoring | `note`, `set`, `set-status`, `depend`, `move`, `ref` (`add` / `rm` / `list`) |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
 | Reporting | `status` (per-status counts + total; `--epic`/`--domain`/`--tier`/`--assignee`, `--json`), `progress` (live epics and their full membership, in dependency order; `--epic`, `--json`) |
@@ -389,17 +390,21 @@ Key behaviours worth calling out:
   scratch payload area's size. It is read-only and always exits 0, and there is
   deliberately no `bind`: a relocated root or a repointed store is a new workspace,
   not a mutation, so there is no conflict path to resolve.
-- **Coordination state is groundwork so far.** The versioned records the file proxy
-  needs — workspace, work attempt, file claim, read observation, operation receipt,
-  artifact and event — exist, are validated, and are stored beside the tickets
+- **Coordination state is part built.** The versioned records the file proxy needs —
+  workspace, work attempt, file claim, read observation, operation receipt, artifact
+  and event — exist, are validated, and are stored beside the tickets
   (`.arbite/coordination/`) or in the ticket database. A multi-record operation is
   one commit on both sinks (a journal plus a process lock for the file sink, a real
   transaction for SQLite), records carry an explicit revision counter for an
-  optimistic write, and events take a stable per-store cursor. What does **not**
-  exist yet is the command surface that acquires a claim, reads or writes a file
-  through it, or recovers an interrupted operation: those arrive with the remaining
-  slices, so no command claims ownership of a file today. `arbite doctor --json`
-  names the coordination backend and its counts.
+  optimistic write, and events take a stable per-store cursor. **Work attempts are
+  live**: claiming a ticket (directly, through `list next --claim`, or with
+  `promote --agent`) records one, the lifecycle commands end it, and a takeover
+  revokes the attempt it replaces — all of it through the application layer, so a
+  setter or a batch cannot route around those rules. What does **not** exist yet is
+  file ownership itself: `arbite file …` (claims, reads, writes, edits) and the
+  recovery of an interrupted operation arrive with the remaining slices, so no command
+  claims ownership of a *file* today, and the `next:` line a claim prints is the step
+  that will. `arbite doctor --json` names the coordination backend and its counts.
 - **`arbite events [--after CURSOR | --tail N] [--include-reads]`** reads the event
   stream in cursor order, one line per event: the cursor, kind, subject, operation,
   ticket/attempt, actor, local time and outcome, then the cursor to resume from. It
@@ -421,10 +426,45 @@ Key behaviours worth calling out:
   queue that can never yield work.
 - **`arbite list next --claim <agent_id>`** selects *and* claims in one step,
   closing the race inherent in calling `list next` then `claim`. If it loses the race
-  for the top ticket it takes the next workable one rather than failing.
+  for the top ticket it takes the next workable one rather than failing, and a ticket
+  that already has an active attempt is never offered.
 - **`--count N`** turns `list next` into a batch pull; with `--claim` each claim is
   individually a compare-and-swap, so a short batch is a correct result, reported as
   such.
+- **`arbite claim <id> --agent <id>`** is the acquisition, and it is where the rules
+  live rather than in the queue that suggested the ticket: every `depends_on` must be
+  closed, the classification must be real (no `TODO:` placeholders), the ticket must be
+  `open` and unclaimed, and it must not already have an active attempt. It then records
+  the **work attempt** — one durable record per worker's run, printed as
+  `attempt: att-XXXX (generation N, …)` because every later file command presents that
+  id — and the ticket write is the compare-and-swap that decides which of two racing
+  claims wins: the loser is told the holder's attempt and takes other work. Claiming a
+  ticket this worker already holds returns the attempt it already has rather than
+  starting a second one. `--force` is the administrative takeover and therefore
+  requires `--reason`: it ends the holder's attempt as `interrupted`, records the
+  revocation, and starts a fresh attempt. Nothing anywhere infers that a worker is
+  gone from a timestamp.
+- **`arbite attempt adopt <id> --agent <id>`** is the migration path for a ticket that
+  was already `in_progress` when attempt tracking began (including a ticket claimed
+  before these records existed, or one placed there by `set status`/`promote` before
+  attempts). It records an attempt starting *now* and says so: no prior activity is
+  invented, because these timestamps are what a later staleness policy would decide
+  from. A ticket that already has an active attempt, or that is assigned to a different
+  worker, is refused — that is the takeover, and `claim --force` owns it.
+- **The lifecycle commands end the attempt they stop.** `release` and `shelve` end it
+  as `released`, `block` and `reopen` as `interrupted`, each recording the reason as
+  the attempt's handoff; nothing on disk is undone, and the receipt says so because the
+  next worker has to re-read it. Resuming blocked work with `unblock` starts a fresh
+  attempt for the worker it goes back to. Reopening a ticket that something else
+  depends on flags the *running* dependents with an `attempt.invalidated` event instead
+  of undoing their work, which is the documented order for that race: either the claim
+  lands first and is flagged, or the reopen lands first and the claim is refused as not
+  ready.
+- **`arbite set` is not a backdoor.** `set <id> status closed` on a ticket with an
+  active attempt is refused with the command that owns the transition (`arbite close`),
+  and so is moving the assignee while an attempt is running; statuses whose lifecycle
+  command does not exist yet (`review`) are still reachable, which the remaining
+  lifecycle-cascade slice closes.
 - **`arbite fetch`** implements the read-only half of the triage queue: it pulls the
   oldest `raw` ticket and prints it with a `derived_note` (a JSON field in `--json`
   mode, a leading block otherwise) telling the caller to classify it with

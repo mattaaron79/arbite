@@ -193,12 +193,20 @@ class OperationResult:
 
     `lines` is the text a language agent reads; `data` is the branchable form and
     is expected to carry the same facts (JSON may carry more -- never less).
-    `next_actions` are exact commands, and their rendering is `render_next_line`."""
+    `next_actions` are exact commands, and their rendering is `render_next_line`.
+
+    `text_hint` is the one case where the printed sentence is not that rendering: a
+    *successful* claim hands back the command to run next and a sentence explaining
+    why (the frozen CL1 transcript prints both), while JSON publishes the bare
+    command. Set, it is the complete `next:` line -- including the word `next:` -- and
+    it must name the very commands `next_actions` carries, so the two cannot describe
+    different next steps."""
 
     outcome: Outcome
     lines: list = field(default_factory=list)
     data: dict = field(default_factory=dict)
     next_actions: list = field(default_factory=list)
+    text_hint: Optional[str] = None
 
     @property
     def kind(self) -> str:
@@ -211,7 +219,7 @@ class OperationResult:
     def to_text(self) -> str:
         """The whole text output, ending with the `next:` line when there is one."""
         parts = list(self.lines)
-        hint = render_next_line(self.next_actions)
+        hint = self.text_hint if self.text_hint is not None else render_next_line(self.next_actions)
         if hint:
             parts.append(hint)
         return "\n".join(parts)
@@ -239,9 +247,22 @@ class OperationResult:
         return f"{label}: {first}"
 
 
-def succeeded(lines=None, data=None) -> OperationResult:
-    """A plain success."""
-    return OperationResult(Outcome(OK), list(lines or ()), dict(data or {}))
+def succeeded(lines=None, data=None, next_actions=None, text_hint=None) -> OperationResult:
+    """A plain success.
+
+    `next_actions` is not decoration: a *success* can have a next step that is only
+    true because it succeeded -- claiming a ticket hands back the attempt id a file
+    command needs -- and the frozen CL1 transcript prints that `next:` line after a
+    successful claim, so the success path has to be able to carry one. `text_hint` is
+    how that line reads in text when it is more than the command (see
+    `OperationResult`)."""
+    return OperationResult(
+        Outcome(OK),
+        list(lines or ()),
+        dict(data or {}),
+        list(next_actions or ()),
+        text_hint,
+    )
 
 
 def failed(message: str, reason: Optional[str] = None, data=None, lines=None) -> OperationResult:

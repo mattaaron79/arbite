@@ -66,5 +66,9 @@ def test_EV5_reads_are_a_separate_category(ev_project):
 
 def test_EV7_no_follow(ev_project):
     """A blocking watcher is a sleeping process, so the flag is refused -- and the
-    refusal teaches the pattern that works instead."""
-    examples.assert_scenario(examples.scenario_block("EV7"), ev_project)
+    refusal teaches the pattern that works instead.
+
+    This is the one refusal the CLI prints on **stdout** (the events surface says why:
+    the transcript puts both the error line and the hint there), so the harness is told
+    which stream this scenario belongs to rather than inferring it from the label."""
+    examples.assert_scenario(examples.scenario_block("EV7"), ev_project, stream="stdout")

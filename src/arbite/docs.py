@@ -692,6 +692,23 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     )
     add("")
     add(
+        "**A claim records an attempt, and hands you its id.** Claiming (directly, through `list next "
+        "--claim`, or with `promote --agent`) also records the *work attempt* that owns the work, and "
+        "prints it as `attempt: att-XXXX (generation N, ...)`: every later `arbite file` command "
+        "presents that id, so keep it. The acquisition checks the rules a queue only filters on -- "
+        "every `depends_on` must be closed, the classification must be real (no `TODO:` placeholders), "
+        "the ticket must be `open` and unclaimed, and it must not already have an active attempt -- so "
+        "naming a ticket directly cannot bypass them. `--force` is the administrative takeover, and it "
+        "needs `--reason`: it ends the holder's attempt as `interrupted`, records the revocation, and "
+        "starts a fresh attempt for you. For work that was already `in_progress` before arbite tracked "
+        "attempts (a ticket claimed long ago, or put there by `set status`), the migration path is "
+        "`arbite attempt adopt <id> --agent <your-id>`, which records an attempt starting now and says "
+        "so rather than inventing history. Release, block, shelve and reopen end the attempt they stop, "
+        "and reopening a ticket other work depends on flags the running dependents instead of undoing "
+        "their work."
+    )
+    add("")
+    add(
         "**Pull a batch with `--count N`.** `arbite list next --count 3` returns the 3 most urgent "
         "workable tickets instead of 1, so a dispatcher can fan work out to several agents in one "
         "query; adding `--claim <agent_id>` claims up to N of them. Each claim is individually "

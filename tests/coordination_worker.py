@@ -9,7 +9,8 @@ the holder really dies.
 Usage: python3 tests/coordination_worker.py <operation> <project-dir> <sink-kind> [args...]
 
 Exit codes: 0 for the operation (printing what it did), 3 for a lost revision race,
-9 for a deliberate death at a commit boundary.
+9 for a deliberate death at a commit boundary. `claim` and `claim-crash` run the real
+CLI in this process, so what races (or dies) is the acquisition an agent would run.
 """
 
 from __future__ import annotations
@@ -175,6 +176,65 @@ def op_lock(store, seconds: str) -> int:
     return 0
 
 
+def _wait_for_go(go: str, timeout: float = 30.0) -> bool:
+    """Block until the starting-gun file exists, so a race really is a race.
+
+    Without it the workers start whenever the parent happens to schedule them, and two
+    claims that never overlap prove nothing about what happens when they do."""
+    deadline = time.monotonic() + timeout
+    while not Path(go).exists():
+        if time.monotonic() > deadline:
+            print("no starting gun", file=sys.stderr)
+            return False
+        time.sleep(0.005)
+    return True
+
+
+def _run_cli(argv) -> int:
+    """The command surface, in this process, returning its exit code."""
+    from arbite.cli import main as cli_main
+
+    sys.argv = list(argv)
+    try:
+        cli_main()
+    except SystemExit as exit_code:
+        return 0 if exit_code.code is None else int(exit_code.code)
+    return 0
+
+
+def op_claim(store, ticket: str, agent: str, go: str) -> int:
+    """Claim one ticket through the real CLI, released by a shared starting gun.
+
+    The point is that nothing here re-implements the acquisition: the race is between
+    processes running `arbite claim`, which is what the transcripts describe. The
+    parent starts this process *in* the project directory, so the CLI resolves the same
+    store the others do."""
+    if not _wait_for_go(go):
+        return 4
+    # Nothing is printed: this process's stdout is the *claim's* stdout, so the parent
+    # can assert that a refused claim wrote nothing there.
+    return _run_cli(["arbite", "claim", ticket, "--agent", agent])
+
+
+def op_claim_crash(store, ticket: str, agent: str, boundary: str) -> int:
+    """Claim one ticket through the real CLI, and die at a commit boundary.
+
+    The hook is installed on the *class*, so the store the CLI opens for itself is the
+    one that dies: what the parent then inspects is a store a claim was interrupted in,
+    which is the only honest way to check that an attempt and its events are one unit.
+    """
+    from arbite.coordination.store import CoordinationStore
+
+    def die_at(*names) -> None:
+        # A hook installed on the class is reached through the instance, so it is called
+        # with (self, boundary); the boundary is the name it is given either way.
+        if names and names[-1] == boundary:
+            os._exit(9)
+
+    CoordinationStore.crash_hook = staticmethod(die_at)
+    return _run_cli(["arbite", "claim", ticket, "--agent", agent])
+
+
 def op_report(store) -> int:
     """What the store holds, for the parent to assert against."""
     journal_reader = getattr(store, "read_commit_journal", None)
@@ -207,6 +267,8 @@ OPERATIONS = {
     "write": (op_write, 0),
     "lock": (op_lock, 1),
     "report": (op_report, 0),
+    "claim": (op_claim, 3),
+    "claim-crash": (op_claim_crash, 3),
 }
 
 
