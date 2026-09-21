@@ -40,8 +40,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..errors import CoordinationError, RecordError
+from ..sinks.base import Problem
 from .locking import StoreLock
-from .records import RECEIPT_PENDING, Record, parse_record
+from .records import RECEIPT_PENDING, Record, document_id, parse_record
 from .store import (
     COMMIT_APPLIED,
     COMMIT_STAGED,
@@ -218,6 +219,25 @@ class SqliteCoordinationStore(CoordinationStore):
             "SELECT document FROM coordination_records WHERE record_type = ? ORDER BY record_id",
             (record_type,),
         ).fetchall()
+
+    def _raw_documents(self, record_type: str) -> list:
+        """The stored documents of one record type, without interpreting them.
+
+        The read a migration needs (see `CoordinationStore.raw_documents`): a document
+        written by an older arbite would be refused by `parse_record`, and a copy has to
+        start from the bytes this database holds -- which are the same bytes the file
+        backend keeps (see `_dumps`). Ordered as the validating read is, so two
+        migrations of one store write in the same order."""
+        entries = []
+        with self._connection() as conn:
+            if not self._table_exists(conn):
+                return []
+            for row in self._rows(conn, record_type):
+                document = _loads(row["document"])
+                entries.append((document_id(document), document))
+        if record_type == "event":
+            return sorted(entries, key=lambda entry: (entry[1].get("cursor") or 0, entry[0]))
+        return sorted(entries, key=lambda entry: entry[0])
 
     def _records(self, record_type: str) -> list:
         stored = []
@@ -470,6 +490,77 @@ class SqliteCoordinationStore(CoordinationStore):
         records between sinks)."""
         if not self._has_table(conn, "coordination_artifacts"):
             conn.executescript(COORDINATION_DDL)
+
+    def storage_problems(self, fix: bool = False) -> list:
+        """The findings only this backend's own tables can have: revision rows whose
+        record is gone.
+
+        The mirror of the ticket sink's orphaned index rows (a row that outlived the
+        ticket it points at), and reported the same way: the records are authoritative
+        and the counter is bookkeeping, so a repair drops the row. A database that was
+        never initialised has no counters to check and reports nothing."""
+        with self._connection() as conn:
+            if not self._has_table(conn, "coordination_revisions"):
+                return []
+            orphans = self._orphan_revision_rows(conn)
+            if not orphans:
+                return []
+            dropped = self._drop_revision_rows(conn, orphans) if fix else False
+        names = ", ".join(f"{record_type}/{record_id}" for record_type, record_id in orphans)
+        return [
+            Problem(
+                "orphan_revision_rows",
+                f"{len(orphans)} revision row(s) name a record this store does not have "
+                f"({names})"
+                + (
+                    " -- dropped, the counters are this store's own bookkeeping"
+                    if dropped
+                    else " (re-run with --fix to drop them)"
+                ),
+                fixed=dropped,
+            )
+        ]
+
+    def _orphan_revision_rows(self, conn) -> list:
+        """`(record_type, record_id)` for every counter whose record row is gone.
+
+        A database holding counters but no records table is all orphans: the counters
+        are the only half that exists."""
+        if not self._table_exists(conn):
+            rows = conn.execute(
+                "SELECT record_type, record_id FROM coordination_revisions "
+                "ORDER BY record_type, record_id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT counter.record_type AS record_type, counter.record_id AS record_id "
+                "FROM coordination_revisions counter "
+                "LEFT JOIN coordination_records record "
+                "ON record.record_type = counter.record_type "
+                "AND record.record_id = counter.record_id "
+                "WHERE record.record_id IS NULL "
+                "ORDER BY counter.record_type, counter.record_id"
+            ).fetchall()
+        return [(row["record_type"], row["record_id"]) for row in rows]
+
+    def _drop_revision_rows(self, conn, orphans) -> bool:
+        """Forget counters for records that are not there, in one transaction."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for record_type, record_id in orphans:
+                conn.execute(
+                    "DELETE FROM coordination_revisions "
+                    "WHERE record_type = ? AND record_id = ?",
+                    (record_type, record_id),
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return True
 
     def counts(self) -> dict:
         """The totals the report needs, derived from the records themselves.

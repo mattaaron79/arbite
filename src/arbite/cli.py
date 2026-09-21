@@ -32,6 +32,7 @@ from .coordination import claims as coordination_claims
 from .coordination import discovery as coordination_discovery
 from .coordination import evidence as coordination_evidence
 from .coordination import lifecycle as coordination_lifecycle
+from .coordination import migrate as coordination_migrate
 from .coordination import moves as coordination_moves
 from .coordination import reads as coordination_reads
 from .coordination import recovery as coordination_recovery
@@ -39,6 +40,7 @@ from .coordination import results as outcomes
 from .coordination import scratch as coordination_scratch
 from .coordination import writes as coordination_writes
 from .coordination.scratch import ensure_scratch_dir, note_lines, scratch_summary
+from .coordination.store import open_coordination_store
 from .errors import ArbiteError, Busy, Conflict, NotReady, TicketError, UsageRefused
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
@@ -680,18 +682,42 @@ def cmd_workspace_show(args):
 
 
 def cmd_receipt(args):
-    """Print one operation's recorded evidence, reproduced rather than summarised.
+    """Print one operation's recorded evidence, or the summary a devlog is generated from.
 
-    The receipt is what makes a change checkable after the fact: the version it replaced, the
-    version it wrote, and where those bytes are kept. Both versions are read back out of the
-    store and proved against the digests the receipt records before anything is printed, so a
-    digest in this report is a claim arbite checked; a receipt whose evidence is no longer
-    there is refused with nothing changed, because that is drift and not a missing report.
-    Nothing is summarised and nothing is uploaded: agent prose about a change belongs in a
-    ticket note, and this command reports bytes."""
+    Two forms, and the difference is reproduction versus record:
+
+    - `arbite receipt OP` prints one operation's evidence. The version it replaced, the version
+      it wrote, and where those bytes are kept, both read back out of the store and proved
+      against the digests the receipt records before anything is printed, so a digest here is a
+      claim arbite checked. A receipt whose evidence is no longer there is refused with nothing
+      changed, because that is drift and not a missing report.
+    - `arbite receipt --summary` prints every operation in the order it happened -- one row per
+      operation-path, with who did it, when, the ticket and attempt it belonged to, and both
+      versions -- plus what the store is still holding. That is the export a devlog is written
+      from, because `.arbite/coordination/` and the SQLite database are ignored by git and die
+      with the machine: this is the summary to take *before* anyone prunes anything.
+
+    Neither form is written to a file and nothing is uploaded: redirect the output if you want
+    it in the repository, and agent prose about a change belongs in a ticket note."""
     sink = _require_sink(args)
-    result = _evidence(args, sink).receipt(args.operation)
+    views = _evidence(args, sink)
+    if args.summary:
+        if args.operation is not None:
+            raise TicketError(
+                "--summary reports every operation, so it takes no operation id; narrow it with "
+                "'--ticket <id>' instead"
+            )
+        result = views.summary(args.ticket)
+    else:
+        if args.operation is None:
+            raise TicketError(
+                "name the operation id to read one receipt, or pass --summary for the receipt "
+                "summary a devlog is generated from"
+            )
+        result = views.receipt(args.operation)
     _emit_result(result, args.json)
+    if result.exit_code:
+        sys.exit(result.exit_code)
 
 
 def cmd_changes(args):
@@ -2465,24 +2491,43 @@ def cmd_doctor(args):
     whose bytes are exactly one of its two recorded versions is finalised. Bytes that match
     neither are reported, with all three versions, and left alone.
 
-    Exits 3 when problems remain, so this can gate CI or an agent's startup."""
+    Exits 3 when problems remain, so this can gate CI or an agent's startup.
+
+    Both halves are asked through *their own* interface rather than through a list of
+    kinds kept here: the sink reports its findings (`sink.check`), and the coordination
+    store reports its own (`store.record_problems`), which is where the shared findings
+    and the backend's storage-specific ones meet. Which finding belongs to which half is
+    therefore a property of the store, not of this function."""
     sink = _require_sink(args)
     problems = sink.check(fix=args.fix)
     info = sink.describe()
     app = _coordination_app(args, sink)
-    tickets = [ticket.id for ticket in _all_tickets(sink)]
+    tickets = _all_tickets(sink)
+    ticket_ids = [ticket.id for ticket in tickets]
+    # The closed set is what makes "an attempt is still active on a closed ticket"
+    # answerable; it is a status filter rather than a count, because the finding is about
+    # which ticket a record names and not about how many tickets there are.
+    closed_tickets = [ticket.id for ticket in tickets if ticket.status == "closed"]
+    storage_findings = app.store.storage_problems(fix=args.fix)
     if args.fix:
         problems.extend(
             coordination_recovery.repair(
                 app.store,
-                ticket_ids=tickets,
+                ticket_ids=ticket_ids,
                 root=app.project_root,
                 known_command=knows_command,
+                closed_tickets=closed_tickets,
+                storage_findings=storage_findings,
             )
         )
     else:
         problems.extend(
-            coordination_recovery.findings(app.store, ticket_ids=tickets)
+            coordination_recovery.findings(
+                app.store,
+                ticket_ids=ticket_ids,
+                closed_tickets=closed_tickets,
+                storage_findings=storage_findings,
+            )
         )
     fixed = sum(1 for p in problems if p.fixed)
     remaining = sum(1 for p in problems if not p.fixed)
@@ -2576,13 +2621,25 @@ def cmd_delete(args):
 
 
 def cmd_migrate(args):
-    """Copy every ticket from one sink into another.
+    """Copy every ticket, and the coordination state, from one sink into another.
 
     A copy, never a move (unless --prune asks for the cleanup), so migrating is
     reversible. Reading every ticket from one sink and writing it to the other
     exercises the whole interface -- ids, timestamps, body, tags, dependencies,
     notes, buckets -- which is why this command doubles as the end-to-end proof
     that two independent sinks agree.
+
+    The coordination half travels with the tickets (`coordination.migrate`), because
+    a claim left behind in the store nobody consults is not ownership. Records are
+    copied exactly -- ids, generations, actors, operation ids, event cursors and the
+    write counters a read token means -- and a store written by an older arbite is
+    carried forward from its own documents rather than refused. Evidence bytes go
+    with them, so a receipt in the destination can still reproduce its versions.
+    Live work refuses the switch before anything is copied, and the destination's own
+    coordination records are replaced only with --overwrite.
+
+    --prune is about tickets only: coordination state is never deleted, here or
+    anywhere else, because there is no retention policy for evidence yet.
 
     A successful migration also makes the destination the project default: the
     tickets live there now, and leaving `sink:` pointing at the store you migrated
@@ -2610,6 +2667,18 @@ def cmd_migrate(args):
         print(f"no tickets found in the {source.kind} sink at {source.root}")
         sys.exit(EXIT_EMPTY)
 
+    # The coordination half is planned *before* a single ticket is copied: live work
+    # (a claim or an attempt a process is working under right now) must stop the whole
+    # switch, not half of it, and a destination holding work of its own needs the same
+    # answer before anything is written anywhere.
+    source_coordination = open_coordination_store(source)
+    target_coordination = open_coordination_store(target)
+    coordination_plan = coordination_migrate.plan(
+        source_coordination, target_coordination, overwrite=args.overwrite
+    )
+    if coordination_plan.is_blocked:
+        _emit_file_result(coordination_migrate.refused(coordination_plan), as_json=False)
+
     if args.dry_run:
         present = (
             sum(1 for t in tickets if target.exists(t.id)) if _target_exists(target) else 0
@@ -2628,6 +2697,8 @@ def cmd_migrate(args):
                 )
             else:
                 print(f"would prune {len(tickets)} ticket(s) from the {source.kind} sink")
+        for line in coordination_migrate.plan_lines(coordination_plan):
+            print(line)
         return
 
     target.init()
@@ -2655,6 +2726,16 @@ def cmd_migrate(args):
     if skipped:
         summary += f" ({len(skipped)} already present, skipped: {', '.join(sorted(skipped))})"
     print(summary)
+
+    # The tickets are across, so the coordination records follow them: the destination is
+    # about to become the store this project consults, and a claim that stayed behind would
+    # be ownership nobody checks. `--prune` below touches tickets only -- evidence is never
+    # deleted, which is why the source's coordination records stay exactly where they are.
+    coordination_report = coordination_migrate.transfer(
+        source_coordination, target_coordination, overwrite=args.overwrite
+    )
+    for line in coordination_migrate.summary_lines(coordination_report):
+        print(line)
 
     if args.prune:
         # The copy is done; pruning is the destructive half, and it is refused
@@ -3319,15 +3400,37 @@ def build_parser():
 
     p_receipt = sub.add_parser(
         "receipt",
-        help="print one operation's receipt: both versions and the evidence kept",
+        help="print one operation's receipt, or the receipt summary a devlog is built from",
         description="Print one operation's recorded evidence: what it was, who did it, the "
         "paths it named, both versions with the size or line count each one has, and the "
         "artifact that holds them. Every version is read back out of the store and checked "
         "against the digest the receipt records before anything is printed, so a digest here "
-        "is one arbite verified. Nothing is summarised: use 'arbite changes <ticket>' for what "
-        "a ticket's operations add up to.",
+        "is one arbite verified. Use 'arbite changes <ticket>' for what a ticket's operations "
+        "add up to. With --summary, print every operation instead, in the order it happened: "
+        "one row per operation-path with its ticket, attempt, actor, result and both version "
+        "digests, plus the evidence the store is still holding. That summary is the export a "
+        "devlog is generated from, because coordination state is local and is lost with the "
+        "machine -- take it before anything is pruned. Both forms write to stdout only; "
+        "redirect it if the summary should live in the repository.",
     )
-    p_receipt.add_argument("operation", metavar="OP", help="the operation id, e.g. op-2b8d17")
+    p_receipt.add_argument(
+        "operation",
+        metavar="OP",
+        nargs="?",
+        default=None,
+        help="the operation id, e.g. op-2b8d17 (required unless --summary is given)",
+    )
+    p_receipt.add_argument(
+        "--summary",
+        action="store_true",
+        help="print the receipt summary -- every operation in log order with both versions, "
+        "and the evidence the store holds -- instead of reading one receipt",
+    )
+    p_receipt.add_argument(
+        "--ticket",
+        default=None,
+        help="with --summary, report only this ticket's operations",
+    )
     _json_flag(p_receipt)
     _sink_flag(p_receipt)
     p_receipt.set_defaults(func=cmd_receipt)
@@ -4231,11 +4334,19 @@ def build_parser():
         help="copy every ticket from one sink into another",
         description="Read every ticket from the source sink (status-managed tickets and "
         "bucketed ones alike) and write it to the destination sink, preserving ids, "
-        "timestamps, body, tags, dependencies, notes and buckets verbatim. The source is "
-        "never modified -- this is a copy -- and a successful run makes the destination the "
-        "project default, so later commands read the store the tickets now live in. Tickets "
-        "already present in the destination are skipped unless --overwrite is given; --prune "
-        "additionally retires the source store once the copy is verified.",
+        "timestamps, body, tags, dependencies, notes and buckets verbatim. The coordination "
+        "records -- attempts, claims, read observations, receipts, artifacts and the event "
+        "stream -- are copied in the same run, record for record and byte for byte, with "
+        "their event cursors, write counters and workspace binding intact, and the evidence "
+        "bytes a receipt names go with them; a store written by an older arbite is brought "
+        "forward from its own documents. Live work stops the switch before anything is "
+        "copied (finish it, or release what nobody can use), and a destination that already "
+        "holds coordination records needs --overwrite. The source is never modified -- this "
+        "is a copy -- and a successful run makes the destination the project default, so "
+        "later commands read the store the tickets now live in. Tickets already present in "
+        "the destination are skipped unless --overwrite is given; --prune additionally "
+        "retires the source store's tickets once the copy is verified, and never touches "
+        "coordination state: evidence is not pruned anywhere yet.",
     )
     p_migrate.add_argument(
         "--to",
@@ -4262,8 +4373,9 @@ def build_parser():
     p_migrate.add_argument(
         "--overwrite",
         action="store_true",
-        help="replace destination tickets that already use one of the source ids, instead "
-        "of skipping them",
+        help="replace destination tickets that already use one of the source ids (instead of "
+        "skipping them), and replace the destination's coordination records with the source's "
+        "-- a live claim or attempt in either store refuses the switch regardless",
     )
     p_migrate.add_argument(
         "--prune",

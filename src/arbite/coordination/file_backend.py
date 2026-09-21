@@ -60,6 +60,7 @@ from pathlib import Path
 from ..errors import CoordinationError, RecordError
 from ..sinks.base import Problem
 from ..sinks.file import TMP_PREFIX, write_atomic
+from . import records
 from .locking import LOCK_POLL_SECONDS, LOCK_TIMEOUT, StoreLock
 from .records import (
     RECEIPT_PENDING,
@@ -555,6 +556,42 @@ class FileCoordinationStore(CoordinationStore):
             return sorted(stored, key=lambda event: (event.cursor, event.id))
         return sorted(stored, key=lambda record: record.id)
 
+    def _raw_documents(self, record_type: str) -> list:
+        """The stored JSON of one record type, without interpreting it.
+
+        The read a migration needs (see `CoordinationStore.raw_documents`): a document
+        written by an older arbite would be refused by `parse_record`, and a copy has to
+        start from the bytes. It is the same file set the validating read uses and the
+        same order (events by cursor, everything else by id), so two migrations of one
+        store write in the same order; what differs is only that nothing is validated
+        here, so the caller is the one that decides what a document means."""
+        if record_type == "workspace":
+            path = self._root / WORKSPACE_FILENAME
+            if not path.is_file():
+                return []
+            document = self._raw_json(path)
+            return [(records.document_id(document), document)]
+        entries = []
+        for path in self._documents(record_type):
+            document = self._raw_json(path)
+            entries.append((records.document_id(document), document))
+        if record_type == "event":
+            return sorted(entries, key=lambda entry: (entry[1].get("cursor") or 0, entry[0]))
+        return sorted(entries, key=lambda entry: entry[0])
+
+    def _raw_json(self, path: Path) -> dict:
+        """One stored document, read but not checked: a file that is not a JSON object is
+        an error naming it, because a copy that skipped it would lose a record silently."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            raise CoordinationError(f"could not read {path}: {e}")
+        except ValueError as e:
+            raise RecordError(f"{path} is not a valid JSON coordination record: {e}")
+        if not isinstance(data, dict):
+            raise RecordError(f"{path} does not hold a coordination record (a JSON object)")
+        return data
+
     def _get_record(self, record_type: str, record_id: str) -> Record:
         for record in self._records(record_type):
             if record.id == record_id:
@@ -619,16 +656,21 @@ class FileCoordinationStore(CoordinationStore):
             if path.is_file() and (path.stem == record_id or path.stem.endswith(f"-{record_id}"))
         ]
 
-    def record_problems(self, ticket_ids=None) -> list:
-        """The shared findings, plus the one only this backend can have: a commit
-        journal left behind by a process that died mid-commit.
+    def storage_problems(self, fix: bool = False) -> list:
+        """The findings only this backend's own documents can have.
 
-        Reported rather than silently replayed, to keep a read a read: the next
-        *write* finishes it (which decides nothing -- the journal names the documents
-        and their absolute revisions), and until then a reader is told that a commit
-        is outstanding instead of being shown a half-applied unit of work as if it
-        were finished."""
-        problems = super().record_problems(ticket_ids)
+        Two, both about files this backend keeps *beside* the records: a commit journal
+        a dead process left behind, and revision counters naming a record that is no
+        longer there. Neither is a record's meaning, which is why both live here rather
+        than in the shared findings stream.
+
+        The journal is reported and never replayed by a repair: the next *write* finishes
+        it (which decides nothing -- the journal names the documents and their absolute
+        revisions), and until then a reader is told that a commit is outstanding instead
+        of being shown a half-applied unit of work as if it were finished. A counter
+        naming nothing is unambiguous, so `fix` drops it -- the counter is this backend's
+        own bookkeeping and says nothing about any record."""
+        problems = []
         journal = self.read_commit_journal()
         if journal is not None:
             staged = ", ".join(
@@ -641,7 +683,61 @@ class FileCoordinationStore(CoordinationStore):
                     "finish; the next write to this store replays it",
                 )
             )
+        orphans = self.orphan_revision_counters()
+        if orphans:
+            dropped = self._drop_revision_counters(orphans) if fix else False
+            problems.append(
+                Problem(
+                    "orphan_revision_counters",
+                    f"{len(orphans)} revision counter(s) name a record this store does not "
+                    f"have ({', '.join(orphans)})"
+                    + (
+                        " -- dropped, the counters are this store's own bookkeeping"
+                        if dropped
+                        else " (re-run with --fix to drop them)"
+                    ),
+                    fixed=dropped,
+                )
+            )
         return problems
+
+    def orphan_revision_counters(self) -> list:
+        """The `type/id` keys in the revision counters whose record is not in the store.
+
+        Read as text rather than through the records: that is what makes it a finding
+        about *this backend's* bookkeeping rather than about a record. A counter whose
+        record cannot be looked for -- an unknown type, a document that will not parse --
+        is left alone, because "I could not tell" is not "it is not there"."""
+        orphans = []
+        for key in sorted(self._read_revisions()):
+            record_type, _, record_id = key.partition("/")
+            if record_type not in CONTAINER_DIRS and record_type != "workspace":
+                continue
+            try:
+                present = self._document_present(record_type, record_id)
+            except RecordError:
+                continue
+            if not present:
+                orphans.append(key)
+        return orphans
+
+    def _document_present(self, record_type: str, record_id: str) -> bool:
+        """Whether the document a counter names is on disk under the id the counter uses."""
+        if record_type == "workspace":
+            path = self._root / WORKSPACE_FILENAME
+            if not path.is_file():
+                return False
+            return self._raw_json(path).get("id") == record_id
+        return bool(self._documents_for(record_type, record_id))
+
+    def _drop_revision_counters(self, keys) -> bool:
+        """Forget counters for records that are not there, under the store's own lock."""
+        with self._exclusive():
+            revisions = self._read_revisions()
+            for key in keys:
+                revisions.pop(key, None)
+            self._write_revisions(revisions)
+        return True
 
     def counts(self) -> dict:
         """The totals the report needs, derived from the records themselves.

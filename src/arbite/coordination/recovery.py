@@ -25,8 +25,10 @@ stages anything of its own.
 
 The findings render in a fixed order, because the report is meant to be acted on from
 the top: a live claim nobody can use, then an unfinished mutation, then the records that
-name something missing. `Problem`s are what `doctor` prints; `OperationJudgement`s are
-what callers needing the detail work from (the journal's retry path, later receipt views).
+name something missing -- and last the store's own bookkeeping, which is not about the
+work at all (see `CoordinationStore.storage_problems`). `Problem`s are what `doctor`
+prints; `OperationJudgement`s are what callers needing the detail work from (the
+journal's retry path, later receipt views).
 """
 
 from __future__ import annotations
@@ -106,6 +108,14 @@ ATTEMPT_OUTCOME_WORDS = {
 #: forbids, and a stopped worker is never inferred from a timestamp.
 ORPHANED_CLAIM = "orphaned_claim"
 CLAIM_WITHOUT_ATTEMPT = "claim_without_attempt"
+
+#: An attempt still *active* on a ticket that is closed. Reported, never repaired: the
+#: record itself is the inconsistency (a closed ticket ends its attempt and releases its
+#: claims, so this one cannot mutate anything), but the attempt's own `ended` time and
+#: outcome were never recorded, and writing "ended now" would say the attempt ran until
+#: the repair -- which is not what happened, and is exactly the invented history the plan
+#: refuses. Only a lifecycle command, with an agent and a reason, can end it honestly.
+ATTEMPT_ON_CLOSED_TICKET = "attempt_on_closed_ticket"
 
 
 def stage_path(root, path: str, operation_id: str) -> Path:
@@ -491,20 +501,34 @@ def _record_drift(store, outcome: OperationJudgement, preserved: Optional[str]) 
 # ---------------------------------------------------------------------------
 
 
-def findings(store, ticket_ids=None, operation_findings=None) -> list:
+def findings(
+    store, ticket_ids=None, closed_tickets=None, operation_findings=None, storage_findings=()
+) -> list:
     """Every coordination finding, in the order a reader acts on them.
 
     Three phases, because the correct response follows the phase: a claim a live holder
     cannot use (release it), an unfinished mutation (judge it), then the records that name
     something missing (inspect them). `operation_findings` lets a caller that has already
     judged (and perhaps reconciled) the pending operations hand its rendering of phase two
-    in, instead of judging them again with a possibly different answer.
+    in, instead of judging them again with a possibly different answer. `closed_tickets`
+    is the ticket store's closed set, which is what makes "this attempt is still active on
+    a ticket nobody can mutate" answerable at all.
+
+    `storage_findings` come last, and they are the backend's own (see
+    `CoordinationStore.storage_problems`): they are about the store's bookkeeping rather
+    than about the work, so they belong after the things wrong with the work itself.
     """
     ownership, dangling = _claim_findings(store)
     operations = (
         operation_findings if operation_findings is not None else operation_problems(store)
     )
-    return [*ownership, *operations, *dangling, *_other_findings(store, ticket_ids)]
+    return [
+        *ownership,
+        *operations,
+        *dangling,
+        *_other_findings(store, ticket_ids, closed_tickets),
+        *storage_findings,
+    ]
 
 
 def operation_problems(store, root=None) -> list:
@@ -642,7 +666,7 @@ def _ended_reason(attempt: WorkAttempt) -> str:
     return f"attempt {attempt.state} {attempt.ended}"
 
 
-def _other_findings(store, ticket_ids=None) -> list:
+def _other_findings(store, ticket_ids=None, closed_tickets=None) -> list:
     """The record findings that are about neither claims nor unfinished operations."""
     problems = []
     ambiguous = multiple_workspace_problem(store)
@@ -650,6 +674,7 @@ def _other_findings(store, ticket_ids=None) -> list:
         problems.append(ambiguous)
     workspace_id = _workspace_id(store)
     known_tickets = set(ticket_ids) if ticket_ids is not None else None
+    closed = set(closed_tickets) if closed_tickets is not None else None
     for attempt in store.records("attempt"):
         if workspace_id is not None and attempt.workspace_id != workspace_id:
             problems.append(
@@ -666,6 +691,14 @@ def _other_findings(store, ticket_ids=None) -> list:
                     "attempt_without_ticket",
                     f"attempt {attempt.id} names ticket {attempt.ticket_id}, which is not in "
                     "the ticket store",
+                    ticket_id=attempt.ticket_id,
+                )
+            )
+        if closed is not None and attempt.is_active and attempt.ticket_id in closed:
+            problems.append(
+                Problem(
+                    ATTEMPT_ON_CLOSED_TICKET,
+                    active_attempt_on_closed_ticket_detail(attempt),
                     ticket_id=attempt.ticket_id,
                 )
             )
@@ -706,14 +739,22 @@ def multiple_workspace_problem(store) -> Optional[Problem]:
     return None
 
 
-def repair(store, ticket_ids=None, root=None, known_command=None) -> list:
+def repair(
+    store, ticket_ids=None, root=None, known_command=None, closed_tickets=None,
+    storage_findings=(),
+) -> list:
     """`doctor --fix`: repair what is unambiguous, report what is not.
 
     The two unambiguous repairs are releasing a claim nobody can use (its attempt is over
     or never existed -- never a live one) and finalising an unfinished operation whose
     bytes are exactly one of the two recorded versions. Drift stays a problem, and the
     report says why rather than guessing; a claim somebody else moved while the repair ran
-    is re-reported from the fresh state rather than forced."""
+    is re-reported from the fresh state rather than forced. An active attempt on a closed
+    ticket is reported and left exactly as it is (see `ATTEMPT_ON_CLOSED_TICKET`).
+
+    `storage_findings` is what the backend's own `storage_problems(fix=True)` produced, so
+    the report names the bookkeeping a repair just dropped rather than saying nothing
+    about it."""
     root = root if root is not None else workspace_root(store)
     outcomes = reconcile(store, root)
     phase_two = [
@@ -728,7 +769,13 @@ def repair(store, ticket_ids=None, root=None, known_command=None) -> list:
         _finalised_problem(outcome) for outcome in outcomes if outcome.finalised is not None
     ]
     ownership, dangling = _repair_claims(store)
-    return [*ownership, *phase_two, *dangling, *_other_findings(store, ticket_ids)]
+    return [
+        *ownership,
+        *phase_two,
+        *dangling,
+        *_other_findings(store, ticket_ids, closed_tickets),
+        *storage_findings,
+    ]
 
 
 def _finalised_problem(outcome: OperationJudgement) -> Problem:
@@ -781,6 +828,23 @@ def _repair_claims(store) -> tuple:
             )
         )
     return ownership, dangling
+
+
+def active_attempt_on_closed_ticket_detail(attempt: WorkAttempt) -> str:
+    """The wording for an attempt that is still active on a closed ticket.
+
+    Both honest ways out are named, because which one is right depends on something the
+    store cannot know: whether the work is finished (release it) or was closed by mistake
+    (reopen it). The commands are the real lifecycle ones, with the flags they require --
+    guidance naming a command nobody can run would send the reader into an argument error.
+    """
+    return (
+        f"attempt {attempt.id} is still active, but {attempt.ticket_id} is closed -- a closed "
+        f"ticket ends\n{PROBLEM_CONTINUATION}its attempt and releases its claims, so this one "
+        f"cannot mutate anything;\n{PROBLEM_CONTINUATION}'arbite release {attempt.ticket_id} "
+        f"--agent {attempt.worker_id} --reason <why>' to end it, or 'arbite reopen\n"
+        f"{PROBLEM_CONTINUATION}{attempt.ticket_id} --reason <why>' to make it workable again"
+    )
 
 
 def orphaned_claim_detail(claim: FileClaim, attempt: WorkAttempt) -> str:

@@ -14,8 +14,9 @@ Three properties are enforced here rather than left to a backend:
 - **Every record is versioned.** `to_dict()` writes a `record` discriminator and
   the `schema_revision` the record was written under; `from_dict()` refuses a
   record whose revision is not the one this arbite knows, by name, instead of
-  half-reading fields it may be misinterpreting. A later slice migrates old
-  records (tic-008f); nothing here guesses.
+  half-reading fields it may be misinterpreting. Bringing an older record forward
+  is a separate, explicit act (`upgrade_document`, used by the migration pass):
+  a read never rewrites what it read, and nothing here guesses.
 - **Every record validates itself** in one `validate()` that both backends call on
   write and on read, so "what a claim is" cannot differ between the file sink and
   SQLite. The invariants encoded are the ones the coordination handoff states:
@@ -50,7 +51,8 @@ from ..errors import RecordError
 #: Revision 2 adds `ReadObservation.spent_by`: one token authorises one mutation, so
 #: the token records which operation used it (tic-60c7). A revision-1 record is
 #: refused by name rather than half-read, which is the deliberate cost of the bump:
-#: a store written before it needs the migration pass tic-008f/C12 owns.
+#: it is carried forward by `upgrade_document` -- mechanically, on the copy a
+#: migration takes -- so a store written before the bump is moved, not misread.
 COORDINATION_SCHEMA_REVISION = 2
 
 #: The record types, and the id prefix each one mints. Prefixes follow the id style
@@ -365,7 +367,8 @@ class Record:
             raise RecordError(
                 f"{cls.RECORD_TYPE} record is schema revision {revision!r}, but this arbite "
                 f"writes and understands revision {cls.SCHEMA_REVISION}; refusing to read "
-                "fields it may be misinterpreting (old records are migrated by tic-008f)"
+                "fields it may be misinterpreting -- 'arbite migrate' copies a store written "
+                "by an older arbite through this build's revision"
             )
         known = {spec.name for spec in fields(cls)}
         unknown = sorted(set(data) - known - {"record", "schema_revision"})
@@ -854,6 +857,11 @@ def parse_record(data: dict) -> Record:
     Dispatches on the stored discriminator, so a backend reads a container without
     knowing what is in it and an unknown type fails by name instead of by
     `KeyError`."""
+    return RECORD_CLASSES[_record_class_name(data)].from_dict(data)
+
+
+def _record_class_name(data: dict) -> str:
+    """The stored record type `data` names, refused by name when it is not one we know."""
     if not isinstance(data, dict):
         raise RecordError("a coordination record must be a JSON object")
     record_type = data.get("record")
@@ -867,7 +875,97 @@ def parse_record(data: dict) -> Record:
             f"unknown coordination record type {record_type!r} "
             f"(known: {', '.join(RECORD_TYPES)})"
         )
-    return RECORD_CLASSES[record_type].from_dict(data)
+    return record_type
+
+
+# ---------------------------------------------------------------------------
+# Bringing an older document forward
+# ---------------------------------------------------------------------------
+
+#: What each schema revision added, as the mechanical change a stored document needs to
+#: reach it. A step belongs here only when an older document has exactly one honest
+#: value for what the bump introduced -- revision 2's `spent_by` is the whole reason
+#: this table exists: a token written before the field could never have been spent.
+#: Anything that needed a decision would be a migration that guesses, and does not
+#: belong here.
+REVISION_UPGRADES = {
+    2: lambda record_type, data: (
+        {**data, "spent_by": None}
+        if record_type == "observation" and "spent_by" not in data
+        else data
+    ),
+}
+
+
+def document_revision(data: dict) -> int:
+    """The schema revision a stored document says it was written in, or a refusal.
+
+    Read from the document itself rather than assumed: a document with no revision
+    (or a value that is not a whole positive number) is refused, because "which
+    schema is this" is not a question to answer with a default."""
+    if not isinstance(data, dict):
+        raise RecordError("a coordination record must be a JSON object")
+    revision = data.get("schema_revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+        raise RecordError(
+            f"coordination record carries no usable 'schema_revision' ({revision!r}); "
+            "refusing to guess which schema it is written in"
+        )
+    return revision
+
+
+def document_id(data: dict) -> str:
+    """The record id a stored document carries, or a refusal.
+
+    Read from the document rather than from the filename that holds it, because the
+    document is what a copy stores: a reader that named a record by its container would
+    write a record whose id and name disagree the moment the two ever drifted."""
+    value = data.get("id") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not COORDINATION_ID_PATTERN.match(value):
+        raise RecordError(
+            f"coordination record carries no usable 'id' ({value!r}); refusing to copy a "
+            "record arbite cannot name"
+        )
+    return value
+
+
+def upgrade_document(data: dict) -> dict:
+    """`data` brought forward to this build's schema revision, or refused by name.
+
+    The migration half of the record contract. `from_dict` refuses an older revision
+    rather than half-reading it, and this is the only path that makes such a document
+    current: the steps in `REVISION_UPGRADES` are applied in order, so the copy a
+    migration takes between stores carries records forward instead of dropping them.
+    A revision it cannot reach is refused by name -- one newer than this build knows,
+    one missing entirely, or a gap in the table -- because there is no honest way to
+    invent the rest."""
+    record_type = _record_class_name(data)
+    revision = document_revision(data)
+    if revision > COORDINATION_SCHEMA_REVISION:
+        raise RecordError(
+            f"{record_type} record is schema revision {revision}, newer than this arbite's "
+            f"{COORDINATION_SCHEMA_REVISION}; refusing to read fields it may be misinterpreting"
+        )
+    upgraded = dict(data)
+    for target in range(revision + 1, COORDINATION_SCHEMA_REVISION + 1):
+        step = REVISION_UPGRADES.get(target)
+        if step is None:
+            raise RecordError(
+                f"no upgrade is defined from schema revision {target - 1} to {target}, so a "
+                f"{record_type} record written in revision {revision} cannot be brought forward"
+            )
+        upgraded = step(record_type, upgraded)
+    upgraded["schema_revision"] = COORDINATION_SCHEMA_REVISION
+    return upgraded
+
+
+def read_forward(data: dict) -> Record:
+    """The record `data` describes, brought forward from an older schema revision first.
+
+    The read a migration uses. It is deliberately not what a backend does when it serves
+    a record: a read reports what is stored, while this makes an older store copyable,
+    and the upgrade it applies is mechanical (see `upgrade_document`)."""
+    return parse_record(upgrade_document(data))
 
 
 def record_type_of(record: Record) -> str:

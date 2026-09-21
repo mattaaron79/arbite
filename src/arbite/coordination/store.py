@@ -29,10 +29,13 @@ What each half of this file is:
   journal from the commit journal the file backend uses to make its own
   multi-record writes recoverable; that one is replayed automatically by the next
   write to the store, because finishing it is not a judgement call.
-- **Shared semantics:** `record_problems` is implemented once, for both backends,
-  through the recovery engine's findings, so integrity means one thing whichever
-  store holds the records. Reporting reads; only `recover()` and `doctor --fix`
-  write, and only where the answer is unambiguous.
+- **Shared semantics, per-sink bookkeeping:** `record_problems` is the one
+  question a report asks a store, and it is assembled here: the findings that
+  mean the same thing whichever store holds the records come from the recovery
+  engine, and each backend adds the findings only its own storage shape can
+  have (`storage_problems`). Reporting reads; only `recover()`, `doctor --fix`
+  and a backend dropping its own bookkeeping write, and only where the answer is
+  unambiguous.
 """
 
 from __future__ import annotations
@@ -182,7 +185,10 @@ class PendingWrite:
     precondition a `replace_record` carries, checked in the same critical section
     as the write itself. `allocate_cursor` marks a write that *asked* for a cursor
     (`append_event`) rather than one that states its own (`put_record`, which is how
-    an import places existing events at the cursors they already have)."""
+    an import places existing events at the cursors they already have).
+    `stated_revision` is the same idea for a record's write counter: an import says
+    which revision the record must end up at, so a copy between stores keeps the
+    counter it had (see `put_record`)."""
 
     record_type: str
     record_id: str
@@ -191,6 +197,7 @@ class PendingWrite:
     revision: Optional[int] = None
     cursor: Optional[int] = None
     allocate_cursor: bool = False
+    stated_revision: Optional[int] = None
 
     @property
     def is_delete(self) -> bool:
@@ -283,10 +290,25 @@ class CoordinationTransaction:
     # Writing -- buffered until commit
     # ------------------------------------------------------------------
 
-    def put_record(self, record: Record) -> None:
-        """Buffer `record` as this transaction's version of its id."""
+    def put_record(self, record: Record, revision: Optional[int] = None) -> None:
+        """Buffer `record` as this transaction's version of its id.
+
+        With `revision`, the write *states* the record's write counter instead of
+        bumping it, which is what an import needs: a record copied between stores
+        keeps the revision it had, so the copy is exact and a later optimistic write
+        contended on the same number wherever the record lives. A stated revision must
+        be a whole number of 1 or more, and it is refused below a revision the store
+        already holds -- the counters are what a reader's token means, and a copy may
+        not move one backwards."""
         record.validate()
-        self._buffer(record_type_of(record), record.id, record)
+        if revision is not None:
+            if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+                raise RecordError(
+                    f"a stated revision must be a whole number of 1 or more, got {revision!r}"
+                )
+        self._buffer(
+            record_type_of(record), record.id, record, stated_revision=revision
+        )
 
     def replace_record(self, record: Record, expect_revision: int) -> None:
         """Buffer a write that commits only while the record's revision is still
@@ -412,11 +434,20 @@ class CoordinationTransaction:
         longer holds."""
         writes = []
         cursor = next_cursor()
+        # A record deleted *and* rewritten in one unit of work starts from nothing, exactly
+        # as it would have if the deletion had been its own commit: the counter goes with the
+        # record (see `delete_record`). That is what lets a migration replace a store's
+        # records wholesale and restore the revisions they had where they came from.
+        deleted = {pending.key for pending in self.writes if pending.is_delete}
         for pending in self.writes:
             if pending.is_delete:
                 writes.append(pending)
                 continue
-            current = revision_of(pending.record_type, pending.record_id)
+            current = (
+                0
+                if pending.key in deleted
+                else revision_of(pending.record_type, pending.record_id)
+            )
             if pending.expect_revision is not None and current != pending.expect_revision:
                 raise Stale(
                     f"{pending.record_type} {pending.record_id} is at revision {current}, "
@@ -424,6 +455,17 @@ class CoordinationTransaction:
                     "this transaction wrote nothing",
                     reason="stale_revision",
                 )
+            if pending.stated_revision is not None:
+                # An import placing a record as it was: the counter travels with the
+                # record, and only ever forwards (a copy may not move a token back).
+                if pending.stated_revision < current:
+                    raise RecordError(
+                        f"{pending.record_type} {pending.record_id} is already at revision "
+                        f"{current}, so it cannot be imported at revision "
+                        f"{pending.stated_revision}"
+                    )
+                writes.append(replace(pending, revision=pending.stated_revision))
+                continue
             if pending.allocate_cursor:
                 # Appended, not placed: the cursor a caller was shown is replaced by
                 # the one this commit can defend, and the object it holds is updated
@@ -439,8 +481,22 @@ class CoordinationTransaction:
     # Internals
     # ------------------------------------------------------------------
 
-    def _buffer(self, record_type, record_id, record, expect_revision=None, allocate_cursor=False) -> None:
+    def _buffer(
+        self,
+        record_type,
+        record_id,
+        record,
+        expect_revision=None,
+        allocate_cursor=False,
+        stated_revision=None,
+    ) -> None:
         self._check_open()
+        if expect_revision is not None and stated_revision is not None:
+            raise RecordError(
+                f"{record_type} {record_id} cannot state both a revision to reach and one "
+                "to expect: a record is either written under an optimistic precondition "
+                "or imported at a revision"
+            )
         key = (record_type, record_id)
         if key not in self._pending:
             self._order.append(key)
@@ -450,6 +506,7 @@ class CoordinationTransaction:
             record=record,
             expect_revision=expect_revision,
             allocate_cursor=allocate_cursor,
+            stated_revision=stated_revision,
         )
 
     def _check_open(self) -> None:
@@ -565,6 +622,21 @@ class CoordinationStore(ABC):
     @abstractmethod
     def _records(self, record_type: str) -> list:
         """The backend's own read of one record type (see `records`)."""
+
+    def raw_documents(self, record_type: str) -> list:
+        """Every stored document of `record_type` as `(record_id, document)`, unread.
+
+        The read a *migration* needs rather than the one a command needs: a record
+        written by an older arbite is refused by `parse_record` (never silently
+        misread), so bringing such a store forward has to start from the bytes on
+        disk. Nothing validates, interprets or repairs here -- `records.read_forward`
+        is the one caller, and it refuses what it cannot bring forward by name."""
+        _check_record_type(record_type)
+        return self._raw_documents(record_type)
+
+    @abstractmethod
+    def _raw_documents(self, record_type: str) -> list:
+        """The backend's own unvalidated read of one record type (see `raw_documents`)."""
 
     def get_record(self, record_type: str, record_id: str) -> Record:
         """One record by id. Raises `CoordinationError` when it is not there."""
@@ -791,26 +863,52 @@ class CoordinationStore(ABC):
     # Integrity
     # ------------------------------------------------------------------
 
-    def record_problems(self, ticket_ids=None, operation_findings=None) -> list:
+    def record_problems(
+        self, ticket_ids=None, closed_tickets=None, operation_findings=None
+    ) -> list:
         """Integrity findings for the coordination records, as `Problem`s.
 
-        One implementation for both backends, in the recovery engine, because a
-        finding has to mean the same thing whichever store holds the records (see
-        `coordination.recovery.findings`). Reporting *reads*: `pending_operation`
-        findings are judged against the bytes on disk, and an operation whose bytes
-        are exactly one of the two recorded versions is deliberately not reported --
-        its repair is unambiguous and free, and `doctor` without `--fix` writes
-        nothing. Only `recover()` and `doctor --fix` change anything.
+        The one entry point a report uses, so `doctor` asks the *store* what is wrong
+        with it rather than one of its halves: the shared findings (claims nobody can
+        use, unfinished operations judged against the bytes on disk, records that name
+        something missing) are computed once in the recovery engine because they mean
+        the same thing whichever store holds the records, and each backend adds its own
+        bookkeeping through `storage_problems` -- the findings only the storage shape
+        can have.
 
-        `ticket_ids` is the ticket store's own set, which is what makes "this
-        attempt names a ticket that does not exist" answerable. `operation_findings`
-        lets a caller that has already reconciled the pending operations pass its own
+        Reporting *reads*: a `pending_operation` whose bytes are exactly one of the two
+        recorded versions is deliberately not reported, because its repair is
+        unambiguous and free and `doctor` without `--fix` writes nothing. Only
+        `recover()`, `doctor --fix` and (for the per-sink bookkeeping) a backend's own
+        repair change anything.
+
+        `ticket_ids` is the ticket store's own set, which is what makes "this attempt
+        names a ticket that does not exist" answerable, and `closed_tickets` is the
+        subset whose status is closed, which is what makes "this attempt is still
+        active on a ticket nobody can mutate" answerable. `operation_findings` lets a
+        caller that has already reconciled the pending operations pass its own
         rendering of that phase in, so a repair does not judge the same receipt twice."""
         from . import recovery
 
         return recovery.findings(
-            self, ticket_ids=ticket_ids, operation_findings=operation_findings
+            self,
+            ticket_ids=ticket_ids,
+            closed_tickets=closed_tickets,
+            operation_findings=operation_findings,
+            storage_findings=self.storage_problems(),
         )
+
+    def storage_problems(self, fix: bool = False) -> list:
+        """The findings only this backend's own storage shape can have.
+
+        Empty by default, which is a statement about the backend rather than a
+        convenience: a store whose records are its only shared state has nothing
+        beyond them to be wrong. The file backend reports an outstanding commit
+        journal and revision counters naming records that are gone; the SQLite backend
+        reports revision rows whose record is gone. `fix` is passed by a repair run,
+        and a backend repairs only what is unambiguous about its *own* bookkeeping,
+        never a record's meaning."""
+        return []
 
     # ------------------------------------------------------------------
     # Evidence bytes

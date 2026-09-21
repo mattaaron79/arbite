@@ -21,6 +21,10 @@ Two questions, deliberately different, about the evidence the engine records:
 - **The ticket's own net.** One attempt's operations are not always the whole ticket -- a reopen
   starts a new attempt -- so when a ticket has more than one the view prints each attempt's
   section and then the ticket's net across them, which is the answer no single section gives.
+- **The store, summarised for a devlog.** `arbite receipt --summary` prints every operation in
+  log order with its attribution, its paths and both versions, and the evidence the store is
+  still holding -- the export to take *before* anything is pruned, because coordination state
+  is local and is lost with the machine while the tickets travel in git.
 
 Three rules shape everything here:
 
@@ -46,7 +50,8 @@ from typing import Optional
 
 from ..errors import CoordinationError, TicketNotFound
 from .paths import Version, version_of
-from .records import ABSENT, OperationReceipt, short_digest
+from .records import ABSENT, OperationReceipt, parse_utc, short_digest
+from .scratch import human_size
 from .results import EMPTY, OK, OperationResult, Outcome
 from .store import CoordinationStore
 from .writes import line_delta, version_facts
@@ -121,6 +126,28 @@ NO_EVIDENCE = "no image to retain (this operation named no version)"
 #: The stub every refusal from this surface ends with: a reader has to be able to tell "arbite
 #: refused" from "arbite changed something and then failed".
 NOTHING_CHANGED = "nothing was changed"
+
+#: The receipt summary: every operation in the order it happened, one row per operation-path,
+#: with both versions named -- which is what a devlog is generated from, because the evidence
+#: itself is local and dies with the machine. `{at}` is local time for reading, the digests are
+#: short, and a row with no path (a passthrough that named none) says so rather than vanishing.
+SUMMARY_HEADING = "receipt summary: {operations}, {tickets}, {attempts}"
+SUMMARY_TICKET_HEADING = "receipt summary for {ticket}: {operations}, {attempts}"
+SUMMARY_RESULTS = "{operations}: {ok} ok, {pending} pending, {failed} failed"
+SUMMARY_NO_PATH = "(no path)"
+SUMMARY_RETENTION = (
+    "evidence: {referenced} version(s) referenced by these operations; the store holds "
+    "{artifacts} artifact record(s) ({bytes})"
+)
+SUMMARY_NEVER_PRUNED = (
+    "note: arbite never prunes evidence and has no retention policy yet, so the store grows "
+    "with the work -- take this summary before anything is deleted"
+)
+SUMMARY_PENDING = (
+    "note: {count} operation(s) here are pending -- staged and never finalized, so arbite will "
+    "not guess whether their bytes are in place ('arbite doctor' judges them)"
+)
+SUMMARY_EMPTY_NEXT = "arbite events --tail 20"
 
 #: Where a receipt whose evidence is gone sends a reader. Nothing here repairs anything: which
 #: version is "correct" is not a question a report may answer, so the repair is a human's, and
@@ -515,6 +542,44 @@ class ChangeViews:
         }
 
     # ------------------------------------------------------------------
+    # The summary a devlog is generated from
+    # ------------------------------------------------------------------
+
+    def summary(self, ticket_id: Optional[str] = None) -> OperationResult:
+        """The receipt summary a devlog is generated from, before any evidence is pruned.
+
+        Evidence is local: `.arbite/coordination/` and `.arbite/arbite.db` are ignored by git and
+        die with the machine, so the development record is the tickets *plus* a summary taken
+        while the receipts are still there. This is that summary -- one row per operation-path,
+        in log order, naming who did it, when, which ticket and attempt it belonged to, and both
+        versions -- and it is deliberately a summary rather than a reproduction: `arbite receipt
+        OP` reads the bytes of one operation back and proves them, while this is what survives
+        the store.
+
+        Nothing is written, nothing is uploaded and no model summarises anything: this is
+        arbite's own record rendered. The retention line reports the size of the evidence the
+        store is holding instead of pruning it, because there is no retention policy yet -- and
+        a summary taken before pruning is the whole reason the design can afford that."""
+        if ticket_id is not None:
+            self._require_ticket(ticket_id)
+        receipts = [
+            receipt
+            for receipt in log_order(self.store.receipts(), operation_order(self.store))
+            if ticket_id is None or receipt.ticket_id == ticket_id
+        ]
+        if not receipts:
+            where = f" for {ticket_id}" if ticket_id else ""
+            return OperationResult(
+                Outcome(EMPTY),
+                [f"no operations recorded{where}"],
+                {"ticket": ticket_id, "operations": 0, "receipts": []},
+                [SUMMARY_EMPTY_NEXT],
+            )
+        lines = [_summary_heading(receipts, ticket_id), *_summary_rows(receipts)]
+        lines += _summary_notes(receipts, self.store)
+        return OperationResult(Outcome(OK), lines, _summary_data(receipts, ticket_id, self.store), [])
+
+    # ------------------------------------------------------------------
     # The change views
     # ------------------------------------------------------------------
 
@@ -810,6 +875,166 @@ def _pending_lines(receipts: list) -> list:
         )
         lines.append(tail.format(command=f"arbite receipt {receipt.id}"))
     return lines
+
+
+def _summary_heading(receipts: list, ticket_id: Optional[str]) -> str:
+    """The summary's first line: how many operations, over how many tickets and attempts."""
+    tickets = {receipt.ticket_id for receipt in receipts if receipt.ticket_id}
+    attempts = {receipt.attempt_id for receipt in receipts if receipt.attempt_id}
+    counts = {
+        "operations": _operations(len(receipts)),
+        "tickets": _counted(len(tickets), "ticket"),
+        "attempts": _counted(len(attempts), "attempt"),
+    }
+    if ticket_id is not None:
+        return SUMMARY_TICKET_HEADING.format(ticket=ticket_id, **counts)
+    return SUMMARY_HEADING.format(**counts)
+
+
+def _counted(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _summary_rows(receipts: list) -> list:
+    """One row per operation-path, columns laid out over every row.
+
+    An operation's own columns are printed on its first row and left blank on the rest, so a
+    multi-path operation reads as one entry with several paths rather than as several operations
+    sharing an id -- the shape the change views use, and the reason a rename shows both paths
+    under one operation."""
+    cells = [
+        (
+            _summary_time(receipt),
+            RESULT_WORDS[receipt.result],
+            receipt.id,
+            receipt.kind,
+            _where(receipt),
+            receipt.actor or "",
+            path,
+            _summary_versions(receipt, path),
+        )
+        for receipt in receipts
+        for path in (receipt.paths or [SUMMARY_NO_PATH])
+    ]
+    widths = [max(len(cell[index]) for cell in cells) + COLUMN_GAP for index in range(7)]
+    rows, seen = [], set()
+    for cell in cells:
+        entry = list(cell)
+        if cell[2] in seen:
+            entry[:6] = [""] * 6
+        seen.add(cell[2])
+        rows.append("".join(f"{value:<{width}}" for value, width in zip(entry[:7], widths)) + entry[7])
+    return rows
+
+
+def _summary_time(receipt: OperationReceipt) -> str:
+    """When the operation was recorded, local time for reading (the stored value is UTC)."""
+    return parse_utc(receipt.recorded_at).astimezone().strftime("%H:%M:%S")
+
+
+def _where(receipt: OperationReceipt) -> str:
+    """The ticket/attempt column, both when both are known (the events view's own shape)."""
+    if receipt.ticket_id and receipt.attempt_id:
+        return f"{receipt.ticket_id}/{receipt.attempt_id}"
+    return receipt.ticket_id or receipt.attempt_id or ""
+
+
+def _summary_versions(receipt: OperationReceipt, path: str) -> str:
+    """Both versions of one path, and what became of them.
+
+    A version that is not there prints `absent` rather than a digest, because that *is* the
+    fact (a creation and a removal are what this column makes visible), and an operation nobody
+    has judged says so: which way a pending receipt went is not something a summary may claim.
+    A row printed for an operation that named no path has no versions to show."""
+    if path not in receipt.before:
+        return ""
+    pair = f"{_summary_side(receipt.before[path])} -> {_summary_side(receipt.after[path])}"
+    if receipt.result == "failed":
+        return f"{pair} ({DETAIL_FAILED})"
+    if receipt.result == "pending":
+        return f"{pair} ({DETAIL_PENDING})"
+    return pair
+
+
+def _summary_side(digest: str) -> str:
+    return VERSION_ABSENT if digest == ABSENT else short_digest(digest)
+
+
+def _summary_notes(receipts: list, store) -> list:
+    """The lines under the rows: how the work came out, what is unfinished, and what is retained.
+
+    The retention line is the honest replacement for a pruning policy: it names the evidence the
+    store is holding -- the fact that it keeps growing -- and says nothing is deleted."""
+    results = _summary_result_counts(receipts)
+    notes = [
+        SUMMARY_RESULTS.format(
+            operations=_operations(len(receipts)),
+            ok=results["ok"],
+            pending=results["pending"],
+            failed=results["failed"],
+        )
+    ]
+    if results["pending"]:
+        notes.append(SUMMARY_PENDING.format(count=results["pending"]))
+    referenced = {digest for receipt in receipts for digest in _named_versions(receipt)}
+    artifacts = store.records("artifact")
+    notes.append(
+        SUMMARY_RETENTION.format(
+            referenced=len(referenced),
+            artifacts=len(artifacts),
+            bytes=human_size(sum(artifact.size for artifact in artifacts)),
+        )
+    )
+    notes.append(SUMMARY_NEVER_PRUNED)
+    return notes
+
+
+def _summary_data(receipts: list, ticket_id: Optional[str], store) -> dict:
+    """The same facts as fields, with the full digests the text abbreviates."""
+    referenced = {digest for receipt in receipts for digest in _named_versions(receipt)}
+    artifacts = store.records("artifact")
+    return {
+        "ticket": ticket_id,
+        "operations": len(receipts),
+        "results": _summary_result_counts(receipts),
+        "tickets": sorted({receipt.ticket_id for receipt in receipts if receipt.ticket_id}),
+        "attempts": sorted({receipt.attempt_id for receipt in receipts if receipt.attempt_id}),
+        "receipts": [
+            {
+                "operation": receipt.id,
+                "kind": receipt.kind,
+                "result": RESULT_WORDS[receipt.result],
+                "stored_result": receipt.result,
+                "recorded_at": receipt.recorded_at,
+                "ticket": receipt.ticket_id,
+                "attempt": receipt.attempt_id,
+                "actor": receipt.actor,
+                "claim_generation": receipt.claim_generation,
+                "paths": [
+                    {
+                        "path": path,
+                        "before": receipt.before[path],
+                        "after": receipt.after[path],
+                    }
+                    for path in receipt.paths
+                ],
+            }
+            for receipt in receipts
+        ],
+        "evidence": {
+            "referenced_versions": sorted(referenced),
+            "artifacts": len(artifacts),
+            "artifact_bytes": sum(artifact.size for artifact in artifacts),
+        },
+    }
+
+
+def _summary_result_counts(receipts: list) -> dict:
+    """`{printed word: count}` over the receipt set, always naming all three words."""
+    counts = {word: 0 for word in ("ok", "pending", "failed")}
+    for receipt in receipts:
+        counts[RESULT_WORDS[receipt.result]] += 1
+    return counts
 
 
 def _log_entry(receipt: OperationReceipt) -> dict:
