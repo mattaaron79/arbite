@@ -46,12 +46,14 @@ def test_an_absent_key_reads_as_true(tmp_project):
     assert review_enabled(tmp_project) is True
 
 
-def test_the_repos_own_config_takes_the_default():
-    """This repo's committed `.arbite/project.yaml` has no `review:` key, so its own
-    default is the one an absent key produces -- the flag is not switched on here."""
+def test_the_repos_own_config_carries_the_owner_chosen_review_false():
+    """`.arbite/project.yaml` sets `review: false` as the repo owner's deliberate choice,
+    so this repo's flag is the explicit boolean written, not the absent-key default."""
     repo_root = Path(__file__).resolve().parents[1]
-    assert REVIEW_KEY not in load_config(repo_root)
-    assert review_enabled(repo_root) is True
+    config = load_config(repo_root)
+    assert config == {"sink": "file", REVIEW_KEY: False}
+    assert config[REVIEW_KEY] is False  # read as written: a real boolean, not a falsey stand-in
+    assert review_enabled(repo_root) is False
 
 
 def test_a_project_with_no_config_file_reads_as_true(tmp_project):
