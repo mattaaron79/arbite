@@ -35,7 +35,7 @@ import hashlib
 import os
 import re
 import uuid
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import ClassVar, Optional
 
@@ -46,7 +46,12 @@ from ..errors import RecordError
 #: whenever a field changes meaning. Record-level revision counters for optimistic
 #: concurrency are a different thing and belong to the transactional store
 #: (tic-1a75): this is "which schema is this document written in".
-COORDINATION_SCHEMA_REVISION = 1
+#:
+#: Revision 2 adds `ReadObservation.spent_by`: one token authorises one mutation, so
+#: the token records which operation used it (tic-60c7). A revision-1 record is
+#: refused by name rather than half-read, which is the deliberate cost of the bump:
+#: a store written before it needs the migration pass tic-008f/C12 owns.
+COORDINATION_SCHEMA_REVISION = 2
 
 #: The record types, and the id prefix each one mints. Prefixes follow the id style
 #: the examples document fixes: `ws-XXXX` workspaces, `att-XXXX` attempts and
@@ -549,7 +554,13 @@ class ReadObservation(Record):
 
     Read observations and mutation receipts share the `op-` id space: the id is the
     token a write presents, so a caller holds one handle and the store says what
-    that handle is allowed to do (`authorizes_write`)."""
+    that handle is allowed to do (`authorizes_write`).
+
+    `spent_by` is the other half of that handle: **one token authorises one
+    mutation**, so the mutation records the operation that used it, and a second
+    attempt to spend it is refused with the operation named. Nothing else is
+    written to a token -- an observation is otherwise append-only evidence of bytes
+    having been served."""
 
     RECORD_TYPE: ClassVar[str] = "observation"
 
@@ -562,11 +573,25 @@ class ReadObservation(Record):
     claim_generation: int = 0
     line_start: Optional[int] = None
     line_end: Optional[int] = None
+    spent_by: Optional[str] = None
     schema_revision: int = COORDINATION_SCHEMA_REVISION
 
     @property
     def is_ranged(self) -> bool:
         return self.line_start is not None or self.line_end is not None
+
+    @property
+    def is_spent(self) -> bool:
+        """Whether a mutation has already used this token."""
+        return self.spent_by is not None
+
+    def spent(self, operation_id: str) -> "ReadObservation":
+        """This observation, marked as spent by `operation_id`.
+
+        Returns a new record rather than mutating in place: the value a caller holds
+        is the token as it was validated, and the store's copy is the one that says
+        it is spent."""
+        return replace(self, spent_by=operation_id)
 
     def authorizes_write(self, claim: Optional[FileClaim]) -> bool:
         """Whether this observation may authorise a change to *existing* bytes.
@@ -600,8 +625,12 @@ class ReadObservation(Record):
         return self._held_by(claim)
 
     def _held_by(self, claim: Optional[FileClaim]) -> bool:
-        """The ownership half of the two checks above."""
-        if claim is None or not claim.is_active:
+        """The ownership half of the two checks above.
+
+        A spent token holds nothing, whatever the claim says: it authorised one
+        mutation and is not reusable for a second (the mutation reports *which*
+        operation spent it, so the caller is told why rather than merely refused)."""
+        if claim is None or not claim.is_active or self.is_spent:
             return False
         return (
             claim.path == self.path
@@ -626,6 +655,13 @@ class ReadObservation(Record):
         for label, value in (("line_start", self.line_start), ("line_end", self.line_end)):
             if value is not None:
                 _require_int(value, f"observation {label}", minimum=1)
+        if self.spent_by is not None:
+            _require_id(self.spent_by, "op", "observation spent_by")
+            if self.spent_by == self.id:
+                raise RecordError(
+                    f"observation {self.id} cannot be spent by itself: a token is spent "
+                    "by the operation that used it"
+                )
         if self.line_start is not None and self.line_end is not None and self.line_end < self.line_start:
             raise RecordError(
                 f"observation range {self.line_start}:{self.line_end} ends before it starts"

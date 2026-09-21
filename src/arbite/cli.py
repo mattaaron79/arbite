@@ -34,8 +34,10 @@ from .coordination import lifecycle as coordination_lifecycle
 from .coordination import reads as coordination_reads
 from .coordination import recovery as coordination_recovery
 from .coordination import results as outcomes
+from .coordination import scratch as coordination_scratch
+from .coordination import writes as coordination_writes
 from .coordination.scratch import ensure_scratch_dir, note_lines, scratch_summary
-from .errors import ArbiteError, Busy, Conflict, NotReady, TicketError
+from .errors import ArbiteError, Busy, Conflict, NotReady, TicketError, UsageRefused
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
 from .sinks import (
@@ -276,6 +278,37 @@ def _reads(args, sink):
     mutation presents; whether that token authorises anything is decided by the claim
     it was taken under, in `coordination.reads`."""
     return coordination_reads.FileReads(sink, _lifecycle(args, sink))
+
+
+def _writes(args, sink):
+    """The mutation surface for this command's sink and store.
+
+    Writes and edits build the request, read the payload and render the report; the
+    rules that make a mutation safe -- one token authorises one mutation, a stale token
+    changes no bytes, a batch that cannot select one place each changes nothing -- live
+    in `coordination.writes` and the engine below it, so no command can differ about
+    them."""
+    return coordination_writes.FileWrites(sink, _lifecycle(args, sink))
+
+
+def _mutation_context(args):
+    """The attempt every mutation must name, or the refusal that says so.
+
+    Validated here rather than in argparse because a missing attempt is an *outcome* with a
+    `next:` line naming the command that supplies it -- the frozen WR7 block prints
+    `--attempt is required`, exit 1 -- not an argparse usage error: the fix is a command to
+    run, and that command is the hint.
+
+    The read token is checked in `coordination.writes` instead, because whether one is
+    required depends on the path: a change to existing bytes needs the read that authorises
+    it, while a file that is not there is created from a probe the command records itself."""
+    if not getattr(args, "attempt", None):
+        claim_hint = f"arbite claim {args.ticket} --agent <your-id>"
+        raise UsageRefused(
+            "--attempt is required: every mutation is attributed to a work attempt",
+            [claim_hint],
+            text_hint=f"next: '{claim_hint}' to start one",
+        )
 
 
 def _emit_file_result(result, as_json):
@@ -1740,6 +1773,49 @@ def cmd_file_read(args):
     _emit_file_result(result, args.json)
 
 
+def cmd_file_write(args):
+    """Replace a whole file's bytes, with the read token and the claim checked first.
+
+    The command adds three things to the engine: the path rules (canonical, not
+    generated output -- BY2), the payload it read from the scratch area or stdin, and
+    the report a caller reads. Writing a path that does not exist is the creation case,
+    and it needs the same two facts: the claim, and a read taken under it that found the
+    path absent.
+
+    Nothing here retries, waits or works around a refusal: a stale token, a foreign
+    claim and a generated path each change nothing and say exactly what to do next."""
+    sink = _require_sink(args)
+    _mutation_context(args)
+    writes = _writes(args, sink)
+    payload = coordination_scratch.read_payload(
+        writes.app.arbite_dir, args.payload, "--input", sys.stdin.buffer
+    )
+    result = writes.write(
+        args.path, args.ticket, args.attempt, args.read_token, payload
+    )
+    _emit_file_result(result, args.json)
+
+
+def cmd_file_edit(args):
+    """Apply an ordered batch of exact text substitutions to one file, or change nothing.
+
+    The batch arrives through the same payload channel a write uses (`--edits NAME`, or
+    `-` for stdin) and is matched against the version the token served: each edit has to
+    select exactly one occurrence, may not overlap another, and a batch that fails
+    anywhere is refused with the lines to look at and no bytes changed. The replacement
+    is assembled in memory and written once, which is what makes the guarantee structural."""
+    sink = _require_sink(args)
+    _mutation_context(args)
+    writes = _writes(args, sink)
+    payload = coordination_scratch.read_payload(
+        writes.app.arbite_dir, args.payload, "--edits", sys.stdin.buffer
+    )
+    result = writes.edit(
+        args.path, args.ticket, args.attempt, args.read_token, payload
+    )
+    _emit_file_result(result, args.json)
+
+
 def cmd_close(args):
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
@@ -2613,17 +2689,21 @@ def build_parser():
 
     p_file = sub.add_parser(
         "file",
-        help="the file proxy: discovery, reads, and exclusive claims on whole files",
+        help="the file proxy: discovery, reads, claims, and version-checked writes and edits",
         description="The shared-directory proxy: what is in the workspace, what it contains, and "
         "which work attempt owns which whole file. `list` and `search` are bounded discovery in "
         "canonical path order and never authorise a change; `read` serves bytes and records an "
         "observation whose token a mutation may present; `claim`, `release` and `claims` are the "
-        "durable ownership surface. A claim is a record, not a lock, so no lock is ever held for "
-        "the length of an agent's work, and acquisition is all-or-nothing in canonical path "
-        "order, so two attempts can never each hold half of a pair -- contention is a structured "
-        "busy answer (exit 4) naming the holder, never a wait. Paths are validated against the "
-        "project root: escapes, arbite's own state and `.git` metadata are refused. Writes, "
-        "edits, renames and removes are not here yet -- they arrive with their own slices.",
+        "durable ownership surface; `write` and `edit` change a file's bytes and record the "
+        "evidence. A claim is a record, not a lock, so no lock is ever held for the length of an "
+        "agent's work, and acquisition is all-or-nothing in canonical path order, so two attempts "
+        "can never each hold half of a pair -- contention is a structured busy answer (exit 4) "
+        "naming the holder, never a wait. A mutation needs all three of the claim, the attempt and "
+        "a read token taken under that claim, and one token authorises exactly one mutation: a "
+        "stale token, a moved file or a closed ticket refuses with exit 5 and changes no bytes. "
+        "Paths are validated against the project root: escapes, arbite's own state, `.git` "
+        "metadata and generated or build output are refused. Renames and removes are not here "
+        "yet -- they arrive with their own slice.",
     )
     file_sub = p_file.add_subparsers(
         dest="file_action", required=True, metavar="SUBCOMMAND"
@@ -2839,6 +2919,90 @@ def build_parser():
     _json_flag(p_file_read)
     _sink_flag(p_file_read)
     p_file_read.set_defaults(func=cmd_file_read)
+
+    p_file_write = file_sub.add_parser(
+        "write",
+        help="replace a whole file's bytes, if a read token still authorises it",
+        description="Write the bytes of a scratch payload (`--input NAME`, or `-` for stdin) "
+        "over a path this attempt holds. Everything is checked before anything is written: the "
+        "ticket must still be in progress for this attempt, the attempt must hold the claim on "
+        "the path at the generation the token was taken under, the token must be unspent, and "
+        "the bytes on disk must still be the version that token observed. A refusal says which "
+        "of those failed, reports both versions, and says plainly that no bytes were changed "
+        "(exit 5 for a stale token or a moved file, 4 for a path somebody else holds, 1 for a "
+        "path nobody holds or one that is generated output). A path that does not exist is "
+        "created, provided the read that found it absent was taken under the claim. The write "
+        "reports the version it produced, the receipt that holds both versions as evidence, and "
+        "the fresh read the token it just spent requires before another change. Success consumes "
+        "the scratch payload; a refusal leaves it in place. Renames and removes are separate "
+        "commands (tic-74e2).",
+    )
+    p_file_write.add_argument("path", metavar="PATH", help="the file to write, relative to the root")
+    p_file_write.add_argument(
+        "--ticket", required=True, metavar="TICKET", help="the ticket this change belongs to"
+    )
+    p_file_write.add_argument(
+        "--attempt",
+        metavar="ATTEMPT",
+        help="the work attempt that holds the claim (required; the error names 'arbite claim')",
+    )
+    p_file_write.add_argument(
+        "--read-token",
+        dest="read_token",
+        metavar="TOKEN",
+        help="the read token a read taken under the claim returned; required to replace bytes "
+        "that exist, since a path that does not exist is created from the probe this command "
+        "records under the claim",
+    )
+    p_file_write.add_argument(
+        "--input",
+        dest="payload",
+        required=True,
+        metavar="NAME|-",
+        help="a payload name inside .arbite/scratch/, or '-' to read it from stdin",
+    )
+    _json_flag(p_file_write)
+    _sink_flag(p_file_write)
+    p_file_write.set_defaults(func=cmd_file_write)
+
+    p_file_edit = file_sub.add_parser(
+        "edit",
+        help="apply exact text substitutions to a file, or change nothing at all",
+        description="Apply an ordered batch of exact replacements (`--edits NAME`, or `-` for "
+        "stdin) to a UTF-8 text file this attempt holds. The batch is JSON: either a list or "
+        'an object with an "edits" list, each edit `{"old": ..., "new": ..., "occurrence": N}` '
+        '(`"line": N` selects by line instead). Matches are exact substrings of the version the '
+        "read token served, every edit must select exactly one occurrence, selections may not "
+        "overlap, and the whole batch is applied in memory and written once -- so a batch that "
+        "is ambiguous, absent or overlapping changes no bytes and names the lines to read. The "
+        "line numbers in the report are the ones the caller read. The claim, attempt, token and "
+        "version checks are the write command's, and so are its exit codes.",
+    )
+    p_file_edit.add_argument("path", metavar="PATH", help="the text file to edit, relative to the root")
+    p_file_edit.add_argument(
+        "--ticket", required=True, metavar="TICKET", help="the ticket this change belongs to"
+    )
+    p_file_edit.add_argument(
+        "--attempt",
+        metavar="ATTEMPT",
+        help="the work attempt that holds the claim (required; the error names 'arbite claim')",
+    )
+    p_file_edit.add_argument(
+        "--read-token",
+        dest="read_token",
+        metavar="TOKEN",
+        help="the read token a read taken under the claim returned (required)",
+    )
+    p_file_edit.add_argument(
+        "--edits",
+        dest="payload",
+        required=True,
+        metavar="NAME|-",
+        help="an edit batch inside .arbite/scratch/, or '-' to read it from stdin",
+    )
+    _json_flag(p_file_edit)
+    _sink_flag(p_file_edit)
+    p_file_edit.set_defaults(func=cmd_file_edit)
 
     p_events = sub.add_parser(
         "events",

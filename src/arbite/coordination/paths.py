@@ -23,6 +23,10 @@ slice -- the escape refusal (LS6) and the protected-path refusal (LS6) -- and on
 the refusal the *read* surface raises for a path that does not exist (RD5), kept here
 with the other path rules so the slice that owns reads (tic-1c4f) raises exactly the
 frozen block rather than re-inventing its wording.
+
+`policy_exclusion` is the third rule: generated and build output is not a path arbite
+will record a proxy write for, so a mutation of one is refused *early*, by name,
+before a ticket, a claim or a payload is looked at -- the frozen BY2 block.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import os
 import posixpath
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -74,6 +79,31 @@ PROTECTED_STATE_REFUSALS = {
 }
 
 DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
+
+#: The generated and build output arbite refuses to record a proxy write for. A
+#: fixed list rather than `.gitignore`: a rule arbite cannot evaluate is worse than a
+#: short one it can state, and the honest boundary is what is here -- anything else
+#: is left alone. Directory names match at any depth, suffixes on the file's name.
+EXCLUDED_DIRS = (
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".venv",
+    "venv",
+    "node_modules",
+    "build",
+    "dist",
+    ".eggs",
+    "htmlcov",
+)
+EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".egg-info", ".so", ".dylib", ".dll", ".class", ".o", ".a")
+
+#: The BY2 refusal, and the one thing a caller can do about it.
+EXCLUDED_POLICY_HINT = "keep generated output outside managed source paths"
+EXCLUDED_POLICY_REASON = "generated or build output"
 
 
 @dataclass(frozen=True)
@@ -175,6 +205,15 @@ def arbite_state(relative: str):
     return None
 
 
+def version_of(data: bytes, digest: Optional[str] = None) -> Version:
+    """The `Version` of bytes already in hand.
+
+    Used by a report that describes what a receipt recorded rather than what is on
+    disk now: the evidence is content-addressed, so a report reads the artifact back
+    and renders the same version `probe` would have described."""
+    return Version(digest or digest_bytes(data), len(data), _line_count(data))
+
+
 def probe(root, relative) -> Version:
     """Observe `relative` inside `root`: its version, or `ABSENT`, or a refusal.
 
@@ -235,6 +274,64 @@ def missing_path_refusal(path: str, ticket_id: str, attempt_id: str) -> PathRefu
         # in front of the second (see `results.text_hint_of`).
         text_hint=f"next: '{list_hint}' to see what exists, or\n      '{claim_hint}' to create it",
     )
+
+
+def policy_exclusion(relative: str) -> Optional[str]:
+    """The excluded name `relative` falls under, or None.
+
+    A directory component at any depth (`node_modules/...`), or a file whose name
+    ends in a compiled-output suffix (`schema.pyc`). Case-folded, so a
+    case-insensitive filesystem cannot spell its way past the rule, exactly as
+    `arbite_state` folds its own names."""
+    folded_dirs = {_fold(name) for name in EXCLUDED_DIRS}
+    segments = relative.split("/")
+    for segment in segments[:-1]:
+        if _is_excluded_name(segment, folded_dirs):
+            return segment
+    if _is_excluded_name(segments[-1], folded_dirs):
+        return segments[-1]
+    return None
+
+
+def _is_excluded_name(segment: str, folded_dirs) -> bool:
+    """Whether one path component is an excluded directory name or build artefact.
+
+    A suffix matches on a segment at any level, not only on the file: `pkg.egg-info` is a
+    directory a build wrote, and the file inside it is that output."""
+    name = _fold(segment)
+    if name in folded_dirs:
+        return True
+    return any(name.endswith(suffix) for suffix in EXCLUDED_SUFFIXES)
+
+
+def refuse_if_excluded(relative: str) -> None:
+    """Refuse a mutation target that is generated or build output (the frozen BY2 block).
+
+    Raising rather than warning is the point: arbite will not report a successful
+    proxy write whose evidence it cannot attribute to source, and a caller that must
+    regenerate a cache or a bundle keeps it outside the managed paths."""
+    excluded = policy_exclusion(relative)
+    if excluded is None:
+        return
+    raise PathRefused(
+        f"'{relative}' is excluded by policy ({EXCLUDED_POLICY_REASON});\n"
+        f"{REFUSAL_INDENT}arbite will not record a proxy write it cannot attribute",
+        text_hint=f"next: {EXCLUDED_POLICY_HINT}",
+    )
+
+
+def modified_clock(root, relative) -> Optional[str]:
+    """When the bytes at `relative` were last written, as `HH:MM:SS` local time.
+
+    The "changed at" half of the stale-version refusal: a caller whose plan was built
+    on a version that has moved is told when it moved, in the reading local time the
+    rest of the reports use. `None` when the file cannot be stat'ed (it went away, or
+    was never there), because a sentence is better than a failure at that point."""
+    try:
+        stamp = (Path(root) / relative).stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(stamp).strftime("%H:%M:%S")
 
 
 def escape_refusal(raw, root) -> PathRefused:

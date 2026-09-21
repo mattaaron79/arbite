@@ -139,14 +139,83 @@ class Stale(ArbiteError):
     """Outcome 5: a token, digest or generation is no longer current, and
     **nothing changed**. The correct caller response is to re-read and retry.
 
-    `reason` refines which stale this is (`stale_read`, `stale_revision`,
-    `stale_generation`, ...); it defaults to the bare kind."""
+    `reason` refines which stale this is (`stale_read`, `stale_version`,
+    `stale_token_spent`, `attempt_not_current`, ...); it defaults to the bare kind,
+    and it is what keys the `next:` line: a file that moved, a token that was spent
+    and a ticket that closed are all outcome 5 but want different repairs. A raise
+    site that knows the repair (it knows the path, the ticket and the attempt) may
+    carry `next_actions` and the `text_hint` they read as, exactly as `PathRefused`
+    does, so the sentence is built where the state is known."""
 
     label = "stale_read"
 
-    def __init__(self, message: str, reason: Optional[str] = None):
+    def __init__(
+        self,
+        message: str,
+        reason: Optional[str] = None,
+        next_actions=(),
+        text_hint: Optional[str] = None,
+    ):
         super().__init__(message)
         self.reason = reason or "stale_read"
+        self.next_actions = tuple(next_actions)
+        #: The exact `next:` sentence to print, when the fixed wording matters more
+        #: than `render_next_line`'s join (see `results.text_hint_of`).
+        self.text_hint = text_hint
+
+
+class EditRefused(ArbiteError):
+    """An exact-substitution batch does not apply, and **nothing was written**.
+
+    Ambiguous, absent and overlapping selections are all this one outcome because the
+    caller's response is the same for them: re-read the lines the refusal names and
+    re-send the edit with a selection that identifies one place. The batch is applied
+    to the in-memory version and written in one replacement, so a batch that fails
+    anywhere leaves the file exactly as it was -- the guarantee is structural rather
+    than a cleanup path.
+    """
+
+    reason = "edit_refused"
+
+    def __init__(self, message: str, next_actions=(), text_hint: Optional[str] = None):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+        self.text_hint = text_hint
+
+
+class UsageRefused(ArbiteError):
+    """A mutation command was not given what makes it attributable.
+
+    An error (exit 1), because the fix is to correct the command rather than to re-read:
+    a change named without an attempt cannot be attributed to anybody, and a change named
+    without a read token is authorised by nothing -- ownership is the claim's, but the
+    change itself is the read's (the frozen WR7 block, and the same rule one argument
+    further on)."""
+
+    reason = "usage"
+
+    def __init__(self, message: str, next_actions=(), text_hint: Optional[str] = None):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+        self.text_hint = text_hint
+
+
+class NoClaim(ArbiteError):
+    """A mutation named a path this attempt does not hold.
+
+    An error rather than stale: re-reading the path will not make it the caller's,
+    so the fix is a command -- claim the path, then take the read a mutation needs
+    under that claim -- and the exit code has to say "fix the command". A read
+    observation never authorises a change on its own; the claim is the ownership
+    half, and this is the refusal that says so (the frozen WR4 block).
+    """
+
+    reason = "no_claim"
+
+    def __init__(self, message: str, next_actions=(), text_hint: Optional[str] = None):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+        self.text_hint = text_hint
 
 
 class NotOwner(ArbiteError):

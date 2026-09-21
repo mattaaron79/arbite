@@ -410,7 +410,12 @@ def test_a_token_authorises_only_the_version_it_observed(file_scene):
 def test_bytes_that_moved_since_the_read_are_refused(file_scene):
     """The whole-file digest is re-checked at use time, so a change made between the read
     and the write is outcome 5 rather than an overwrite (the external-writer case the plan
-    reports instead of pretending to prevent)."""
+    reports instead of pretending to prevent).
+
+    The wording is the frozen WR2/SC2 block's -- both digests, and when the file moved --
+    and the reason is `stale_version`, because a moved file and a spent token are the same
+    exit code and different repairs (tic-60c7 owns both sentences; this test asserted the
+    older, vaguer wording until the transcript fixed it)."""
     scene = file_scene
     request = scene.replace(PATH, AFTER)
     scene.write(PATH, b"somebody else\n")  # a direct write, attributed to no ticket
@@ -418,8 +423,11 @@ def test_bytes_that_moved_since_the_read_are_refused(file_scene):
     with pytest.raises(Stale) as failure:
         scene.mutations.apply(request)
 
-    assert "changed since you read it" in str(failure.value)
-    assert "no bytes were changed" in str(failure.value)
+    message = str(failure.value)
+    assert failure.value.reason == "stale_version"
+    assert f"you read {coordination_records.short_digest(request.changes[0].expect)}" in message
+    assert f"but the file is now {coordination_records.short_digest(coordination_records.digest_bytes(b'somebody else\n'))}" in message
+    assert "no bytes were changed" in message
     assert scene.bytes(PATH) == b"somebody else\n"
 
 
@@ -467,7 +475,10 @@ def test_RC2_a_close_racing_a_write_changes_nothing(file_scene):
         scene.mutations.apply(request)
 
     message = str(failure.value)
-    assert failure.value.reason == "stale_read"
+    # The reason is narrower than "stale_read" since tic-60c7: a ticket that moved on is
+    # the same outcome (5, nothing changed) with a different repair -- reopen or stop --
+    # so it carries its own key and its own sentence rather than the re-read hint.
+    assert failure.value.reason == "attempt_not_current"
     assert f"attempt {scene.attempt.id} generation {scene.attempt.generation} is no longer " in message
     assert "current" in message
     assert f"({TICKET} closed" in message

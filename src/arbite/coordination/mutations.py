@@ -38,13 +38,14 @@ operation's behalf.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from ..errors import Busy, CoordinationError, Stale
+from ..errors import Busy, CoordinationError, NoClaim, Stale
 from . import recovery
-from .paths import probe
+from .paths import modified_clock, probe
 from .records import (
     ABSENT,
     RECEIPT_KINDS,
@@ -58,6 +59,7 @@ from .records import (
     short_digest,
     utc_now,
 )
+from .results import REFUSAL_INDENT
 
 #: The boundaries a fault-injection hook can be told about, in the order they are
 #: crossed. Two of them are observably the same state (#1 and #2, #4 and #5) and are named
@@ -81,6 +83,32 @@ MUTABLE_STATUS = "in_progress"
 #: this module reads it as *the operation's own* vocabulary: expect=absent is a create,
 #: becomes=absent is a removal.
 ABSENT_VERSION = ABSENT
+
+#: The reasons the refusals below carry. The *reason* keys the `next:` line and the JSON
+#: branch, while the clause stays outcome 5 for all of them (nothing changed; the fix is a
+#: fresh read): a file that moved, a token that was spent and a ticket that closed are one
+#: exit code and three different repairs, so they cannot share one hint.
+REASON_STALE_VERSION = "stale_version"
+REASON_STALE_TOKEN_SPENT = "stale_token_spent"
+REASON_ATTEMPT_NOT_CURRENT = "attempt_not_current"
+
+#: The reason WR4's refusal names inline, in the caller's own words. It is also the
+#: registered key for the hint, so the word in the message and the branch in JSON agree.
+REASON_NO_CLAIM = "no_claim"
+
+#: The closing line of every refusal a mutation makes, on its own line because that is how the
+#: frozen blocks print it. A caller has to be able to tell "it refused" from "it may have
+#: written half a file": this is the sentence that makes the difference checkable.
+NO_BYTES_CHANGED = "no bytes were changed"
+
+
+def read_command(ticket_id: str, attempt_id: str, path: str) -> str:
+    """The read a mutation's refusals hand back: the exact command, not a description.
+
+    Every stale refusal in this module exists to send the caller back to a fresh read
+    under the same claim, so the sentence names the command with the ticket and the
+    attempt already filled in -- a hint a caller can run rather than interpret."""
+    return f"arbite file read {path} --ticket {ticket_id} --attempt {attempt_id}"
 
 
 @dataclass(frozen=True)
@@ -297,8 +325,24 @@ class FileMutations:
                 f"attempt {attempt_id} belongs to {attempt.ticket_id}, not {ticket.id}"
             )
         if not attempt.is_active or ticket.status != MUTABLE_STATUS:
-            raise self._stale(self._not_current(ticket, attempt))
+            raise self._no_longer_current(ticket, attempt)
         return attempt
+
+    def _no_longer_current(self, ticket, attempt: WorkAttempt) -> Stale:
+        """The stale refusal a revoked attempt or a moved ticket produces (WR5, RC2).
+
+        The repair is not "re-read and retry" -- the bytes are frozen because the ticket
+        moved on, and the only ways forward are to reopen it deliberately or to stop --
+        so this carries its own reason and its own sentence rather than the generic
+        stale hint. The reopen command is named with the ticket already filled in; the
+        reason placeholder is the caller's to write."""
+        reopen = f'arbite reopen {ticket.id} --reason "<why>"'
+        return Stale(
+            f"{self._not_current(ticket, attempt)}\n{NO_BYTES_CHANGED}",
+            reason=REASON_ATTEMPT_NOT_CURRENT,
+            next_actions=[reopen],
+            text_hint=f"next: reopen the ticket ('{reopen}') and claim it again, or stop work on it",
+        )
 
     def _not_current(self, ticket, attempt: WorkAttempt) -> str:
         """Why this attempt can no longer mutate, in the words RC2 freezes.
@@ -325,17 +369,16 @@ class FileMutations:
 
     def _stale(self, message: str) -> Stale:
         """A refusal that changed nothing, said in both halves the caller needs."""
-        return Stale(f"{message}\nno bytes were changed", reason="stale_read")
+        return Stale(f"{message}\n{NO_BYTES_CHANGED}", reason="stale_read")
 
     def _require_path(self, ticket, attempt: WorkAttempt, change: PathChange):
         """The live claim on a path, refused unless this attempt holds it.
 
         A busy path is outcome 4 rather than 5, because the caller's correct response is
         to pick other work rather than to re-read: the bytes are not theirs to write, and
-        retrying will not change that. An unclaimed path is stale, because the fix is a
-        claim followed by a fresh read."""
-        from ..errors import Busy
-
+        retrying will not change that. An unclaimed path is an *error* (WR4): no amount
+        of re-reading makes the path the caller's, so the answer names the claim to take
+        and says plainly that a read is not ownership."""
         active = self.store.claims_for_path(change.path)
         holder = active[0] if active else None
         if holder is not None and not holder.held_by(attempt.id):
@@ -345,7 +388,17 @@ class FileMutations:
                 reason="file_busy",
             )
         if holder is None:
-            raise self._stale(f"{change.path} is not claimed by attempt {attempt.id}")
+            claim_command = (
+                f"arbite file claim {change.path} --ticket {ticket.id} --attempt {attempt.id}"
+            )
+            raise NoClaim(
+                f"{ticket.id} / {attempt.id} does not hold a claim on {change.path} "
+                f"({REASON_NO_CLAIM});\n"
+                f"{REFUSAL_INDENT}a read does not authorize a write",
+                [claim_command],
+                # The frozen WR4 block quotes the command, as every hint in the document does.
+                text_hint=f"next: '{claim_command}'",
+            )
         return holder
 
     def _require_one_generation(self, claims) -> None:
@@ -365,11 +418,12 @@ class FileMutations:
     def _confirm_versions(self, request: MutationRequest, claims) -> tuple:
         """Check the token and the bytes for every path, and read the evidence.
 
-        The order is the order a caller can act on it: the token has to be *this* path's
-        (an observation taken elsewhere, or before the claim, authorises nothing), then the
-        token has to describe the version the caller passed, then the bytes on disk have to
-        still be that version. Anything else is outcome 5 -- re-read and retry -- and the
-        bytes are untouched when it fires.
+        The order is the order a caller can act on it: the token has to exist, and to be
+        *unspent* (one token authorises one mutation, and a replay is told which operation
+        spent it), and to be *this* path's -- an observation taken elsewhere, or before the
+        claim, authorises nothing -- and to describe the version the caller passed, and the
+        bytes on disk have to still be that version. Every one of those is outcome 5 with
+        nothing written; the reasons differ because the repairs do.
 
         Returns the recorded before versions and the bytes to archive, keyed by digest: two
         paths that share a version share one artifact, which is the point of storing content
@@ -378,6 +432,8 @@ class FileMutations:
         for change in request.changes:
             observation = self._observation(change)
             claim = claims[change.path]
+            if observation.is_spent:
+                raise self._already_spent(observation, change, request)
             authorised = (
                 observation.authorizes_creation(claim)
                 if change.is_creation
@@ -393,23 +449,69 @@ class FileMutations:
                     f"read token {observation.id} observed {observation.digest} for "
                     f"{change.path}, not {change.expect}"
                 )
-            observed = probe(self.project_root, change.path).digest
-            if observed != change.expect:
-                raise self._stale(
-                    f"{change.path} changed since you read it "
-                    f"({short_digest(change.expect)} -> {short_digest(observed)})"
-                )
+            observed = probe(self.project_root, change.path)
+            if observed.digest != change.expect:
+                raise self._moved(change, observed, request)
             if change.payload is not None and digest_bytes(change.payload) != change.becomes:
                 raise CoordinationError(
                     f"the payload for {change.path} is not the version the operation "
                     "claims to write, so recording it would be recording a lie"
                 )
-            before[change.path] = observed
+            before[change.path] = observed.digest
             if not change.is_creation:
-                data[observed] = (Path(self.project_root) / change.path).read_bytes()
+                data[observed.digest] = (Path(self.project_root) / change.path).read_bytes()
             if change.payload is not None:
                 data[change.becomes] = change.payload
         return before, data
+
+    def _already_spent(self, observation, change: PathChange, request: MutationRequest) -> Stale:
+        """Refuse a token a mutation has already used (WR3).
+
+        The spending operation is named, because "already spent" without it reads as a
+        version mismatch and sends the caller looking for an edit nobody made: one read
+        token authorises exactly one mutation, and this is the sentence that says which
+        mutation it authorised."""
+        command = read_command(request.ticket_id, request.attempt_id, change.path)
+        return Stale(
+            f"read token {observation.id} was already spent by {observation.spent_by}\n"
+            f"{NO_BYTES_CHANGED}",
+            reason=REASON_STALE_TOKEN_SPENT,
+            next_actions=[command],
+            text_hint=f"next: '{command}' for a fresh token",
+        )
+
+    def _moved(self, change: PathChange, observed, request: MutationRequest) -> Stale:
+        """Refuse bytes that moved after the read the caller planned against (WR2).
+
+        Both versions are printed -- what the token observed and what is on disk -- with
+        the file's own last-write time, because the caller has to judge whether its change
+        still applies to the new text and neither digest means anything without the other.
+        A path that was absent when the caller probed it is the same situation read the
+        other way round, and says so."""
+        command = read_command(request.ticket_id, request.attempt_id, change.path)
+        when = modified_clock(self.project_root, change.path)
+        stamp = f" (changed {when})" if when else ""
+        if observed.digest == ABSENT_VERSION:
+            moved = f"{change.path} was removed after you read it{stamp}"
+        elif change.expect == ABSENT_VERSION:
+            moved = (
+                f"{change.path} was absent when you read it and is now "
+                f"{short_digest(observed.digest)}{stamp}"
+            )
+        else:
+            moved = (
+                f"you read {short_digest(change.expect)} but the file is now "
+                f"{short_digest(observed.digest)}{stamp}"
+            )
+        return Stale(
+            f"{moved}\n{NO_BYTES_CHANGED}",
+            reason=REASON_STALE_VERSION,
+            next_actions=[command],
+            text_hint=(
+                f"next: '{command}',\n"
+                "      re-apply your change, then write with the new token"
+            ),
+        )
 
     def _observation(self, change: PathChange):
         """The read observation a change presents as its token."""
@@ -525,14 +627,20 @@ class FileMutations:
             stage = recovery.stage_path(
                 self.project_root, change.path, request.operation_id
             )
-            self._write_stage(stage, change.payload)
+            self._write_stage(stage, change.payload, self._existing_mode(change.path))
 
-    def _write_stage(self, stage: Path, payload: bytes) -> None:
+    def _write_stage(self, stage: Path, payload: bytes, mode=None) -> None:
         """Create the stage file's content atomically, so a leftover is never half a file.
 
         A second name in the same directory, then `os.replace`: the stage file a later
         recovery sees is either complete or absent, and never a truncated version of the
-        bytes an operation meant to write."""
+        bytes an operation meant to write.
+
+        The replacement carries the target's permission bits when it has any, because the
+        replace would otherwise give a 0600 file the umask's default: an operation changes
+        the *content* of a path, and a writer must not silently widen -- or narrow -- who can
+        read it. Ownership is deliberately not carried over: that is not something an
+        unprivileged process can promise, and nothing here claims it."""
         partial = stage.with_name(stage.name + ".partial")
         stage.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -540,11 +648,23 @@ class FileMutations:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if mode is not None:
+                os.chmod(partial, mode)
             os.replace(partial, stage)
         except BaseException:
             if partial.exists():
                 partial.unlink()
             raise
+
+    def _existing_mode(self, path: str):
+        """The permission bits of the path a change replaces, or None for a creation.
+
+        `None` lets the umask decide, which is exactly right for a file that is not there
+        yet: nothing existed whose permissions could be preserved."""
+        try:
+            return stat.S_IMODE(os.stat(Path(self.project_root) / path).st_mode)
+        except OSError:
+            return None
 
     # ------------------------------------------------------------------
     # 4. The filesystem change
@@ -590,6 +710,7 @@ class FileMutations:
                 return current
             final = replace(current, result=RECEIPT_SUCCEEDED)
             txn.replace_record(final, expect_revision=txn.revision("receipt", receipt.id))
+            self._spend_tokens(txn, request, final)
             txn.append_event(
                 f"{request.kind}.file",
                 "file",
@@ -602,6 +723,25 @@ class FileMutations:
                 payload={"after": current.after, "generation": current.claim_generation},
             )
         return final
+
+    def _spend_tokens(self, txn, request: MutationRequest, receipt: OperationReceipt) -> None:
+        """Mark the read tokens this operation used as spent, in the same commit.
+
+        "One token authorises one mutation" is made true here, and it is made true
+        *atomically*: the bytes, the receipt that records them and the token that paid
+        for them commit together or not at all, so a second writer presenting the same
+        token -- however soon it runs -- cannot find an unspent token to use. A token
+        that is already spent is left alone: the operation that spent it is the one on
+        record, and this commit is not the place to rewrite that."""
+        tokens = {change.token for change in request.changes if change.token}
+        for token in sorted(tokens):
+            observation = txn.find_record("observation", token)
+            if observation is None or observation.is_spent:
+                continue
+            txn.replace_record(
+                observation.spent(receipt.id),
+                expect_revision=txn.revision("observation", token),
+            )
 
     def _discard_stages(self, request: MutationRequest, operation_id: str) -> None:
         """Remove the staged copies now that the target holds the bytes.

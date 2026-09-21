@@ -86,7 +86,11 @@ BODY_SEPARATOR = "---"
 #: A sample line that trails off (`...` in the document) matches by prefix.
 TRAILING_ELLIPSIS_RE = re.compile(r"\s*(?:\.\.\.|…)\s*$")
 
-ID_RE = re.compile(r"\b(tic|ws|att|clm|op|art|evt)-[0-9a-f]{4}\b")
+#: Ids, as the document and this build write them. Four hex characters is what arbite
+#: mints; the document also spells a handful of receipt ids with more (`op-2b8d17`), and
+#: they are placeholders in exactly the same way -- so the pattern covers both lengths
+#: rather than letting one of them survive normalisation and pin a block to a literal id.
+ID_RE = re.compile(r"\b(tic|ws|att|clm|op|art|evt)-[0-9a-f]{4,8}\b")
 #: A content digest, shortened for text or whole (`sha256:<hex>`). Normalised because a
 #: digest is a fact about *bytes*: the document's blocks were written against an earlier
 #: revision of this repo's own files (its `sinks/file.py` is 412 lines, the file here is
@@ -324,11 +328,12 @@ def normalise_payload(payload, root=None):
     return payload
 
 
-def run_cli(cwd, *args, sink: Optional[str] = None):
+def run_cli(cwd, *args, sink: Optional[str] = None, stdin: Optional[str] = None):
     """Run the CLI in `cwd` against this checkout, as a user would.
 
     ARBITE_SINK is never inherited: each caller says which store it means, and a
-    missing environment keeps the project's committed answer."""
+    missing environment keeps the project's committed answer. `stdin` is how a transcript
+    whose command reads `-` is run: the shell pipe and this say the same thing."""
     environment = dict(os.environ, PYTHONPATH=str(SRC_DIR))
     environment.pop("ARBITE_SINK", None)
     if sink:
@@ -339,15 +344,22 @@ def run_cli(cwd, *args, sink: Optional[str] = None):
         env=environment,
         capture_output=True,
         text=True,
+        input=stdin,
     )
 
 
-def run_scenario(scenario: Scenario, cwd, sink: Optional[str] = None):
+def run_scenario(scenario: Scenario, cwd, sink: Optional[str] = None, stdin: Optional[str] = None):
     """Run a scenario's command, exactly as its transcript writes it."""
-    return run_cli(cwd, *scenario.command, sink=sink)
+    return run_cli(cwd, *scenario.command, sink=sink, stdin=stdin)
 
 
-def assert_scenario(scenario: Scenario, cwd, sink: Optional[str] = None, stream: Optional[str] = None) -> str:
+def assert_scenario(
+    scenario: Scenario,
+    cwd,
+    sink: Optional[str] = None,
+    stream: Optional[str] = None,
+    stdin: Optional[str] = None,
+) -> str:
     """Run `scenario` and assert it matches its frozen transcript exactly.
 
     Exit code, the body and the *other* stream are all asserted: a transcript that
@@ -358,7 +370,7 @@ def assert_scenario(scenario: Scenario, cwd, sink: Optional[str] = None, stream:
     deliberately not where refusals normally go: EV7's `--follow` refusal is printed on
     stdout (the application layer says why), and the document records neither stream.
     Everything else is decided by the body's own label (see the module docstring)."""
-    proc = run_scenario(scenario, cwd, sink=sink)
+    proc = run_scenario(scenario, cwd, sink=sink, stdin=stdin)
     where = f"scenario {scenario.id} ('arbite {' '.join(scenario.command)}')"
     assert proc.returncode == scenario.exit_code, (
         f"{where} exited {proc.returncode}, expected {scenario.exit_code}\n"
@@ -486,7 +498,11 @@ def _find_sample(actual_lines: list, start: int, sample) -> Optional[int]:
 
 
 def assert_scenario_abridged(
-    scenario: Scenario, cwd, sink: Optional[str] = None, stream: Optional[str] = None
+    scenario: Scenario,
+    cwd,
+    sink: Optional[str] = None,
+    stream: Optional[str] = None,
+    stdin: Optional[str] = None,
 ) -> str:
     """Assert an *abridged* transcript: every line's facts, not its exact layout.
 
@@ -497,7 +513,7 @@ def assert_scenario_abridged(
     an actual line, in order. It is deliberately weaker than `assert_scenario`, so it
     is used only where the block itself is visibly abridged -- and the test that calls
     it says which abridgement it is accepting."""
-    proc = run_scenario(scenario, cwd, sink=sink)
+    proc = run_scenario(scenario, cwd, sink=sink, stdin=stdin)
     where = f"scenario {scenario.id} ('arbite {' '.join(scenario.command)}')"
     assert proc.returncode == scenario.exit_code, (
         f"{where} exited {proc.returncode}, expected {scenario.exit_code}\n"

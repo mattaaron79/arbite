@@ -7,19 +7,42 @@ authorizes nothing, it is not a ticket, it is never claimable and it never appea
 in discovery -- which is why this module only creates the directory and reports
 what is in it.
 
-Consuming and clearing a payload (success consumes it, failure keeps it, `--keep`
-opts out, `arbite scratch list|clear`) is the scratch slice (tic-95c0); the summary
-here is what the workspace report and `doctor` render, so the count and the size a
-user sees come from one place.
+Reading the payload a mutation will write (`--input`/`--edits` resolved inside
+`.arbite/scratch/`, `-` for stdin) and consuming it on success are here too, because
+the mutation is what knows it succeeded. The rest of the scratch slice is
+tic-95c0/C09: `arbite scratch list|clear`, `--keep`, and the line a *failed* mutation
+prints about the payload it left standing. Until that lands a failed mutation keeps
+the payload -- the file is still there for a model to re-apply -- and says nothing
+about it, because no frozen transcript of this slice asks for a sentence there.
 """
 
 from __future__ import annotations
 
+import posixpath
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
+from ..errors import PathRefused
 
 #: The payload area's name inside the arbite directory.
 SCRATCH_DIRNAME = "scratch"
+
+#: The one payload name that means "read the bytes from stdin".
+STDIN_NAME = "-"
+
+DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
+
+#: How a consumed payload is reported: the bytes now live in the receipt, so the
+#: staged copy is transport that has done its job.
+CONSUMED_NOTE = "payload: {display} consumed and cleared (bytes retained as receipt artifact)"
+
+#: How a stdin payload is reported, in the shape the frozen transcripts use: a write
+#: names the file's shape, an edit batch names how many edits it holds.
+STDIN_NOTE = "(payload read from stdin: {shape})"
+WRITE_SHAPE = "{lines} lines, {size}"
+EDITS_SHAPE = "{edits} edits"
 
 
 def scratch_root(arbite_dir) -> Path:
@@ -120,6 +143,104 @@ def note_lines(
             f"      interrupted run; clear with 'arbite {clear_command} --all'",
         ]
     return [f"{fact} -- transport left behind, expected after an interrupted run"]
+
+
+def read_payload(arbite_dir, name, flag: str, stdin=None) -> "Payload":
+    """The bytes one mutation will write, read from the scratch area or stdin.
+
+    `flag` is the argument the name arrived through (`--input`, `--edits`), so a
+    refusal tells the caller which one to fix. A name is resolved *inside*
+    `.arbite/scratch/`: a path outside the project is refused rather than accepted,
+    because the documented workflow must never need one -- an out-of-project payload
+    makes every harness prompt for permission and breaks unattended automation.
+    """
+    text = "" if name is None else str(name).strip()
+    if not text:
+        raise PathRefused(
+            f"'{flag}' is required: name a payload in .arbite/scratch/ or use '-' for stdin"
+        )
+    if text == STDIN_NAME:
+        if stdin is None:
+            raise PathRefused(
+                f"'{flag} -' reads the payload from stdin, and stdin is not connected"
+            )
+        return Payload(stdin.read())
+    if _outside_project(text):
+        raise PathRefused(
+            f"'{flag}' takes a name inside .arbite/scratch/ or '-' for stdin; "
+            f"'{text}' is outside the project",
+            text_hint=f"next: pipe the payload with '{flag} -', or stage it in .arbite/scratch/",
+        )
+    path = scratch_root(arbite_dir) / text
+    if not path.is_file():
+        raise PathRefused(
+            f"no payload named '{text}' in .arbite/scratch/",
+            text_hint=(
+                f"next: write the bytes to .arbite/scratch/{text} first, or pipe them "
+                f"with '{flag} -'"
+            ),
+        )
+    return Payload(path.read_bytes(), name=text, path=path)
+
+
+def _outside_project(name: str) -> bool:
+    """Whether a payload name points out of the scratch area (or out of the project)."""
+    if name.startswith("/") or DRIVE_LETTER.match(name):
+        return True
+    normalised = posixpath.normpath(name)
+    return normalised == ".." or normalised.startswith("../")
+
+
+@dataclass(frozen=True)
+class Payload:
+    """Bytes staged for one mutation, and where they came from.
+
+    Transport, not a record: the payload authorises nothing, becomes no event on its
+    own, and the only copy that turns into evidence is the one the receipt keeps.
+    `path` is None for stdin, which is the payload that has no file to consume -- so
+    `from_stdin` is the difference between "the staged copy was cleared" and "there
+    was never a staged copy"."""
+
+    data: bytes
+    name: Optional[str] = None
+    path: Optional[Path] = None
+
+    @property
+    def from_stdin(self) -> bool:
+        return self.path is None
+
+    @property
+    def display(self) -> str:
+        """How a report names the payload: its scratch path, or `stdin`."""
+        if self.path is None:
+            return "stdin"
+        return f".arbite/{SCRATCH_DIRNAME}/{self.name}"
+
+    def consume(self) -> bool:
+        """Delete the staged copy, now that its bytes live in the receipt.
+
+        Returns whether there was a copy to clear. Best-effort: the mutation has
+        already been recorded, and failing here would report a successful write as a
+        failure over a leftover of transport."""
+        if self.path is None:
+            return False
+        try:
+            self.path.unlink()
+        except OSError:
+            return False
+        return True
+
+    def consume_note(self) -> str:
+        """The `payload:` line a successful mutation prints, or '' for stdin."""
+        if self.path is None:
+            return ""
+        return CONSUMED_NOTE.format(display=self.display)
+
+    def stdin_note(self, shape: str) -> str:
+        """The `(payload read from stdin: ...)` line, or '' for a staged file."""
+        if self.path is not None:
+            return ""
+        return STDIN_NOTE.format(shape=shape)
 
 
 def scratch_summary(arbite_dir) -> ScratchSummary:
