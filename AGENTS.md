@@ -53,4 +53,8 @@ Do not modify this file without explicit permission.
 ## Comment Protocol
 
 Do not fill the codebase with comments containing history, musings, or overly wordy explanations. Comments should be maximally useful and concise. Put long explanations and related context in Arbite tickets, and refer to the relevant ticket from a code comment when needed.
+
+## Coding Style
+
+*MANDATORY* All code should be human readable. Prefer longer more readable code (though not to an extreme).
 <!-- END ARBITE INSTRUCTIONS -->
