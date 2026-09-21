@@ -31,6 +31,7 @@ from .coordination import app as coordination_app
 from .coordination import claims as coordination_claims
 from .coordination import discovery as coordination_discovery
 from .coordination import lifecycle as coordination_lifecycle
+from .coordination import moves as coordination_moves
 from .coordination import reads as coordination_reads
 from .coordination import recovery as coordination_recovery
 from .coordination import results as outcomes
@@ -291,24 +292,28 @@ def _writes(args, sink):
     return coordination_writes.FileWrites(sink, _lifecycle(args, sink))
 
 
+def _moves(args, sink):
+    """The removal and rename surface for this command's sink and store.
+
+    Both commands are the engine's operations (`coordination.mutations`) with the rules
+    that make them deliberate: a rename holds both paths at one claim generation and
+    replaces an existing destination only when `--expect-dest` names the version it is
+    replacing, a removal keeps the bytes it deletes, and neither touches a directory. All
+    of that lives in `coordination.moves`, so the command layer here is one call each."""
+    return coordination_moves.FileMoves(sink, _lifecycle(args, sink))
+
+
 def _mutation_context(args):
-    """The attempt every mutation must name, or the refusal that says so.
+    """The ticket and the attempt every mutation must name, or the refusal that says so.
 
-    Validated here rather than in argparse because a missing attempt is an *outcome* with a
-    `next:` line naming the command that supplies it -- the frozen WR7 block prints
-    `--attempt is required`, exit 1 -- not an argparse usage error: the fix is a command to
-    run, and that command is the hint.
-
-    The read token is checked in `coordination.writes` instead, because whether one is
-    required depends on the path: a change to existing bytes needs the read that authorises
-    it, while a file that is not there is created from a probe the command records itself."""
-    if not getattr(args, "attempt", None):
-        claim_hint = f"arbite claim {args.ticket} --agent <your-id>"
-        raise UsageRefused(
-            "--attempt is required: every mutation is attributed to a work attempt",
-            [claim_hint],
-            text_hint=f"next: '{claim_hint}' to start one",
-        )
+    The rule itself lives in `coordination.writes` beside the read-token check, because it
+    is an *outcome* rather than an argparse usage error -- the frozen WR7 block prints
+    `--attempt is required`, exit 1, with the command that supplies one -- and because the
+    removals and renames judge the path before it (RN4's frozen command names neither
+    flag and still gets the directory refusal)."""
+    coordination_writes.require_mutation_context(
+        getattr(args, "ticket", None), getattr(args, "attempt", None)
+    )
 
 
 def _emit_file_result(result, as_json):
@@ -1796,6 +1801,51 @@ def cmd_file_write(args):
     _emit_file_result(result, args.json)
 
 
+def cmd_file_remove(args):
+    """Remove a file's bytes, keeping them and their version as receipt evidence.
+
+    Everything is checked before anything is deleted: the ticket must still be in progress
+    for this attempt, the attempt must hold the claim at the generation the read token was
+    taken under, the token must be unspent, and the bytes must still be the version it
+    observed. A path that is not there is an error rather than a no-op, and a *directory* is
+    refused with the manual alternative stated, because arbite has no recursive deletion.
+
+    The bytes do not vanish: the receipt keeps the removed version as an artifact, so what
+    was deleted stays reproducible. The claim on the path stays active too -- a path with no
+    bytes is the state a creation is authorised from -- so the same attempt can create it
+    again from a fresh probe, and `arbite file release` is how it gives the path up."""
+    sink = _require_sink(args)
+    result = _moves(args, sink).remove(
+        args.path, args.ticket, args.attempt, args.read_token
+    )
+    _emit_file_result(result, args.json)
+
+
+def cmd_file_rename(args):
+    """Move a file's bytes to another path this attempt holds, recording both paths.
+
+    A rename is one operation over two paths, so both have to be claimed by this attempt in
+    *one* acquisition: that is what gives them one generation and what makes the single read
+    token authorise the whole move. A destination that is not held is refused with the
+    command that claims both together. A destination that already exists is replaced only
+    when `--expect-dest` names the version it is replacing (a wrong version is stale, and
+    nothing moves); without it the refusal names the version that is there.
+
+    The receipt records where the bytes came from and where they went, including the version
+    a replaced destination held, and the ownership moves with them: the destination keeps the
+    claim the acquisition gave it and the source's claim is released."""
+    sink = _require_sink(args)
+    result = _moves(args, sink).rename(
+        args.source,
+        args.destination,
+        args.ticket,
+        args.attempt,
+        args.read_token,
+        args.expect_dest,
+    )
+    _emit_file_result(result, args.json)
+
+
 def cmd_file_edit(args):
     """Apply an ordered batch of exact text substitutions to one file, or change nothing.
 
@@ -2689,21 +2739,25 @@ def build_parser():
 
     p_file = sub.add_parser(
         "file",
-        help="the file proxy: discovery, reads, claims, and version-checked writes and edits",
+        help="the file proxy: discovery, reads, claims, and version-checked writes, edits, "
+        "removes and renames",
         description="The shared-directory proxy: what is in the workspace, what it contains, and "
         "which work attempt owns which whole file. `list` and `search` are bounded discovery in "
         "canonical path order and never authorise a change; `read` serves bytes and records an "
         "observation whose token a mutation may present; `claim`, `release` and `claims` are the "
-        "durable ownership surface; `write` and `edit` change a file's bytes and record the "
-        "evidence. A claim is a record, not a lock, so no lock is ever held for the length of an "
-        "agent's work, and acquisition is all-or-nothing in canonical path order, so two attempts "
-        "can never each hold half of a pair -- contention is a structured busy answer (exit 4) "
-        "naming the holder, never a wait. A mutation needs all three of the claim, the attempt and "
-        "a read token taken under that claim, and one token authorises exactly one mutation: a "
-        "stale token, a moved file or a closed ticket refuses with exit 5 and changes no bytes. "
-        "Paths are validated against the project root: escapes, arbite's own state, `.git` "
-        "metadata and generated or build output are refused. Renames and removes are not here "
-        "yet -- they arrive with their own slice.",
+        "durable ownership surface; `write`, `edit`, `remove` and `rename` change a file's bytes "
+        "and record the evidence. A claim is a record, not a lock, so no lock is ever held for the "
+        "length of an agent's work, and acquisition is all-or-nothing in canonical path order, so "
+        "two attempts can never each hold half of a pair -- contention is a structured busy answer "
+        "(exit 4) naming the holder, never a wait. A mutation needs all three of the claim, the "
+        "attempt and a read token taken under that claim, and one token authorises exactly one "
+        "mutation: a stale token, a moved file or a closed ticket refuses with exit 5 and changes "
+        "no bytes. Paths are validated against the project root: escapes, arbite's own state, "
+        "`.git` metadata and generated or build output are refused. `remove` keeps the bytes it "
+        "deletes as receipt evidence, and `rename` holds both paths at one claim generation, "
+        "records both, and replaces a destination that already exists only when `--expect-dest` "
+        "names the version it is replacing. Neither ever touches a directory: arbite has no "
+        "recursive deletion and no mutation creates one.",
     )
     file_sub = p_file.add_subparsers(
         dest="file_action", required=True, metavar="SUBCOMMAND"
@@ -2934,8 +2988,9 @@ def build_parser():
         "created, provided the read that found it absent was taken under the claim. The write "
         "reports the version it produced, the receipt that holds both versions as evidence, and "
         "the fresh read the token it just spent requires before another change. Success consumes "
-        "the scratch payload; a refusal leaves it in place. Renames and removes are separate "
-        "commands (tic-74e2).",
+        "the scratch payload; a refusal leaves it in place. Removing and renaming are their own "
+        "commands: `arbite file remove` keeps the bytes it deletes, and `arbite file rename` "
+        "moves them between two paths this attempt holds.",
     )
     p_file_write.add_argument("path", metavar="PATH", help="the file to write, relative to the root")
     p_file_write.add_argument(
@@ -2964,6 +3019,95 @@ def build_parser():
     _json_flag(p_file_write)
     _sink_flag(p_file_write)
     p_file_write.set_defaults(func=cmd_file_write)
+
+    p_file_remove = file_sub.add_parser(
+        "remove",
+        help="remove a file, keeping its bytes as receipt evidence",
+        description="Remove one file's bytes, keeping them: the receipt records the version that "
+        "was there and holds the bytes themselves, so a removal is reproducible from the "
+        "evidence. Everything is checked before anything is deleted -- the ticket must still be "
+        "in progress for this attempt, the attempt must hold the claim on the path at the "
+        "generation the read token was taken under, the token must be unspent, and the bytes on "
+        "disk must still be the version it observed -- and every refusal changes no bytes (exit 5 "
+        "for a stale token or a moved file, 4 for a path somebody else holds, 1 for a path nobody "
+        "holds, one that is generated output, one that is not there, or a directory). There is no "
+        "recursive deletion: a directory is refused with the manual alternative stated. The claim "
+        "stays active afterwards, so a path with no bytes is one a creation can be authorised "
+        "from, and `arbite file release` is how the path is given up.",
+    )
+    p_file_remove.add_argument(
+        "path", metavar="PATH", help="the file to remove, relative to the root"
+    )
+    # --ticket and --attempt are deliberately not required by argparse: the path rules are
+    # judged first, so `file remove <dir>` answers about the directory rather than about a
+    # missing flag (the frozen RN4 block names neither one). The application layer refuses a
+    # missing one with the command that supplies it, exit 1.
+    p_file_remove.add_argument(
+        "--ticket", metavar="TICKET", help="the ticket this change belongs to (required)"
+    )
+    p_file_remove.add_argument(
+        "--attempt",
+        metavar="ATTEMPT",
+        help="the work attempt that holds the claim (required; the error names 'arbite claim')",
+    )
+    p_file_remove.add_argument(
+        "--read-token",
+        dest="read_token",
+        metavar="TOKEN",
+        help="the read token a read taken under the claim returned (required: the read "
+        "authorises changing bytes that exist)",
+    )
+    _json_flag(p_file_remove)
+    _sink_flag(p_file_remove)
+    p_file_remove.set_defaults(func=cmd_file_remove)
+
+    p_file_rename = file_sub.add_parser(
+        "rename",
+        help="move a file between two paths this attempt holds, recording both",
+        description="Move one file's bytes from SOURCE to DEST, which this attempt must hold in "
+        "*one* acquisition: that is what gives the two paths one claim generation, and one read "
+        "token authorises the whole move. A destination that is not held is refused with the "
+        "command that claims both together, and two paths at different generations are refused "
+        "as stale, because they did not change hands together. A destination that already exists "
+        "is replaced only when `--expect-dest` names the version it is replacing -- the full "
+        "digest or the 12-character prefix a report prints; without it the refusal names the "
+        "version that is there, and a version that no longer matches is stale. Every refusal "
+        "changes no bytes. The receipt records where the bytes came from, where they went and "
+        "what a replaced destination held, and the ownership moves with them: the destination "
+        "keeps its claim and the source's is released. A directory is never a rename target.",
+    )
+    p_file_rename.add_argument(
+        "source", metavar="SOURCE", help="the file to move, relative to the root"
+    )
+    p_file_rename.add_argument(
+        "destination", metavar="DEST", help="where to move it, relative to the root"
+    )
+    # Not argparse-required, for the same reason `remove`'s are not (see above).
+    p_file_rename.add_argument(
+        "--ticket", metavar="TICKET", help="the ticket this change belongs to (required)"
+    )
+    p_file_rename.add_argument(
+        "--attempt",
+        metavar="ATTEMPT",
+        help="the work attempt that holds both claims (required; the error names 'arbite claim')",
+    )
+    p_file_rename.add_argument(
+        "--read-token",
+        dest="read_token",
+        metavar="TOKEN",
+        help="the read token of the source, taken under the claim (required: the read "
+        "authorises the move)",
+    )
+    p_file_rename.add_argument(
+        "--expect-dest",
+        dest="expect_dest",
+        metavar="DIGEST",
+        help="the version of the destination this rename may replace ('sha256:<64 hex>', or the "
+        "12-character prefix a report prints); required when the destination already exists",
+    )
+    _json_flag(p_file_rename)
+    _sink_flag(p_file_rename)
+    p_file_rename.set_defaults(func=cmd_file_rename)
 
     p_file_edit = file_sub.add_parser(
         "edit",

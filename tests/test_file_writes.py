@@ -166,27 +166,31 @@ def test_two_processes_with_one_token_race_and_exactly_one_wins(tmp_path, projec
     kind = project_kind  # a sink that can record the evidence (see the SQLite test below)
     """The guarantee under real concurrency, not just in sequence.
 
-    Two `arbite file write` processes are started against one staged payload with the same
-    read token. Whichever the store serialises first spends the token; the other must be
-    refused with exit 5 -- there is no interleaving in which both replace the file, and the
-    file holds exactly one copy of the payload afterwards (whichever process won)."""
+    Two `arbite file write` processes are started with the same read token, each with its own
+    copy of the payload (a successful write consumes the payload it read, so one shared file
+    would let the winner's consumption decide the loser's outcome -- a race in the fixture
+    rather than in the rule this test is about). Whichever the store serialises first spends
+    the token; the other must be refused with exit 5 -- there is no interleaving in which both
+    replace the file, and the file holds exactly one copy of the payload afterwards (whichever
+    process won)."""
     project = state.write_project(tmp_path, kind)
     token = state.token_for_write(project, kind)
     payload = state.base_text(append=state.APPENDED_LINES).encode("utf-8")
+    state.staged(project, "second.py", state.base_text(append=state.APPENDED_LINES))
     environment = dict(os.environ, PYTHONPATH=str(examples.SRC_DIR))
     environment.pop("ARBITE_SINK", None)
 
-    command = [
-        sys.executable, "-m", "arbite.cli", "file", "write", BASE_PY,
-        "--ticket", HOLDER_TICKET, "--attempt", HOLDER,
-        "--read-token", token, "--input", "base.py",
-    ]
     racers = [
         subprocess.Popen(
-            command, cwd=str(project), env=environment,
+            [
+                sys.executable, "-m", "arbite.cli", "file", "write", BASE_PY,
+                "--ticket", HOLDER_TICKET, "--attempt", HOLDER,
+                "--read-token", token, "--input", name,
+            ],
+            cwd=str(project), env=environment,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        for _ in range(2)
+        for name in ("base.py", "second.py")
     ]
     outcomes = [racer.communicate() for racer in racers]
     codes = sorted(racer.returncode for racer in racers)
@@ -730,12 +734,21 @@ def test_the_json_payload_carries_the_facts_the_text_prints(tmp_path, project_ki
 
 def test_help_text_names_only_commands_that_exist():
     """A refusal may not point at a command this build does not have: the hints here name
-    `file read`, `file claim`, `file write` and `reopen`, all of which exist."""
+    `file read`, `file claim`, `file write`, `file edit`, `file remove`, `file rename`,
+    `reopen` and `close`, all of which exist.
+
+    The second list is the same rule in the other direction, and it is why the check is worth
+    having: a slice that has not landed must not be named by anything output today. tic-74e2
+    landed `file remove` and `file rename`, so they moved to the first list; scratch transport
+    (tic-95c0) and the receipt and change views (tic-7c42) are still ahead."""
     from arbite import cli
 
-    for path in ("file read", "file claim", "file write", "file edit", "reopen", "close"):
+    for path in (
+        "file read", "file claim", "file write", "file edit", "file remove", "file rename",
+        "reopen", "close",
+    ):
         assert cli.knows_command(path), path
-    for path in ("scratch list", "scratch clear", "receipt", "changes", "file remove", "file rename"):
+    for path in ("scratch list", "scratch clear", "receipt", "changes"):
         assert not cli.knows_command(path), f"{path} is another slice's"
 
 

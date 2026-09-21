@@ -102,6 +102,35 @@ REASON_NO_CLAIM = "no_claim"
 NO_BYTES_CHANGED = "no bytes were changed"
 
 
+def spent_message(observation) -> str:
+    """The two lines a token a mutation already used produces (the frozen WR3 shape).
+
+    One place for the words, because every mutation of every kind answers a replay the same
+    way: one read token authorises exactly one mutation, the operation that used it is
+    named, and nothing was changed by the replay. `already_spent` is the refusal that
+    carries the standard repair; a caller that cannot take that repair -- a path that is no
+    longer there has nothing to re-read -- builds its own hint from this sentence."""
+    return (
+        f"read token {observation.id} was already spent by {observation.spent_by}\n"
+        f"{NO_BYTES_CHANGED}"
+    )
+
+
+def already_spent(observation, command: str) -> "Stale":
+    """The refusal a token a mutation has already used produces (WR3).
+
+    The spending operation is named, because "already spent" without it reads as a version
+    mismatch and sends the caller looking for an edit nobody made: one read token authorises
+    exactly one mutation, and this is the sentence that says which mutation it authorised.
+    `command` is the read that takes a fresh one."""
+    return Stale(
+        spent_message(observation),
+        reason=REASON_STALE_TOKEN_SPENT,
+        next_actions=[command],
+        text_hint=f"next: '{command}' for a fresh token",
+    )
+
+
 def read_command(ticket_id: str, attempt_id: str, path: str) -> str:
     """The read a mutation's refusals hand back: the exact command, not a description.
 
@@ -465,19 +494,9 @@ class FileMutations:
         return before, data
 
     def _already_spent(self, observation, change: PathChange, request: MutationRequest) -> Stale:
-        """Refuse a token a mutation has already used (WR3).
-
-        The spending operation is named, because "already spent" without it reads as a
-        version mismatch and sends the caller looking for an edit nobody made: one read
-        token authorises exactly one mutation, and this is the sentence that says which
-        mutation it authorised."""
-        command = read_command(request.ticket_id, request.attempt_id, change.path)
-        return Stale(
-            f"read token {observation.id} was already spent by {observation.spent_by}\n"
-            f"{NO_BYTES_CHANGED}",
-            reason=REASON_STALE_TOKEN_SPENT,
-            next_actions=[command],
-            text_hint=f"next: '{command}' for a fresh token",
+        """Refuse a token a mutation has already used (WR3); see `already_spent`."""
+        return already_spent(
+            observation, read_command(request.ticket_id, request.attempt_id, change.path)
         )
 
     def _moved(self, change: PathChange, observed, request: MutationRequest) -> Stale:

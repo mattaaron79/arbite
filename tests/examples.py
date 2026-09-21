@@ -196,6 +196,22 @@ def scenario_json_blocks(scenario_id: str, path: Path = EXAMPLES_DOC) -> list:
     return documents
 
 
+def with_token(scenario: Scenario, token: str, placeholder: str = "op-") -> Scenario:
+    """The frozen command with the document's illustrative read token replaced.
+
+    A token is the one fact a transcript cannot carry: it is minted by the fixture's own
+    `arbite file read`, so a block's `op-XXXX` is a placeholder exactly as `tic-XXXX` is
+    (`Scenario.with_ticket`). The harness normalises both sides, and a command that
+    *presents* a token has to name the real one to run at all."""
+    return replace(
+        scenario,
+        command=tuple(
+            token if argument.startswith(placeholder) else argument
+            for argument in scenario.command
+        ),
+    )
+
+
 def scenario_block(scenario_id: str, path: Path = EXAMPLES_DOC) -> Scenario:
     """The frozen scenario `scenario_id`, parsed out of the examples document.
 

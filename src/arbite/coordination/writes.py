@@ -23,6 +23,13 @@ The three report shapes are the frozen transcripts', implemented literally becau
 Every refusal happens before the engine stages anything, and says **no bytes were
 changed**: a caller that cannot tell "refused" from "may have written half a file" is
 never put in that position.
+
+The few helpers a *command* needs rather than the engine -- the canonical mutation target,
+the probe a mutation records for itself under its claim, the artifact read-back a report
+renders, and the refusals for a change that names no ticket, no attempt or no read token --
+live at module level here, because the removal and rename commands (`coordination.moves`)
+need exactly the same ones: a second copy would be a second answer to "which path is this,
+and what authorises a change".
 """
 
 from __future__ import annotations
@@ -112,6 +119,141 @@ register_next_actions(
 )
 
 
+def mutation_target(raw_path, root) -> str:
+    """The canonical path a mutation names, or the refusal that stops it.
+
+    Two rules, both before anything is read: the path has to be one arbite manages at
+    all, and it may not be generated or build output -- a proxy write whose evidence
+    could not be attributed to source is refused early rather than recorded late (BY2)."""
+    path = canonical_relative(raw_path, root)
+    refuse_if_excluded(path)
+    return path
+
+
+def active_claim(store, path: str):
+    """The active claim on `path`, or None."""
+    claims = store.claims_for_path(path)
+    return claims[0] if claims else None
+
+
+def next_observation_id(store) -> str:
+    """A fresh `op-` id, free in both the observation and the receipt space.
+
+    The two share the prefix on purpose (a caller holds one handle), so minting one has
+    to look at both -- a token that collided with a receipt would be two records claiming
+    one id."""
+    taken = {record.id for record in store.records("observation")}
+    taken.update(record.id for record in store.records("receipt"))
+    return new_id("observation", taken)
+
+
+def evidence(store, digest: str) -> tuple:
+    """`(version, bytes)` for a version a receipt recorded.
+
+    Read back from the artifact store rather than from disk: a report describes what
+    the operation *recorded*, which is what makes its sentence reproducible from the
+    receipt alone -- and checkable by a reviewer after the file has moved on."""
+    if digest == ABSENT:
+        return Version(ABSENT), b""
+    data = store.get_artifact_bytes(digest)
+    return version_of(data, digest), data
+
+
+def version_facts(version: Version) -> dict:
+    """A version as JSON reports one: the same keys `file read --json` prints."""
+    return {"digest": version.digest, "bytes": version.size, "lines": version.lines}
+
+
+def require_mutation_context(ticket_id, attempt_id) -> None:
+    """Refuse a mutation that names no ticket, or no attempt (the frozen WR7 rule).
+
+    An *outcome* rather than an argparse error, because the fix is a command to run: the
+    refusal names the command that supplies the missing half, and the exit code says "fix
+    the command" (1) rather than "nothing matched" (the argparse exit 2 would mean).
+
+    The read token is a separate check (`require_read_token`), because whether one is
+    required depends on the path: existing bytes need the read that authorises changing
+    them, while a path that is not there is created from a probe the command records itself.
+    """
+    if not ticket_id:
+        command = "arbite list next --claim <agent-id>"
+        raise UsageRefused(
+            "--ticket is required: every mutation is recorded against a ticket and an attempt",
+            [command],
+            text_hint=(
+                f"next: '{command}' to take workable work, or name the ticket this change "
+                "belongs to"
+            ),
+        )
+    if not attempt_id:
+        command = f"arbite claim {ticket_id} --agent <your-id>"
+        raise UsageRefused(
+            "--attempt is required: every mutation is attributed to a work attempt",
+            [command],
+            text_hint=f"next: '{command}' to start one",
+        )
+
+
+def require_read_token(path, ticket_id, attempt_id) -> None:
+    """Refuse a change to existing bytes that names no read token.
+
+    WR7's rule one argument further on: the claim says whose the path is, and the read
+    taken under it is what authorises the change, so a caller that presents neither gets
+    the command that takes one rather than a stale outcome it cannot act on."""
+    command = read_command(ticket_id, attempt_id, path)
+    raise UsageRefused(
+        "--read-token is required: a claim authorises ownership, and the read taken "
+        "under it authorises the change",
+        [command],
+        text_hint=f"next: '{command}' to take one, then retry",
+    )
+
+
+def record_claim_probe(
+    store, workspace_id, path, ticket_id, attempt_id, actor, claim_generation, digest
+) -> ReadObservation:
+    """Record the observation a mutation takes for itself, under the claim it holds.
+
+    A path that is not there cannot be read -- `file read` refuses it, because there are
+    no bytes to serve -- so a creation's probe is recorded here instead: the same
+    observation a read would have written, with `absent` as its version and the claim
+    generation it was taken under. That is the "read/probe receipt for an absent path"
+    the plan gives creations, and the write spends it exactly like any other token.
+
+    A rename's destination is the same shape one step on: the version the caller *stated*
+    for it (its absence, or the digest it gave as the one it expects to replace) is
+    recorded as the observation the engine checks against the bytes, exactly as a read
+    token's observed version is checked. Ownership is the claim's either way."""
+    observation = ReadObservation(
+        id=next_observation_id(store),
+        path=path,
+        digest=digest,
+        observed_at=utc_now(),
+        attempt_id=attempt_id,
+        actor=actor,
+        claim_generation=claim_generation,
+    )
+    with store.transaction() as txn:
+        txn.put_record(observation)
+        txn.append_event(
+            READ_FILE,
+            READ_FILE_CATEGORY,
+            subject=path,
+            result=MUTATION_RESULT,
+            ticket_id=ticket_id,
+            attempt_id=attempt_id,
+            actor=actor,
+            operation_id=observation.id,
+            payload={
+                "digest": digest,
+                "claim_generation": claim_generation,
+                "read_only": False,
+                "workspace": workspace_id,
+            },
+        )
+    return observation
+
+
 class FileWrites:
     """Whole-file writes and exact edit batches, for one sink and one store."""
 
@@ -141,7 +283,7 @@ class FileWrites:
         two things: the claim, and a read (a probe, there) taken under it that found the
         path absent. Nothing else distinguishes it -- the evidence records `absent` as the
         version the write replaced."""
-        path = self._target(raw_path)
+        path = mutation_target(raw_path, self.project_root)
         before = probe(self.project_root, path)
         token = self._write_token(path, ticket_id, attempt_id, read_token, before)
         outcome = self._apply("write", path, ticket_id, attempt_id, token, before, payload.data)
@@ -163,9 +305,9 @@ class FileWrites:
         report names the token that was used, so nothing about which handle paid is implicit."""
         if not before.is_absent:
             if not read_token:
-                self._require_token(path, ticket_id, attempt_id)
+                require_read_token(path, ticket_id, attempt_id)
             return read_token
-        claim = self._claim_for(path)
+        claim = active_claim(self.store, path)
         if claim is None or not claim.held_by(attempt_id):
             # No probe of the caller's own to record: the refusal is the engine's (WR4),
             # which names the claim to take.
@@ -179,72 +321,25 @@ class FileWrites:
         ):
             return read_token
         attempt = self.store.get_attempt(attempt_id)
-        observation = ReadObservation(
-            id=self._next_observation_id(),
-            path=path,
-            digest=ABSENT,
-            observed_at=utc_now(),
-            attempt_id=attempt_id,
-            actor=None if attempt is None else attempt.worker_id,
-            claim_generation=claim.generation,
+        observation = record_claim_probe(
+            self.store,
+            self.app.derived_workspace().id,
+            path,
+            ticket_id,
+            attempt_id,
+            None if attempt is None else attempt.worker_id,
+            claim.generation,
+            ABSENT,
         )
-        with self.store.transaction() as txn:
-            txn.put_record(observation)
-            txn.append_event(
-                READ_FILE,
-                READ_FILE_CATEGORY,
-                subject=path,
-                result=MUTATION_RESULT,
-                ticket_id=ticket_id,
-                attempt_id=attempt_id,
-                actor=observation.actor,
-                operation_id=observation.id,
-                payload={
-                    "digest": ABSENT,
-                    "claim_generation": claim.generation,
-                    "read_only": False,
-                    "workspace": self.app.derived_workspace().id,
-                },
-            )
         return observation.id
-
-    @staticmethod
-    def _require_token(path, ticket_id, attempt_id) -> None:
-        """Refuse a change to existing bytes that names no read token.
-
-        WR7's rule one argument further on: the claim says whose the path is, and the read
-        taken under it is what authorises the change, so a caller that presents neither gets
-        the command that takes one rather than a stale outcome it cannot act on."""
-        command = read_command(ticket_id, attempt_id, path)
-        raise UsageRefused(
-            "--read-token is required: a claim authorises ownership, and the read taken "
-            "under it authorises the change",
-            [command],
-            text_hint=f"next: '{command}' to take one, then retry",
-        )
-
-    def _claim_for(self, path):
-        """The active claim on a path, or None."""
-        claims = self.store.claims_for_path(path)
-        return claims[0] if claims else None
-
-    def _next_observation_id(self) -> str:
-        """A fresh `op-` id, free in both the observation and the receipt space.
-
-        The two share the prefix on purpose (a caller holds one handle), so minting one has
-        to look at both -- a probe that collided with a receipt would be two records claiming
-        one id."""
-        taken = {record.id for record in self.store.records("observation")}
-        taken.update(record.id for record in self.store.records("receipt"))
-        return new_id("observation", taken)
 
     def _write_report(
         self, path, ticket_id, attempt_id, read_token, outcome, payload
     ) -> OperationResult:
         """The frozen shape for a whole-file write, assembled from what was recorded."""
         receipt = outcome.receipt
-        before, before_bytes = self._evidence(receipt.before[path])
-        after, after_bytes = self._evidence(receipt.after[path])
+        before, before_bytes = evidence(self.store, receipt.before[path])
+        after, after_bytes = evidence(self.store, receipt.after[path])
         created = before.is_absent
         binary = before.lines is None or after.lines is None
 
@@ -340,7 +435,7 @@ class FileWrites:
         is never reached. That ordering is what makes "no partial write" a property of the
         shape rather than a cleanup path -- the new text is assembled in memory and handed
         over as one version, replaced once."""
-        path = self._target(raw_path)
+        path = mutation_target(raw_path, self.project_root)
         before = probe(self.project_root, path)
         if before.is_absent:
             raise PathRefused(
@@ -356,7 +451,7 @@ class FileWrites:
                 f"{REFUSAL_INDENT}`file write` sends bytes, and `file read` shows the digest"
             )
         if not read_token:
-            self._require_token(path, ticket_id, attempt_id)
+            require_read_token(path, ticket_id, attempt_id)
         substitutions = edit_batches.parse_batch(payload.data, flag)
         before_bytes = (Path(self.project_root) / path).read_bytes()
         batch = edit_batches.apply_batch(
@@ -379,8 +474,8 @@ class FileWrites:
     ) -> OperationResult:
         """The frozen shape for an edit: the delta, one row per replacement, the receipt."""
         receipt = outcome.receipt
-        after, after_bytes = self._evidence(receipt.after[path])
-        _, before_bytes = self._evidence(receipt.before[path])
+        after, after_bytes = evidence(self.store, receipt.after[path])
+        _, before_bytes = evidence(self.store, receipt.before[path])
         added, removed = line_delta(before_bytes, after_bytes)
 
         lines = []
@@ -415,17 +510,6 @@ class FileWrites:
     # ------------------------------------------------------------------
     # The operation, and its evidence
     # ------------------------------------------------------------------
-
-    def _target(self, raw_path) -> str:
-        """The canonical path a mutation names, or the refusal that stops it.
-
-        Two rules, both before anything is read: the path has to be one arbite manages at
-        all, and it may not be generated or build output -- a proxy write whose evidence
-        could not be attributed to source is refused early rather than recorded late
-        (BY2)."""
-        path = canonical_relative(raw_path, self.project_root)
-        refuse_if_excluded(path)
-        return path
 
     def _apply(
         self, kind, path, ticket_id, attempt_id, read_token, before, after_bytes
@@ -463,17 +547,6 @@ class FileWrites:
             )
         )
 
-    def _evidence(self, digest: str) -> tuple:
-        """`(version, bytes)` for a version a receipt recorded.
-
-        Read back from the artifact store rather than from disk: a report describes what
-        the operation *recorded*, which is what makes its sentence reproducible from the
-        receipt alone -- and checkable by a reviewer after the file has moved on."""
-        if digest == ABSENT:
-            return Version(ABSENT), b""
-        data = self.store.get_artifact_bytes(digest)
-        return version_of(data, digest), data
-
     def _payload(
         self,
         path: str,
@@ -495,8 +568,8 @@ class FileWrites:
             "ticket": receipt.ticket_id,
             "attempt": receipt.attempt_id,
             "claim_generation": receipt.claim_generation,
-            "before": None if before.is_absent else _version_facts(before),
-            "after": _version_facts(after),
+            "before": None if before.is_absent else version_facts(before),
+            "after": version_facts(after),
             "created": before.is_absent,
             "binary": after.lines is None,
             "token": {"id": token, "spent_by": receipt.id},
@@ -508,11 +581,6 @@ class FileWrites:
                 "consumed": consumed,
             },
         }
-
-
-def _version_facts(version: Version) -> dict:
-    """A version as JSON reports one: the same keys `file read --json` prints."""
-    return {"digest": version.digest, "bytes": version.size, "lines": version.lines}
 
 
 def _stdin_shape(data: bytes) -> str:
