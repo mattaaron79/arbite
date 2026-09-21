@@ -27,6 +27,9 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__, config, docs, graph, schema
+from .coordination import app as coordination_app
+from .coordination import results as outcomes
+from .coordination.scratch import ensure_scratch_dir
 from .errors import ArbiteError, Conflict, TicketError
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
@@ -46,11 +49,18 @@ from .sinks import (
 # Exit codes. Agents drive arbite from shell loops, so "nothing matched" has to
 # be distinguishable from "worked fine" and from "broke" without parsing
 # stdout: 0 = success with results, 1 = error, 2 = query ran but matched
-# nothing, 3 = `doctor` found integrity problems.
-EXIT_OK = 0
-EXIT_ERROR = 1
-EXIT_EMPTY = 2
-EXIT_PROBLEMS = 3
+# nothing, 3 = `doctor` found integrity problems, 4 = busy (a live claim or
+# attempt holds it; nothing changed), 5 = stale (a token, digest or generation is
+# no longer current; nothing changed). 4 and 5 are the coordination vocabulary's
+# additions -- they need a different caller response from a genuine error -- and
+# they are named here from `coordination.results` so the codes, the labels and the
+# `next:` hints cannot drift apart.
+EXIT_OK = outcomes.EXIT_OK
+EXIT_ERROR = outcomes.EXIT_ERROR
+EXIT_EMPTY = outcomes.EXIT_EMPTY
+EXIT_PROBLEMS = outcomes.EXIT_PROBLEMS
+EXIT_BUSY = outcomes.EXIT_BUSY
+EXIT_STALE = outcomes.EXIT_STALE
 
 
 def _split_csv(value):
@@ -187,6 +197,43 @@ def _warn_about_an_unused_database(args, sink) -> None:
         )
 
 
+def _store_source(args, project_root) -> str:
+    """Where this command's sink selection came from, in words.
+
+    A fact the workspace report states plainly, because "which store am I looking
+    at" is the question the whole sink design exists to keep answerable: an
+    explicit flag or an environment override is a per-invocation decision, a
+    `sink:` key in the committed config is the project's, and neither is the same
+    as the default."""
+    kind = config.sink_spec(getattr(args, "sink", None), project_root).kind
+    if getattr(args, "sink", None):
+        return f"--sink {kind}"
+    if os.environ.get(config.ENV_SINK):
+        return f"{config.ENV_SINK}={kind}"
+    if config.load_config(project_root).get("sink"):
+        return f"sink: {kind} in {config.ARBITE_DIRNAME}/{config.CONFIG_FILENAME}"
+    return (
+        f"the default for this project -- no 'sink:' key in "
+        f"{config.ARBITE_DIRNAME}/{config.CONFIG_FILENAME}"
+    )
+
+
+def _coordination_app(args, sink, project_root=None):
+    """The application layer for this command's sink and project.
+
+    Coordination policy lives there rather than here: this function only assembles
+    the facts the layer needs (the located project root, the arbite directory, the
+    resolved sink and where that selection came from) and nothing about claims,
+    attempts or staleness is decided in argparse."""
+    project_root = project_root or config.find_project_root()
+    return coordination_app.CoordinationApp.open(
+        sink,
+        project_root,
+        project_root / config.ARBITE_DIRNAME,
+        store_source=_store_source(args, project_root),
+    )
+
+
 def _has_tickets(sink) -> bool:
     """Whether a store holds anything, tolerating one that was never created."""
     try:
@@ -308,6 +355,11 @@ def cmd_init(args):
     arbite_dir.mkdir(parents=True, exist_ok=True)
 
     sink = build_sink(spec, arbite_dir)
+    # The coordination guards run before anything is created, so a layout that
+    # cannot be built (a file where a directory belongs) refuses with an
+    # instruction instead of failing halfway through setup, after the ticket
+    # directories already exist.
+    _coordination_app(args, sink, project_root).check_layout()
     sink.init()
     print(f"{sink.kind} sink ready at {sink.root}")
 
@@ -350,6 +402,16 @@ def cmd_init(args):
                 f"set 'sink: {sink.kind}' in {written.name} -- the store this command created "
                 "is now the project default, so plain 'arbite' commands read it"
             )
+
+    # Coordination state lives beside the tickets (a `coordination/` directory) or
+    # in the same database, and the workspace binding is recorded exactly once, here
+    # -- so every later command has one authoritative answer for "which workspace is
+    # this" without a bind command to forget. This runs after the sink selection is
+    # committed above, so the report names the store a plain command will read.
+    ensure_scratch_dir(arbite_dir)
+    recorded = _coordination_app(args, sink, project_root).record_workspace()
+    if recorded.lines:
+        print(recorded.to_text())
 
     parser, subparsers_by_name = build_parser()
     agents_md = arbite_dir / "AGENTS.md"
@@ -431,6 +493,21 @@ def cmd_sink(args):
             print(f"{key}: {value}")
     counts = ", ".join(f"{status} {n}" for status, n in sorted(info.status_counts.items()))
     print(f"tickets: {info.ticket_count}{f' ({counts})' if counts else ''}")
+
+
+def cmd_workspace_show(args):
+    """Report the workspace this project derives, and what its coordination state holds.
+
+    The workspace is *derived* -- from the located `.arbite/` directory plus the
+    resolved sink -- so there is no bind command, no `--force` override and no
+    conflict path. This command is read-only: it writes nothing, not even the
+    workspace record, so two runs on unchanged state print identical text."""
+    sink = _require_sink(args)
+    result = _coordination_app(args, sink).workspace_show()
+    if args.json:
+        _print_json(result.to_json())
+    else:
+        print(result.to_text())
 
 
 def cmd_status(args):
@@ -1841,13 +1918,21 @@ def cmd_doctor(args):
     remaining = sum(1 for p in problems if not p.fixed)
 
     if args.json:
+        # Which coordination backend is in use, and what is in it, is part of the
+        # report because a project whose tickets and whose claims live in different
+        # places needs to be able to say so out loud. The scratch area is reported
+        # too: a leftover payload is expected after an interrupted run, so it is a
+        # fact about the store rather than a problem with it.
+        facts = _coordination_app(args, sink).doctor_facts()
         _print_json(
             {
                 "sink": {"kind": info.kind, "root": info.root},
+                "coordination": facts["coordination"],
                 "tickets_checked": info.ticket_count,
                 "problems": [p.to_dict() for p in problems],
                 "fixed": fixed,
                 "remaining": remaining,
+                "scratch": facts["scratch"],
             }
         )
     else:
@@ -2084,6 +2169,36 @@ def build_parser():
     _sink_flag(p_sink)
     _json_flag(p_sink)
     p_sink.set_defaults(func=cmd_sink)
+
+    p_workspace = sub.add_parser(
+        "workspace",
+        help="report the workspace this project derives (show)",
+        description="Report the workspace this project *is*: the id derived from the located "
+        ".arbite/ directory plus the resolved sink, the project root, which store is in use "
+        "and where that choice came from, the coordination backend's location and what it "
+        "currently holds, and the state of the scratch payload area. There is deliberately no "
+        "`bind`: a workspace is derived, never bound, so a relocated root or a repointed store "
+        "is a new workspace rather than a mutation of an old one, and there is no conflict "
+        "path. Read-only: `workspace show` writes nothing at all, not even the workspace "
+        "record (that is `arbite init`'s job), so two runs on unchanged state print identical "
+        "text.",
+    )
+    workspace_sub = p_workspace.add_subparsers(
+        dest="workspace_action", required=True, metavar="SUBCOMMAND"
+    )
+    _sink_flag(p_workspace)
+    p_workspace_show = workspace_sub.add_parser(
+        "show",
+        help="show the derived workspace, its store and its coordination state",
+        description="Print the workspace id, the project root, the ticket store in use (with "
+        "where that selection came from), the coordination backend's location and counts "
+        "(active claims, events, receipts), and the scratch payload area's file count and "
+        "size. Every fact is printed in text and present in `--json`, and the exit code is "
+        "always 0: 'nothing is happening' is a first-class answer, not an error.",
+    )
+    _json_flag(p_workspace_show)
+    _sink_flag(p_workspace_show)
+    p_workspace_show.set_defaults(func=cmd_workspace_show)
 
     p_status = sub.add_parser(
         "status",
@@ -3006,8 +3121,17 @@ def main():
     try:
         args.func(args)
     except ArbiteError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(EXIT_ERROR)
+        # One failure path for every expected refusal, driven by the outcome
+        # vocabulary: the label (`error`, `busy`, `stale_read`), the `next:` hints
+        # and the exit code all come from the same outcome, so a caller branching on
+        # 4 or 5 reads the same word on stderr. A plain error prints exactly what it
+        # always has (`error: <message>`, exit 1) and gains no hint it never had.
+        outcome = outcomes.outcome_of(e)
+        print(f"{outcome.label}: {e}", file=sys.stderr)
+        hint = outcomes.render_next_line(outcomes.next_actions_of(e))
+        if hint:
+            print(hint, file=sys.stderr)
+        sys.exit(outcome.exit_code)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,42 @@ class Conflict(ArbiteError):
     instead of silently overwriting the winner's work."""
 
 
+class CoordinationError(ArbiteError):
+    """The coordination layer failed: a record that cannot be stored or read, a
+    store whose backend cannot be reached.
+
+    A separate branch from `SinkError` because coordination state is a different
+    storage domain from tickets (local runtime state versus the git-tracked
+    development record); a failure here must not read as one in the ticket store."""
+
+
+class RecordError(CoordinationError):
+    """A coordination record is malformed, carries an unknown type, or was written
+    by a newer schema revision than this arbite understands.
+
+    Reported rather than coerced: a record whose fields cannot be trusted must not
+    be silently half-read, because every later decision (claims, staleness,
+    evidence) is built from these fields."""
+
+
+class Busy(ArbiteError):
+    """Outcome 4: a live claim or attempt already holds what was asked for, and
+    **nothing changed** (see the exit-code table in the coordination handoff).
+
+    `label` is the text the CLI prints in front of the message, so the outcome the
+    caller branches on and the word it reads come from one place. The correct
+    caller response is to pick other work, not to retry the busy path."""
+
+    label = "busy"
+
+
+class Stale(ArbiteError):
+    """Outcome 5: a token, digest or generation is no longer current, and
+    **nothing changed**. The correct caller response is to re-read and retry."""
+
+    label = "stale_read"
+
+
 class SinkError(ArbiteError):
     """The storage layer failed: an IO error, a database error, a corrupt store."""
 

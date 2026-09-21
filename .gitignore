@@ -7,6 +7,13 @@ dist/
 tickets/
 /plans/
 
+# Runtime coordination state: claims, attempts, receipts, events, artifacts and
+# scratch payloads are local evidence, not the development record. Tickets, agent
+# scratchpads and the plans are committed; these are not.
+/.arbite/coordination/
+/.arbite/scratch/
+/.arbite/arbite.db*
+
 # Local / personal editor settings
 .vscode/
 .idea/

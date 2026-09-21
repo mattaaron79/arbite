@@ -375,11 +375,27 @@ The package exposes the console script `arbite`, providing:
 | Authoring | `note`, `set`, `set-status`, `depend`, `move`, `ref` (`add` / `rm` / `list`) |
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
 | Reporting | `status` (per-status counts + total; `--epic`/`--domain`/`--tier`/`--assignee`, `--json`), `progress` (live epics and their full membership, in dependency order; `--epic`, `--json`) |
+| Workspace | `workspace` — `show` reports the derived workspace, the store in use and the coordination backend's counts |
 | Integrity | `doctor [--fix]` |
 | Destruction | `delete <id> --force` |
 
 Key behaviours worth calling out:
 
+- **`arbite workspace show`** reports the *derived* workspace: the id derived from
+  the located `.arbite/` directory plus the resolved sink, the project root, which
+  store is in use and where that selection came from, the coordination backend's
+  location and what it currently holds (active claims, events, receipts), and the
+  scratch payload area's size. It is read-only and always exits 0, and there is
+  deliberately no `bind`: a relocated root or a repointed store is a new workspace,
+  not a mutation, so there is no conflict path to resolve.
+- **Coordination state is groundwork so far.** The versioned records the file proxy
+  needs — workspace, work attempt, file claim, read observation, operation receipt,
+  artifact and event — exist, are validated, and are stored beside the tickets
+  (`.arbite/coordination/`) or in the ticket database. What does **not** exist yet
+  is the command surface that acquires a claim, reads or writes a file through it,
+  or recovers an interrupted operation: those arrive with the remaining slices, so
+  no command claims ownership of a file today. `arbite doctor --json` names the
+  coordination backend and its counts.
 - **`arbite list next`** returns the most urgent (lowest `priority` number) `open`
   ticket whose `depends_on` are all closed, in topological dependency order, and can
   filter by `--tier` / `--domain` / `--epic`. If nothing is ready it exits `2`; if
