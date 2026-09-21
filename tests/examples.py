@@ -101,6 +101,11 @@ DIGEST_RE = re.compile(r"sha256:[0-9a-f]{12,64}\b")
 UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 LOCAL_TIME_RE = re.compile(r"\b\d{2}:\d{2}:\d{2}\b")
 DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+#: A wall-clock duration, as the passthrough transcripts print it (`(14 ms)`). It is the
+#: same kind of fact as `HH:MM:SS` -- how long something really took -- so it is normalised
+#: on both sides: the block asserts that the run *measured* its command, not how many
+#: milliseconds a real `sed` took on the machine the block was written on.
+DURATION_RE = re.compile(r"\(\d+ ms\)")
 ARBITE_PATH_RE = re.compile(r"(?:[^\s\"'()]*[/\\])?\.arbite((?:[/\\][^\s\"'(),]*)?)")
 
 
@@ -329,6 +334,7 @@ def normalise(text: str, root=None) -> str:
     result = DIGEST_RE.sub("sha256:<DIGEST>", result)
     result = UTC_TIMESTAMP_RE.sub("YYYY-MM-DDTHH:MM:SSZ", result)
     result = LOCAL_TIME_RE.sub("HH:MM:SS", result)
+    result = DURATION_RE.sub("(<MS> ms)", result)
     result = DATE_RE.sub("YYYY-MM-DD", result)
     return result
 

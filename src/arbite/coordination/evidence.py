@@ -123,6 +123,15 @@ VERSION_MISSING = "{digest} (evidence missing)"
 VERSION_ABSENT = "absent"
 NO_EVIDENCE = "no image to retain (this operation named no version)"
 
+#: The one receipt kind whose versions arbite did **not** archive: a passthrough receipt
+#: describes a change a *tool* made, so the version the command replaced is a digest with no
+#: image behind it -- those bytes were already gone when arbite looked, and nothing here
+#: pretends otherwise. Every other kind is a change arbite performed itself, and there a
+#: version with no artifact behind it is exactly the drift this view exists to catch.
+OBSERVED_KINDS = ("passthrough",)
+VERSION_OBSERVED = "{digest} (no image: observed, not performed by arbite)"
+NO_IMAGE_OBSERVED = "no image retained (the change was observed, not performed by arbite)"
+
 #: The stub every refusal from this surface ends with: a reader has to be able to tell "arbite
 #: refused" from "arbite changed something and then failed".
 NOTHING_CHANGED = "nothing was changed"
@@ -401,7 +410,7 @@ class ChangeViews:
         artifacts = self._checked_artifacts(receipt, reads)
         return OperationResult(
             Outcome(OK),
-            self._receipt_lines(receipt, reads),
+            self._receipt_lines(receipt, reads, artifacts),
             self._receipt_data(receipt, reads, artifacts),
             [],
         )
@@ -486,7 +495,12 @@ class ChangeViews:
         uncovered = sorted(
             digest for digest in _named_versions(receipt) if digest not in covered
         )
-        if uncovered:
+        # A passthrough receipt names versions arbite never held (`OBSERVED_KINDS`): the
+        # tool replaced bytes that were gone before anything could be archived, so the
+        # view reports them as "no image" rather than as the drift this check exists to
+        # catch. The artifacts the receipt *does* name are checked just as strictly above,
+        # so a passthrough run whose after-image went missing is still refused.
+        if uncovered and receipt.kind not in OBSERVED_KINDS:
             raise CoordinationError(
                 f"{receipt.id} records {', '.join(short_digest(digest) for digest in uncovered)} "
                 f"with no artifact holding them, so its evidence is not complete; "
@@ -496,19 +510,30 @@ class ChangeViews:
             )
         return sorted(entries, key=lambda entry: entry["digest"])
 
-    def _receipt_lines(self, receipt: OperationReceipt, reads: dict) -> list:
+    def _receipt_lines(self, receipt: OperationReceipt, reads: dict, artifacts: list) -> list:
         """The frozen EV6 shape: the operation, its attribution, its paths, its evidence."""
         lines = [_operation_line(receipt), _attribution_line(receipt)]
         for path in receipt.paths:
             lines.append(f"path: {path}")
             lines.append(
-                f"before: {reads[receipt.before[path]].describe()}   "
-                f"after: {reads[receipt.after[path]].describe()}"
+                f"before: {self._describe(receipt, reads[receipt.before[path]])}   "
+                f"after: {self._describe(receipt, reads[receipt.after[path]])}"
             )
-        lines.append(f"artifact: {_evidence_line(receipt)}")
+        lines.append(f"artifact: {_evidence_line(receipt, artifacts)}")
         if receipt.is_pending:
             lines.append(PENDING_NOTE)
         return lines
+
+    def _describe(self, receipt: OperationReceipt, read: VersionRead) -> str:
+        """One version as *this* receipt can reproduce it.
+
+        An observed change (`OBSERVED_KINDS`) replaced bytes arbite never had, so the honest
+        word there is `no image`, not `evidence missing`: nothing was lost, and a reader who
+        saw "missing" would go looking for drift that does not exist. Every other kind is
+        arbite's own change, where an unreadable version *is* missing evidence."""
+        if read.version is None and not read.is_absent and receipt.kind in OBSERVED_KINDS:
+            return VERSION_OBSERVED.format(digest=short_digest(read.digest))
+        return read.describe()
 
     def _receipt_data(self, receipt: OperationReceipt, reads: dict, artifacts: list) -> dict:
         """The same facts as fields, plus the parts the one-line text summarises."""
@@ -831,19 +856,25 @@ def _attribution_line(receipt: OperationReceipt) -> str:
     return "  ".join(parts)
 
 
-def _evidence_line(receipt: OperationReceipt) -> str:
+def _evidence_line(receipt: OperationReceipt, held: list) -> str:
     """Which image of the operation the receipt holds: `before image stored and retained`.
 
     The statement a change receipt exists to make is "the version this operation replaced is
     still here", so that is the image the line names -- for a write, an edit, a removal and a
     rename alike (a rename's bytes are one version, named once). An operation that displaced
-    nothing names the image it did keep, and one that named no version at all says so. Every
-    retained version, and the side each one serves, is in `--json`, because the line is one line
-    by design and the JSON does not have to be."""
+    nothing names the image it did keep, and one that named no version at all says so.
+
+    `held` is what the receipt really keeps, so the line reports the images that are *there*
+    rather than the ones a receipt like this normally has: an observed change keeps the version
+    the command left and nothing else, and saying "before image stored" for it would be a claim
+    arbite cannot stand behind. Every retained version, and the side each one serves, is in
+    `--json`, because the line is one line by design and the JSON does not have to be."""
     if not _named_versions(receipt):
         return NO_EVIDENCE
-    side = "before" if any(digest != ABSENT for digest in receipt.before.values()) else "after"
-    return f"{side} image stored and retained"
+    sides = {side for entry in held for side in entry["sides"]}
+    if not sides:
+        return NO_IMAGE_OBSERVED
+    return f"{'before' if 'before' in sides else 'after'} image stored and retained"
 
 
 def _header(ticket_id, attempt_id, receipts, actor) -> str:

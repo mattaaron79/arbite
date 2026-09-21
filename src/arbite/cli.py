@@ -34,6 +34,7 @@ from .coordination import evidence as coordination_evidence
 from .coordination import lifecycle as coordination_lifecycle
 from .coordination import migrate as coordination_migrate
 from .coordination import moves as coordination_moves
+from .coordination import passthrough as coordination_passthrough
 from .coordination import reads as coordination_reads
 from .coordination import recovery as coordination_recovery
 from .coordination import results as outcomes
@@ -718,6 +719,67 @@ def cmd_receipt(args):
     _emit_result(result, args.json)
     if result.exit_code:
         sys.exit(result.exit_code)
+
+
+def cmd_cmd(args):
+    """Run a command and record what it is *observed* to change.
+
+    Passthrough exists so an agent can keep its habits: `grep`, `sed` and `mv` are what a
+    model already uses well, and wrapping the invocation means the change is captured
+    anyway. It is deliberately the lowest-fidelity path in the proxy, and the report says
+    so: a digest manifest of the managed paths is taken before and after, the paths that
+    differ get a receipt and a `passthrough.changed` event, the run itself is one
+    `passthrough.exec` event carrying the tool, the argv hash, the exit code and the
+    duration -- and *no exclusivity is claimed*, because nothing was acquired. The rules
+    -- what may run at all, what a manifest covers, what is recorded -- live in
+    `coordination.passthrough`.
+
+    The wrapped command's own exit code is what this returns, because a tool's result has
+    to survive untouched (0-5 are all reachable that way). Only arbite's own refusals use
+    125 (refused before running), 126 (an invocation arbite does not support) and 127 (the
+    tool is not on PATH), every one of them is decided before any process starts, and each
+    says the command did not run.
+    """
+    sink = _require_sink(args)
+    runs = coordination_passthrough.PassthroughRuns(sink, _lifecycle(args, sink))
+    plan = runs.plan(
+        _command_argv(args.argv),
+        ticket_id=args.ticket,
+        attempt_id=args.attempt,
+        shell=args.shell,
+        claim_paths=args.claim or (),
+    )
+    if isinstance(plan, coordination_passthrough.Refusal):
+        if args.json:
+            _print_json(plan.to_json())
+        else:
+            print(plan.to_text(), file=sys.stderr)
+        sys.exit(plan.exit_code)
+    report = plan.execute()
+    if args.json:
+        _print_json(report.to_json())
+    else:
+        # The command's own stderr stays stderr -- it is the tool's error output, and a
+        # caller reading one stream must not have to guess whose error it is -- and it is
+        # written before the report so the tool's own words come first. `--json` carries
+        # it in the payload instead, so stdout stays parseable.
+        if report.stderr_text:
+            print(report.stderr_text, file=sys.stderr)
+        print(report.to_text())
+    sys.exit(report.exit_code)
+
+
+def _command_argv(argv) -> list:
+    """The wrapped command's argv: the `--` separator is arbite's, not the tool's.
+
+    argparse hands the remainder through verbatim -- including the `--` itself when the
+    caller wrote one -- so it is dropped here, in one place, rather than left for the
+    command to receive as a leading empty-looking argument.
+    """
+    argv = list(argv or [])
+    if argv and argv[0] == "--":
+        return argv[1:]
+    return argv
 
 
 def cmd_changes(args):
@@ -3454,6 +3516,58 @@ def build_parser():
     _json_flag(p_changes)
     _sink_flag(p_changes)
     p_changes.set_defaults(func=cmd_changes)
+
+    p_cmd = sub.add_parser(
+        "cmd",
+        help="run a command and record the changes it is observed to make (passthrough)",
+        description="Run a command in the workspace and record what it is *observed* to change: "
+        "a digest manifest of the managed paths is taken before and after, and each path that "
+        "differs gets a receipt and a 'passthrough.changed' event, plus one 'passthrough.exec' "
+        "event for the run carrying the tool, the argv hash, the exit code and the duration. "
+        "The command runs as argv (no shell), so pass the program and its arguments after "
+        "'--'; '--shell' opts into 'sh -c \"<line>\"', where redirections and other shell "
+        "syntax happen in the shell and become visible only after the fact. Observation claims "
+        "no exclusivity: another writer can interleave, and the report says so. Commands that "
+        "cannot be observed honestly are refused *before* they run -- shell syntax without "
+        "'--shell', interactive tools, watchers, background jobs, a tool that is not on PATH, "
+        "an attempt that is no longer current, a project with no coordination store -- and "
+        "every refusal says the command did not run. The wrapped command's own exit code is "
+        "returned untouched; arbite's refusals use 125, 126 and 127. Output capture is "
+        "bounded and the command's output is not stored: arbite records versions, not prose.",
+    )
+    p_cmd.add_argument(
+        "--ticket",
+        default=None,
+        help="the ticket this run belongs to (with --attempt; the pair attributes the run)",
+    )
+    p_cmd.add_argument(
+        "--attempt",
+        default=None,
+        help="the current attempt for that ticket, e.g. att-91bd (with --ticket)",
+    )
+    p_cmd.add_argument(
+        "--claim",
+        nargs="+",
+        metavar="PATH",
+        default=None,
+        help="guarded mode: the paths the command may touch. Not implemented yet (refused "
+        "with exit 125), so this run is always observed rather than exclusive",
+    )
+    p_cmd.add_argument(
+        "--shell",
+        action="store_true",
+        help="run the command through 'sh -c' instead of as argv: redirections and shell "
+        "syntax are the shell's, and are visible only after the fact",
+    )
+    p_cmd.add_argument(
+        "argv",
+        nargs=argparse.REMAINDER,
+        metavar="CMD",
+        help="the command and its arguments, normally after '--'",
+    )
+    _json_flag(p_cmd)
+    _sink_flag(p_cmd)
+    p_cmd.set_defaults(func=cmd_cmd)
 
     p_events = sub.add_parser(
         "events",

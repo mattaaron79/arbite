@@ -728,21 +728,22 @@ def test_the_json_payload_carries_the_facts_the_text_prints(tmp_path, project_ki
 def test_help_text_names_only_commands_that_exist():
     """A refusal may not point at a command this build does not have: the hints here name
     `file read`, `file claim`, `file write`, `file edit`, `file remove`, `file rename`,
-    `scratch list`, `scratch clear`, `reopen` and `close`, all of which exist.
+    `scratch list`, `scratch clear`, `receipt`, `changes`, `cmd`, `reopen` and `close`, all
+    of which exist.
 
     The second list is the same rule in the other direction, and it is why the check is worth
     having: a slice that has not landed must not be named by anything output today. tic-74e2
-    landed `file remove` and `file rename`, tic-95c0 landed `scratch list|clear`, and tic-7c42
+    landed `file remove` and `file rename`, tic-95c0 landed `scratch list|clear`, tic-7c42
     landed `receipt` and `changes` -- the two commands every hint here that promises "the
-    evidence is kept" now points at."""
+    evidence is kept" now points at -- and tic-faae landed `cmd`, whose own hints name the
+    review, receipt and claim commands."""
     from arbite import cli
 
     for path in (
         "file read", "file claim", "file write", "file edit", "file remove", "file rename",
-        "scratch list", "scratch clear", "receipt", "changes", "reopen", "close",
+        "scratch list", "scratch clear", "receipt", "changes", "cmd", "reopen", "close",
     ):
         assert cli.knows_command(path), path
-    assert not cli.knows_command("cmd"), "passthrough (tic-faae) has not landed"
     assert not cli.knows_command("scratch prune"), "retention (tic-008f) has not landed"
 
 
