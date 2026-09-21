@@ -9,9 +9,12 @@ storage-neutral core, deliberately separate from the ticket store:
 - `results` -- the outcome vocabulary: exit codes 0-5, the `next:` line rendered
   from one hint table, and the JSON result shape;
 - `store` -- `CoordinationStore`, the interface both backends implement, plus the
-  transaction, revision and recovery hooks later slices fill in;
+  transaction, revision and recovery hooks it implements on top of their primitives;
 - `file_backend` / `sqlite_backend` -- the two implementations;
 - `app` -- the application layer, where guarded multi-record operations live;
+- `mutations` -- the recoverable write protocol: stage, verify, apply, finalise;
+- `recovery` -- the intent journal's other half: what a staged operation left behind,
+  and the one honest answer about it;
 - `scratch` -- the payload area, and how it is reported.
 
 Nothing here requires SQLite, and nothing here is imported by the ticket schema or

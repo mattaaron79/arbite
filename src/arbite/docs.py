@@ -805,8 +805,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "frontmatter/folder drift (the folder wins), tickets left loose in the root, temp files "
         "stranded by an interrupted write, and closed tickets archived in the wrong "
         "month; for a database sink, an index that has drifted from a ticket body, orphaned index "
-        "rows, an unexpected schema version and structural corruption. `--fix` repairs only the "
-        "unambiguous cases and never guesses."
+        "rows, an unexpected schema version and structural corruption. The coordination store adds "
+        "the file-ownership and unfinished-operation findings, judged against the bytes on disk: a "
+        "claim whose attempt has ended (or never existed), and an operation that was staged and "
+        "never finalised -- one whose bytes are exactly one of the two versions it recorded can be "
+        "finalised, while bytes matching neither are reported as drift with all three versions and "
+        "left untouched. `--fix` repairs only the unambiguous cases and never guesses."
     )
     add("")
 

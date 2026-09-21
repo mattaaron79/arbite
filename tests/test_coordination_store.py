@@ -459,15 +459,15 @@ def test_a_duplicate_event_cursor_is_reported(store):
 # --- the interfaces later slices fill in -----------------------------------
 
 
-def test_transactions_are_real_and_the_recovery_hook_says_what_is_missing(store):
-    """The transaction and revision hooks are implemented (tic-1a75); the recovery
-    engine is not, and says which ticket owns it. A stub that named its ticket was
-    honest; now that the two are real, this checks the one that is still to come
-    rather than letting the test pass on a promise nobody kept."""
-    with pytest.raises(NotImplementedError) as failure:
-        store.recover()
+def test_the_recovery_hook_is_real_and_a_store_with_nothing_pending_is_untouched(store):
+    """All three hooks `store.py` promised are implemented now: the transaction and the
+    revision counter (tic-1a75) and the recovery engine (tic-b03b).
 
-    assert "tic-b03b" in str(failure.value)
+    What `recover()` does with an operation a dead run left pending is asserted where the
+    bytes are (`test_recovery_journal.py`), because that is where the judgement is made; what
+    is checked here is the case every store that has never been interrupted is in -- nothing
+    pending, so nothing judged and nothing written."""
+    assert store.recover() == []
     # A transaction with nothing in it is a commit of nothing, not an error, and
     # the revision hook answers for a record that was never written.
     assert store.transaction().commit().applied is True

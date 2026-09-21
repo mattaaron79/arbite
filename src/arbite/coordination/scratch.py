@@ -80,6 +80,35 @@ class ScratchSummary:
         return {"files": self.files, "bytes": self.bytes}
 
 
+def note_lines(
+    summary: ScratchSummary, guidance: bool = True, clear_command=None
+) -> list:
+    """The `note:` lines `doctor` prints about the payload area.
+
+    A leftover payload is expected after an interrupted run and is the only copy of a change
+    somebody may still need, so it is reported and never treated as corruption -- and it
+    never changes an exit code by itself. The note states the fact; the sentence about
+    clearing payloads is printed only when this arbite actually has the command that clears
+    them (`clear_command`, which is tic-95c0's), because naming a command that does not
+    exist would be a capability claimed on paper only.
+    """
+    if summary.is_empty:
+        return ["note: .arbite/scratch/ is empty"]
+    noun = "file" if summary.files == 1 else "files"
+    fact = (
+        f"note: .arbite/scratch/ holds {summary.files} {noun} "
+        f"({human_size(summary.bytes)})"
+    )
+    if not guidance:
+        return [fact]
+    if clear_command:
+        return [
+            f"{fact} -- transport left behind, expected after an",
+            f"      interrupted run; clear with 'arbite {clear_command} --all'",
+        ]
+    return [f"{fact} -- transport left behind, expected after an interrupted run"]
+
+
 def scratch_summary(arbite_dir) -> ScratchSummary:
     """Count the payload files under `arbite_dir`, and total their sizes.
 

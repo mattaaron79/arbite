@@ -21,27 +21,29 @@ What each half of this file is:
   describe them, committed together or not at all -- with a real SQL transaction
   on one backend and a commit journal plus a process lock on the other
   (`CoordinationTransaction` below says exactly what both promise).
-- **Defined, not implemented: the recovery engine.** `recover()` names tic-b03b
-  (C05), which owns the file-operation intent journal: reconciling a *staged file
-  write* against the bytes on disk needs a judgement about which version is
-  correct, and guessing is what the durability rules forbid. This is a different
+- **Implemented now: the recovery engine** (`coordination/recovery.py`), which is
+  the file-operation intent journal this interface names. A *staged file write* is
+  reconciled by comparing the bytes on disk with the two versions the receipt
+  recorded: exactly one of "it happened", "it did not happen" or "these are
+  somebody else's bytes", and only the first two are acted on. This is a different
   journal from the commit journal the file backend uses to make its own
   multi-record writes recoverable; that one is replayed automatically by the next
   write to the store, because finishing it is not a judgement call.
-- **Shared semantics:** `record_problems` is implemented once, from the records
-  alone, so integrity means one thing on both backends. It reports; it does not
-  repair.
+- **Shared semantics:** `record_problems` is implemented once, for both backends,
+  through the recovery engine's findings, so integrity means one thing whichever
+  store holds the records. Reporting reads; only `recover()` and `doctor --fix`
+  write, and only where the answer is unambiguous.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
 from ..errors import CoordinationError, RecordError, Stale
-from ..sinks.base import Problem
 from .records import (
     ATTEMPT_ACTIVE,
     CLAIM_ACTIVE,
@@ -571,6 +573,26 @@ class CoordinationStore(ABC):
     def _next_event_cursor(self) -> int:
         """The backend's own next-cursor answer (see `next_event_cursor`)."""
 
+    def operation_lock(self):
+        """Hold this store's cross-process mutex for the length of one file operation.
+
+        A mutation verifies ownership, generations, read tokens and the bytes on disk and
+        then changes those bytes, and the check and the change have to share one critical
+        section: a lifecycle command landing between them is exactly the race the plan
+        refuses to leave open (RC2 -- either the write completes first and the close records
+        it, or the close wins and no observer mutates under the old token).
+
+        The lock is the *ephemeral* kind -- an OS lock the kernel drops when its holder
+        dies, held for one operation and never for a ticket's duration. The durable *claim*
+        is the other kind and is never conflated with this one.
+
+        The default is no lock, which is a statement about the backend rather than a
+        convenience: a store whose records are the only shared state (SQLite: one database
+        file, real transactions) has nothing extra to serialise, while the file backend --
+        records beside the working tree, both reachable by a second arbite process --
+        provides one. A backend that needs a lock implements it here."""
+        return nullcontext()
+
     def transaction(self, operation_id: Optional[str] = None) -> CoordinationTransaction:
         """A store-local unit of work: records and their events, committed together.
 
@@ -726,101 +748,26 @@ class CoordinationStore(ABC):
     # Integrity
     # ------------------------------------------------------------------
 
-    def record_problems(self, ticket_ids=None) -> list:
+    def record_problems(self, ticket_ids=None, operation_findings=None) -> list:
         """Integrity findings for the coordination records, as `Problem`s.
 
-        Checks that mean the same thing on every backend, computed from the
-        records alone (plus the ticket ids when a caller can provide them, which is
-        what makes "this attempt names a ticket that does not exist" answerable).
-        Report-only: every finding here needs a judgement call about whether the
-        bytes on disk are the before or the after version, and guessing is exactly
-        what the durability rules forbid -- `arbite doctor` surfaces these and
-        repairs only what is unambiguous once tic-b03b lands."""
-        problems = []
-        attempts = {attempt.id: attempt for attempt in self.records("attempt")}
-        workspace = None
-        try:
-            workspace = self.get_workspace()
-        except RecordError as e:
-            problems.append(Problem("multiple_workspaces", str(e)))
-        workspace_id = workspace.id if workspace is not None else None
+        One implementation for both backends, in the recovery engine, because a
+        finding has to mean the same thing whichever store holds the records (see
+        `coordination.recovery.findings`). Reporting *reads*: `pending_operation`
+        findings are judged against the bytes on disk, and an operation whose bytes
+        are exactly one of the two recorded versions is deliberately not reported --
+        its repair is unambiguous and free, and `doctor` without `--fix` writes
+        nothing. Only `recover()` and `doctor --fix` change anything.
 
-        for claim in self.records("claim"):
-            attempt = attempts.get(claim.attempt_id)
-            if attempt is None:
-                if claim.state == CLAIM_ACTIVE:
-                    problems.append(
-                        Problem(
-                            "claim_without_attempt",
-                            f"claim {claim.id} on {claim.path} names attempt "
-                            f"{claim.attempt_id}, which does not exist in this store",
-                            ticket_id=claim.ticket_id,
-                        )
-                    )
-            elif claim.state == CLAIM_ACTIVE and attempt.state != ATTEMPT_ACTIVE:
-                problems.append(
-                    Problem(
-                        "orphaned_claim",
-                        f"claim {claim.id} on {claim.path} names attempt {claim.attempt_id}, "
-                        f"which is not active (attempt is '{attempt.state}')",
-                        ticket_id=claim.ticket_id,
-                    )
-                )
-            if workspace_id is not None and claim.workspace_id != workspace_id:
-                problems.append(
-                    Problem(
-                        "claim_for_another_workspace",
-                        f"claim {claim.id} on {claim.path} names workspace "
-                        f"{claim.workspace_id}, but this store records {workspace_id}",
-                        ticket_id=claim.ticket_id,
-                    )
-                )
+        `ticket_ids` is the ticket store's own set, which is what makes "this
+        attempt names a ticket that does not exist" answerable. `operation_findings`
+        lets a caller that has already reconciled the pending operations pass its own
+        rendering of that phase in, so a repair does not judge the same receipt twice."""
+        from . import recovery
 
-        known_tickets = set(ticket_ids) if ticket_ids is not None else None
-        for attempt in self.records("attempt"):
-            if workspace_id is not None and attempt.workspace_id != workspace_id:
-                problems.append(
-                    Problem(
-                        "attempt_for_another_workspace",
-                        f"attempt {attempt.id} names workspace {attempt.workspace_id}, but this "
-                        f"store records {workspace_id}",
-                        ticket_id=attempt.ticket_id,
-                    )
-                )
-            if known_tickets is not None and attempt.ticket_id not in known_tickets:
-                problems.append(
-                    Problem(
-                        "attempt_without_ticket",
-                        f"attempt {attempt.id} names ticket {attempt.ticket_id}, which is not "
-                        "in the ticket store",
-                        ticket_id=attempt.ticket_id,
-                    )
-                )
-
-        for receipt in self.pending_operations():
-            problems.append(
-                Problem(
-                    "pending_operation",
-                    f"{receipt.id} staged a {receipt.kind} of "
-                    f"{', '.join(receipt.paths) or '(no path)'} and was not finalized",
-                    ticket_id=receipt.ticket_id,
-                )
-            )
-
-        cursors = {}
-        for event in self.records("event"):
-            cursors.setdefault(event.cursor, []).append(event.id)
-        for cursor, event_ids in sorted(cursors.items()):
-            if len(event_ids) > 1:
-                problems.append(
-                    Problem(
-                        "duplicate_event_cursor",
-                        f"cursor {cursor} is claimed by {', '.join(sorted(event_ids))} -- a "
-                        "resumed poll would skip or replay one of them",
-                    )
-                )
-
-        return problems
+        return recovery.findings(
+            self, ticket_ids=ticket_ids, operation_findings=operation_findings
+        )
 
     # ------------------------------------------------------------------
     # Evidence bytes
@@ -853,22 +800,31 @@ class CoordinationStore(ABC):
     # Interfaces for later slices -- defined here, not implemented here
     # ------------------------------------------------------------------
 
-    def recover(self) -> list:
+    def recover(self, root=None) -> list:
         """Reconcile operations that were staged and never finalised.
 
-        **Not implemented yet: tic-b03b (C05)** owns the file-operation intent
-        journal and the recovery engine. `pending_operations()` above reports what
-        such a run would have to look at; nothing here inspects or changes bytes.
+        Every pending receipt is judged against the bytes on disk, and the two
+        unambiguous answers are written: the recorded *after* version is there, so
+        the operation happened and the receipt is finalised as succeeded (nothing is
+        applied twice), or the recorded *before* version is there, so it did not
+        happen, the staged copy is discarded and the receipt is finalised as failed.
+        Bytes that match neither are left entirely alone -- receipt, staged copy and
+        file -- and reported as drift, because which version is "correct" is not a
+        question a recovery pass may answer.
+
+        `root` is the project root the paths are relative to; it defaults to the
+        store's own workspace binding, and a store that records none reports the
+        operation as unjudgeable instead of guessing at a directory. Returns one
+        `recovery.OperationJudgement` per operation looked at, in store order.
 
         Deliberately *not* the same thing as the commit journal the file backend
         replays by itself: finishing a half-applied multi-record commit is not a
         judgement call (the journal names the exact documents and revisions), while
-        deciding whether the bytes of a staged file write are the before or the
-        after version is, and this epic never guesses that."""
-        raise NotImplementedError(
-            "recovery is not implemented yet (tic-b03b): 'advance with care' means "
-            "reporting, never guessing which version is correct"
-        )
+        deciding what a staged file write left behind is, and this epic never guesses
+        that."""
+        from . import recovery
+
+        return recovery.reconcile(self, root=root)
 
 
 def open_coordination_store(sink) -> CoordinationStore:

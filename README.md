@@ -285,7 +285,12 @@ reason, closed-date mismatches) and then the ones that don't:
   in the arbite root, temp files stranded by an interrupted write, a closed ticket
   archived in the wrong month, unreadable files;
 - **sqlite sink** — a note index that has drifted from the ticket body, orphaned
-  index rows, an unexpected schema version, structural database corruption.
+  index rows, an unexpected schema version, structural database corruption;
+- **coordination store** — a claim whose attempt has ended or never existed, and an
+  unfinished file operation judged against the bytes on disk: one whose bytes are
+  exactly one of the two versions it recorded is repairable, while bytes matching
+  neither are reported as drift, with all three versions printed and nothing changed.
+  A leftover scratch payload is reported as a note and never changes the exit code.
 
 `--fix` repairs only what is unambiguous, and exits `3` while problems remain, so
 it can gate CI or an agent's startup.
@@ -403,11 +408,15 @@ Key behaviours worth calling out:
   setter or a batch cannot route around those rules. **File ownership is live as well**
   (see the `arbite file` entry below): a claim is a durable record rather than a lock,
   it carries a generation that a release revokes, and a path another attempt holds is
-  refused with exit `4` naming the holder instead of waiting. What does **not** exist
-  yet are the reads, writes, edits, renames and removes that a claim is checked
-  against, and the recovery of an interrupted operation — so no command changes a
-  file's *bytes* through arbite today. `arbite doctor --json` names the coordination
-  backend and its counts.
+  refused with exit `4` naming the holder instead of waiting. The recovery engine is in
+  place as well: an operation persists its intent and both versions as evidence before it
+  stages the new bytes, its retry is deduplicated by operation id, and a kill at any
+  boundary leaves either the recorded before or the recorded after version on disk, which
+  `arbite doctor` reports (and, for the unambiguous cases, `--fix` finalises or discards)
+  rather than guessing at. What does **not** exist yet are the *commands* that change
+  bytes — reads, writes, edits, renames and removes are tic-1c4f, tic-60c7 and tic-74e2 —
+  so no command changes a file's bytes through arbite today. `arbite doctor --json` names
+  the coordination backend and its counts.
 - **`arbite file claim|release|claims`** is file ownership. `claim PATH... --ticket T
   --attempt A` acquires exclusive writer ownership of whole files for one work attempt,
   all-or-nothing and in canonical path order, so two agents can never each end up

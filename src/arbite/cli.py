@@ -30,8 +30,9 @@ from . import __version__, config, docs, graph, schema
 from .coordination import app as coordination_app
 from .coordination import claims as coordination_claims
 from .coordination import lifecycle as coordination_lifecycle
+from .coordination import recovery as coordination_recovery
 from .coordination import results as outcomes
-from .coordination.scratch import ensure_scratch_dir
+from .coordination.scratch import ensure_scratch_dir, note_lines, scratch_summary
 from .errors import ArbiteError, Busy, Conflict, NotReady, TicketError
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
@@ -282,6 +283,43 @@ def _all_tickets(sink):
     parked in the wishlist still blocks, so the acquisition paths judge against this
     list rather than against the tickets their own filters happen to select."""
     return sink.query(TicketQuery(buckets=("*",)))
+
+
+#: The commands this CLI defines, cached after the first look (`known_commands`).
+_KNOWN_COMMANDS: Optional[set] = None
+
+
+def known_commands() -> set:
+    """Every command path this parser defines, as `('command', 'command subcommand', ...)`.
+
+    Output may only name commands that exist: `doctor --fix` tells a human what to run next,
+    and the receipt and change views it points at are tic-7c42's while scratch clearing is
+    tic-95c0's. Asking the parser -- rather than keeping a list here -- is what keeps those
+    sentences true in the build they are printed from, and lets them name the command the
+    moment the slice that owns it lands."""
+    global _KNOWN_COMMANDS
+    if _KNOWN_COMMANDS is None:
+        _, choices = build_parser()
+        found = set()
+        for name, sub in choices.items():
+            found.add(name)
+            found.update(f"{name} {inner}" for inner in _nested_choices(sub))
+        _KNOWN_COMMANDS = found
+    return _KNOWN_COMMANDS
+
+
+def _nested_choices(parser) -> set:
+    """The subcommand names a parser really has, read from its own action rather than
+    guessed from a naming convention."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return set(action.choices)
+    return set()
+
+
+def knows_command(path: str) -> bool:
+    """Whether `path` (e.g. `"receipt"`, `"scratch clear"`) is a command this arbite has."""
+    return path in known_commands()
 
 
 def _emit_result(result, as_json):
@@ -2124,28 +2162,57 @@ def cmd_search(args):
 def cmd_doctor(args):
     """Check the invariants nothing else enforces, and optionally repair them.
 
-    The checks themselves live in the sink, because part of the point of a
-    pluggable store is that its failure modes differ: a file sink can suffer
-    frontmatter/folder drift, a stray temp file or an archive in the wrong month,
-    while a database sink can suffer a stale derived index or structural
-    corruption. The checks that mean the same thing either way -- invalid field
-    values, deadlocked dependencies, a claimed ticket with no assignee -- are
-    shared, so `doctor` cannot mean two different things per sink.
+    Two families of check, reported as one list. The ticket checks live in the sink, because
+    part of the point of a pluggable store is that its failure modes differ: a file sink can
+    suffer frontmatter/folder drift, a stray temp file or an archive in the wrong month, while
+    a database sink can suffer a stale derived index or structural corruption. The checks that
+    mean the same thing either way -- invalid field values, deadlocked dependencies, a claimed
+    ticket with no assignee -- are shared, so `doctor` cannot mean two different things per
+    sink.
+
+    The coordination checks are the recovery engine's (`coordination.recovery`): claims nobody
+    can use, unfinished file operations judged against the bytes on disk, and records that name
+    something missing. Without `--fix` they are only *judged* -- nothing is written, which is
+    why a reconcilable unfinished operation is not reported as a problem at all -- and with it
+    the two unambiguous repairs are made: a dead attempt's claim is released, and an operation
+    whose bytes are exactly one of its two recorded versions is finalised. Bytes that match
+    neither are reported, with all three versions, and left alone.
 
     Exits 3 when problems remain, so this can gate CI or an agent's startup."""
     sink = _require_sink(args)
     problems = sink.check(fix=args.fix)
     info = sink.describe()
+    app = _coordination_app(args, sink)
+    tickets = [ticket.id for ticket in _all_tickets(sink)]
+    if args.fix:
+        problems.extend(
+            coordination_recovery.repair(
+                app.store,
+                ticket_ids=tickets,
+                root=app.project_root,
+                known_command=knows_command,
+            )
+        )
+    else:
+        problems.extend(
+            coordination_recovery.findings(app.store, ticket_ids=tickets)
+        )
     fixed = sum(1 for p in problems if p.fixed)
     remaining = sum(1 for p in problems if not p.fixed)
+    # The scratch area is *reported*, not judged: a leftover payload is what an interrupted
+    # run leaves and the only copy of a change somebody may still need, so it is a fact about
+    # the store rather than a problem with it, and it never changes the exit code by itself.
+    notes = note_lines(
+        scratch_summary(app.arbite_dir),
+        guidance=not args.fix,
+        clear_command="scratch clear" if knows_command("scratch clear") else None,
+    )
 
     if args.json:
-        # Which coordination backend is in use, and what is in it, is part of the
-        # report because a project whose tickets and whose claims live in different
-        # places needs to be able to say so out loud. The scratch area is reported
-        # too: a leftover payload is expected after an interrupted run, so it is a
-        # fact about the store rather than a problem with it.
-        facts = _coordination_app(args, sink).doctor_facts()
+        # Which coordination backend is in use, and what is in it, is part of the report
+        # because a project whose tickets and whose claims live in different places needs to
+        # be able to say so out loud.
+        facts = app.doctor_facts()
         _print_json(
             {
                 "sink": {"kind": info.kind, "root": info.root},
@@ -2158,18 +2225,24 @@ def cmd_doctor(args):
             }
         )
     else:
-        if not problems:
-            print(f"checked {info.ticket_count} tickets: no problems found")
-        else:
+        # The note sits with the findings when there are any and closes a clean report --
+        # the shape the frozen DR1/DR2 and DR3 blocks print.
+        if problems:
             for p in problems:
                 prefix = "fixed" if p.fixed else "problem"
                 where = f" [{p.ticket_id}]" if p.ticket_id else ""
                 print(f"{prefix}{where} {p.kind}: {p.detail}")
+            for line in notes:
+                print(line)
             print(
-                f"\nchecked {info.ticket_count} tickets: {remaining} problem(s), {fixed} fixed"
+                f"checked {info.ticket_count} tickets: {remaining} problem(s), {fixed} fixed"
             )
             if remaining and not args.fix:
                 print("re-run with --fix to repair what arbite can correct automatically")
+        else:
+            print(f"checked {info.ticket_count} tickets: no problems found")
+            for line in notes:
+                print(line)
 
     if remaining:
         sys.exit(EXIT_PROBLEMS)
@@ -3481,7 +3554,8 @@ def build_parser():
 
     p_doctor = sub.add_parser(
         "doctor",
-        help="check ticket integrity (drift, cycles, dangling deps/references, stale indexes)",
+        help="check ticket integrity (drift, cycles, dangling deps/references, stale indexes, "
+        "unusable claims, unfinished file operations)",
         description="Check the invariants nothing else enforces and report what it finds, "
         "then exit 3 if any problem remains. The shared checks cover duplicate ids, invalid "
         "field values, dependency cycles, dangling and self dependencies, dangling "
@@ -3493,7 +3567,13 @@ def build_parser():
         "folder is authoritative), stray temp files from an interrupted write, and closed "
         "tickets archived under the wrong month; for the SQLite sink, a note index that has "
         "drifted from the ticket body, orphaned index rows, an unexpected schema version and "
-        "structural database corruption. --fix repairs only what is unambiguous.",
+        "structural database corruption. The coordination store adds a third family, judged "
+        "against the bytes on the disk: a claim whose attempt is over or does not exist, an "
+        "unfinished file operation (one whose bytes are exactly one of its two recorded "
+        "versions is repairable; bytes that match neither are drift, printed with all three "
+        "versions and left alone), and coordination records naming something this store does "
+        "not have. Scratch payloads are reported as a note and never change the exit code. "
+        "--fix repairs only what is unambiguous.",
     )
     p_doctor.add_argument(
         "--fix",
@@ -3502,8 +3582,11 @@ def build_parser():
         "status is rewritten to match the folder a ticket sits in, tickets loose in the root "
         "are re-filed, and closed tickets are moved into the archive month matching their "
         "close date; for the SQLite sink, a stale note index is rebuilt from the body and "
-        "orphaned index rows are removed. Anything needing a judgement call (duplicate ids, "
-        "dependency cycles, missing data) is only reported",
+        "orphaned index rows are removed; in the coordination store, a claim nobody can use "
+        "is released (the bytes and the receipts are untouched) and an unfinished operation "
+        "whose bytes match one of its two recorded versions is finalised. Anything needing a "
+        "judgement call (duplicate ids, dependency cycles, missing data, bytes matching "
+        "neither recorded version) is only reported",
     )
     _json_flag(p_doctor)
     _sink_flag(p_doctor)

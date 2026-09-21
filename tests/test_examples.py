@@ -154,11 +154,17 @@ def ws2_project(tmp_path):
 
 @pytest.fixture
 def dr4_project(tmp_path):
-    """DR4's state: 22 clean tickets, one pending operation, three payload files."""
+    """DR4's state: 22 clean tickets, one pending operation, three payload files.
+
+    One of the 22 is `tic-cf9f`, the ticket the seeded attempt belongs to: `doctor` reads the
+    coordination records against the ticket set it just checked, so an attempt naming a ticket
+    that store does not hold is a finding (`attempt_without_ticket`) -- and the transcript's
+    store is clean. The count the transcript asserts (22) is unchanged."""
     project = _initialise(tmp_path)
     sink = build_sink(SinkSpec(kind="file"), project / ".arbite")
-    for index in range(DR4_TICKETS):
+    for index in range(DR4_TICKETS - 1):
         sink.create(make_ticket(f"tic-{index + 0x1000:04x}"))
+    sink.create(make_ticket("tic-cf9f"))
     _seed_coordination(project, claims=ACTIVE_CLAIMS, pending_receipts=1)
     _scratch_payload(project, DR4_SCRATCH_SIZES)
     return project

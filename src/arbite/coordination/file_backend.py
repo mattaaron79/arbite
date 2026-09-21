@@ -372,6 +372,16 @@ class FileCoordinationStore(CoordinationStore):
         finally:
             self._mutex.release()
 
+    def operation_lock(self):
+        """The store's own commit mutex, held across a file operation's check and apply.
+
+        Deliberately the *same* lock every commit takes rather than a second one: the
+        operation's records and the bytes it changes are then one critical section against
+        every other arbite process, and the lock is the ephemeral flock the kernel releases
+        when its holder dies -- so a killed operation cannot leave the store locked, and no
+        staleness heuristic is needed to notice (see `_exclusive`)."""
+        return self._exclusive()
+
     def read_commit_journal(self) -> dict | None:
         """The journal of a commit that has not been applied in full, or None.
 
