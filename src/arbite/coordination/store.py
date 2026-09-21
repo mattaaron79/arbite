@@ -15,29 +15,55 @@ What each half of this file is:
   counts a report needs, and the derived queries built from them (active claims,
   active attempts, pending operations). These are the primitives the whole proxy
   is expressed in.
-- **Defined, not implemented: the transaction, revision and recovery hooks.** A
-  multi-record write is *ordered* today -- the last record written is the commit
-  point, so an interrupted operation leaves a recoverable prefix rather than a
-  half-applied set -- but it is not atomic. Making it transactional, with a
-  recoverable journal on the file backend and real transactions on SQLite, is
-  tic-1a75 (C02) and tic-b03b (C05). Those methods raise `NotImplementedError`
-  naming the ticket rather than pretending, and no command calls them yet.
+- **Implemented now, once, on top of those primitives:** the transaction, the
+  record revision counter, and the event cursor. `transaction()` gives an
+  operation a store-local unit of work -- several records and the events that
+  describe them, committed together or not at all -- with a real SQL transaction
+  on one backend and a commit journal plus a process lock on the other
+  (`CoordinationTransaction` below says exactly what both promise).
+- **Defined, not implemented: the recovery engine.** `recover()` names tic-b03b
+  (C05), which owns the file-operation intent journal: reconciling a *staged file
+  write* against the bytes on disk needs a judgement about which version is
+  correct, and guessing is what the durability rules forbid. This is a different
+  journal from the commit journal the file backend uses to make its own
+  multi-record writes recoverable; that one is replayed automatically by the next
+  write to the store, because finishing it is not a judgement call.
 - **Shared semantics:** `record_problems` is implemented once, from the records
   alone, so integrity means one thing on both backends. It reports; it does not
-  repair. Repairing a coordination problem is the recovery engine's job
-  (tic-b03b), and `doctor` exposes these findings with it.
+  repair.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from ..errors import CoordinationError, RecordError
+from ..errors import CoordinationError, RecordError, Stale
 from ..sinks.base import Problem
-from .records import ATTEMPT_ACTIVE, CLAIM_ACTIVE, RECORD_TYPES, Record, Workspace
+from .records import (
+    ATTEMPT_ACTIVE,
+    CLAIM_ACTIVE,
+    EVENT_RESULT_KEY,
+    EVENT_SUBJECT_KEY,
+    RECORD_TYPES,
+    Event,
+    Record,
+    Workspace,
+    new_id,
+    record_type_of,
+    utc_now,
+)
+
+#: The commit boundaries a fault-injection hook can be told about, in order. A
+#: process killed at `COMMIT_STAGED` has recorded the unit of work but applied
+#: none of it; one killed at `COMMIT_APPLIED` has applied all of it and not yet
+#: finalised. Both must leave the store in a state a later operation makes whole
+#: without guessing, which is the property the durability tests kill processes to
+#: check.
+COMMIT_STAGED = "commit_staged"
+COMMIT_APPLIED = "commit_applied"
 
 
 @dataclass(frozen=True)
@@ -86,15 +112,375 @@ class CoordinationInfo:
         }
 
 
+@dataclass(frozen=True)
+class CommitResult:
+    """What a commit did.
+
+    `applied` is False only for the retry case: an operation id whose receipt is
+    already in the store is not applied a second time, so a caller that re-runs an
+    interrupted operation cannot duplicate its effects. `events` are the events the
+    commit appended, with the cursors they were given."""
+
+    applied: bool
+    deduplicated: bool = False
+    events: tuple = ()
+    revisions: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PendingWrite:
+    """One buffered change, with the values the commit will store.
+
+    `revision` and the event's `cursor` are *absolute* values assigned at commit
+    time rather than deltas, which is what lets a journal replay them any number of
+    times and land on the same state. `expect_revision` is the optimistic
+    precondition a `replace_record` carries, checked in the same critical section
+    as the write itself. `allocate_cursor` marks a write that *asked* for a cursor
+    (`append_event`) rather than one that states its own (`put_record`, which is how
+    an import places existing events at the cursors they already have)."""
+
+    record_type: str
+    record_id: str
+    record: Optional[Record] = None
+    expect_revision: Optional[int] = None
+    revision: Optional[int] = None
+    cursor: Optional[int] = None
+    allocate_cursor: bool = False
+
+    @property
+    def is_delete(self) -> bool:
+        return self.record is None
+
+    @property
+    def key(self) -> tuple:
+        return (self.record_type, self.record_id)
+
+    @property
+    def document(self) -> Optional[dict]:
+        """The stored document for this write, or None for a delete."""
+        return None if self.record is None else self.record.to_dict()
+
+
+class CoordinationTransaction:
+    """A store-local unit of work: the record writes and event appends that commit
+    together, or not at all.
+
+    Writes are buffered, so an operation can build a whole state change and hand it
+    to the backend as one unit -- SQLite opens a real transaction, the file backend
+    writes a commit journal and applies it -- and either way there is exactly one
+    commit point. Reads see the buffer first, so an operation can read back what it
+    has just written.
+
+    Three rules live here rather than in either backend, so both mean the same
+    thing:
+
+    - **Revisions are absolute.** Every write bumps its record's revision, assigned
+      inside the backend's serialisation, so two writers that read revision 3 and
+      change different fields cannot both commit: the loser gets `Stale` and
+      nothing was written. A replay lands on the same numbers.
+    - **A retried operation is a no-op.** Given an `operation_id`, a commit whose
+      receipt is already in the store applies nothing and reports `deduplicated`.
+    - **Cursors come from the store.** `append_event` takes the store's next event
+      cursor, so a poll resuming from a cursor cannot skip an event and an event
+      replayed from a journal keeps the cursor it was given.
+    """
+
+    def __init__(self, store: "CoordinationStore", operation_id: Optional[str] = None):
+        self._store = store
+        #: The caller's token for this unit of work, if it has one. It is what a
+        #: retry presents to be recognised as the same operation.
+        self.operation_id = operation_id
+        self._pending: dict = {}
+        self._order: list = []
+        self.committed: Optional[CommitResult] = None
+
+    # ------------------------------------------------------------------
+    # Reading -- this transaction's own writes win
+    # ------------------------------------------------------------------
+
+    def find_record(self, record_type: str, record_id: str) -> Optional[Record]:
+        """One record by id, or None when it is not there (see
+        `CoordinationStore.find_record`), seeing this transaction's own writes."""
+        self._check_open()
+        _check_record_type(record_type)
+        pending = self._pending.get((record_type, record_id))
+        if pending is not None:
+            return pending.record
+        return self._store.find_record(record_type, record_id)
+
+    def get_record(self, record_type: str, record_id: str) -> Record:
+        """One record by id, raising when it is not there."""
+        record = self.find_record(record_type, record_id)
+        if record is None:
+            raise CoordinationError(
+                f"no {record_type} record {record_id} in {self._store.root}"
+            )
+        return record
+
+    def revision(self, record_type: str, record_id: str) -> int:
+        """The revision of a record as this transaction sees it: the stored one, or
+        the one its own buffered write will produce.
+
+        This is the token a `replace_record` presents, so an operation that reads a
+        record, decides, and writes it back cannot silently overwrite a change made
+        in between."""
+        self._check_open()
+        _check_record_type(record_type)
+        pending = self._pending.get((record_type, record_id))
+        if pending is not None and not pending.is_delete:
+            # Its own write is one bump ahead of whatever is stored.
+            return self._store.revision(record_type, record_id) + 1
+        if pending is not None:
+            return 0
+        return self._store.revision(record_type, record_id)
+
+    # ------------------------------------------------------------------
+    # Writing -- buffered until commit
+    # ------------------------------------------------------------------
+
+    def put_record(self, record: Record) -> None:
+        """Buffer `record` as this transaction's version of its id."""
+        record.validate()
+        self._buffer(record_type_of(record), record.id, record)
+
+    def replace_record(self, record: Record, expect_revision: int) -> None:
+        """Buffer a write that commits only while the record's revision is still
+        `expect_revision`.
+
+        The check runs at commit time, inside the backend's serialisation, which is
+        what makes this a real optimistic write rather than a read followed by a
+        hopeful write. `Stale` means another writer got there first and **nothing
+        was written**, not even the parts of this transaction that came before."""
+        record.validate()
+        if not isinstance(expect_revision, int) or isinstance(expect_revision, bool) or expect_revision < 0:
+            raise RecordError(
+                f"an expected revision must be a non-negative integer, got {expect_revision!r}"
+            )
+        self._buffer(
+            record_type_of(record), record.id, record, expect_revision=expect_revision
+        )
+
+    def delete_record(self, record_type: str, record_id: str) -> None:
+        """Buffer the removal of one record. A record that is not there is not an
+        error: the caller is establishing a state, not asserting one."""
+        _check_record_type(record_type)
+        self._buffer(record_type, record_id, None)
+
+    def append_event(
+        self,
+        kind: str,
+        category: str,
+        *,
+        subject=None,
+        result=None,
+        ticket_id=None,
+        attempt_id=None,
+        actor=None,
+        operation_id=None,
+        payload=None,
+        recorded_at=None,
+    ) -> Event:
+        """Append one event to the store's stream, and return it.
+
+        The cursor is the store's next one, and is assigned for real at commit:
+        the object returned here carries the value the commit settled on, so a
+        caller can print it after committing and trust what it printed. With an
+        `operation_id`, the append is idempotent -- an event of the same kind with
+        that operation id already in the store is returned unchanged, because a
+        retried operation must not leave a second copy of its effects.
+
+        `subject` and `result` are the two payload keys the events view renders
+        (see `records.EVENT_SUBJECT_KEY`); any other payload keys are kept as
+        given."""
+        self._check_open()
+        if operation_id is not None:
+            existing = self._event_for_operation(operation_id, kind)
+            if existing is not None:
+                return existing
+        event = Event(
+            id=self._next_event_id(),
+            cursor=self._provisional_cursor(),
+            kind=kind,
+            recorded_at=recorded_at or utc_now(),
+            category=category,
+            ticket_id=ticket_id,
+            attempt_id=attempt_id,
+            actor=actor,
+            operation_id=operation_id,
+            payload=_event_payload(payload, subject, result),
+        )
+        self._buffer("event", event.id, event, allocate_cursor=True)
+        return event
+
+    # ------------------------------------------------------------------
+    # Committing
+    # ------------------------------------------------------------------
+
+    def commit(self) -> CommitResult:
+        """Hand the buffered writes to the backend, which commits them as one."""
+        self._check_open()
+        if self.committed is not None:
+            raise CoordinationError("this transaction has already committed")
+        self.committed = self._store.commit_transaction(self)
+        return self.committed
+
+    def rollback(self) -> None:
+        """Discard everything buffered here. Nothing has been written yet, so this
+        is bookkeeping rather than an undo."""
+        self._pending.clear()
+        self._order.clear()
+
+    def __enter__(self) -> "CoordinationTransaction":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        """Commit on the way out, roll back if the body raised.
+
+        A body that raised leaves nothing behind, which is what lets an operation
+        be written as "read, check, write" and still be all-or-nothing."""
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+    # ------------------------------------------------------------------
+    # For the backends
+    # ------------------------------------------------------------------
+
+    @property
+    def writes(self) -> list:
+        """The buffered writes, in the order the caller made them."""
+        return [self._pending[key] for key in self._order]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self._order
+
+    def materialise(self, revision_of, next_cursor) -> list:
+        """The buffered writes with their resulting revisions and cursors assigned.
+
+        Called by the backend *inside* its serialisation, where the values it reads
+        cannot change underneath it: `revision_of` answers the stored revision of a
+        record and `next_cursor` the cursor the event stream will accept next.
+        Raises `Stale` before anything is written when an `expect_revision` no
+        longer holds."""
+        writes = []
+        cursor = next_cursor()
+        for pending in self.writes:
+            if pending.is_delete:
+                writes.append(pending)
+                continue
+            current = revision_of(pending.record_type, pending.record_id)
+            if pending.expect_revision is not None and current != pending.expect_revision:
+                raise Stale(
+                    f"{pending.record_type} {pending.record_id} is at revision {current}, "
+                    f"not {pending.expect_revision}: another writer changed it first, so "
+                    "this transaction wrote nothing",
+                    reason="stale_revision",
+                )
+            if pending.allocate_cursor:
+                # Appended, not placed: the cursor a caller was shown is replaced by
+                # the one this commit can defend, and the object it holds is updated
+                # so what it prints is what the store stores.
+                pending.record.cursor = cursor
+                writes.append(replace(pending, revision=current + 1, cursor=cursor))
+                cursor += 1
+            else:
+                writes.append(replace(pending, revision=current + 1))
+        return writes
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _buffer(self, record_type, record_id, record, expect_revision=None, allocate_cursor=False) -> None:
+        self._check_open()
+        key = (record_type, record_id)
+        if key not in self._pending:
+            self._order.append(key)
+        self._pending[key] = PendingWrite(
+            record_type=record_type,
+            record_id=record_id,
+            record=record,
+            expect_revision=expect_revision,
+            allocate_cursor=allocate_cursor,
+        )
+
+    def _check_open(self) -> None:
+        if self.committed is not None:
+            raise CoordinationError(
+                "this transaction has already committed; build another one for more work"
+            )
+
+    def _next_event_id(self) -> str:
+        taken = {event.id for event in self._store.events()}
+        taken.update(
+            write.record.id for write in self.writes if write.record is not None
+        )
+        return new_id("event", taken)
+
+    def _provisional_cursor(self) -> int:
+        """The cursor the event would take if it committed next.
+
+        Provisional on purpose: the commit assigns the value it can defend, under
+        the backend's serialisation, and updates the returned event. Two events
+        buffered together are numbered in order here so their relative order is
+        already right."""
+        buffered = sum(1 for write in self.writes if isinstance(write.record, Event))
+        return self._store.next_event_cursor() + buffered
+
+    def _event_for_operation(self, operation_id: str, kind: str) -> Optional[Event]:
+        """The event this operation already produced, if it has one."""
+        for write in self.writes:
+            if isinstance(write.record, Event) and write.record.operation_id == operation_id:
+                if write.record.kind == kind:
+                    return write.record
+        for event in self._store.events():
+            if event.operation_id == operation_id and event.kind == kind:
+                return event
+        return None
+
+
+def _event_payload(payload, subject, result) -> dict:
+    """The event's payload: whatever the caller passed, plus the two keys the
+    events view renders when the caller has values for them."""
+    merged = dict(payload or {})
+    if subject is not None:
+        merged[EVENT_SUBJECT_KEY] = str(subject)
+    if result is not None:
+        merged[EVENT_RESULT_KEY] = str(result)
+    return merged
+
+
+def _check_record_type(record_type: str) -> None:
+    """Refuse an unknown record type by name, once, for every caller."""
+    if record_type not in RECORD_TYPES:
+        raise RecordError(
+            f"unknown record type '{record_type}' (known: {', '.join(RECORD_TYPES)})"
+        )
+
+
 class CoordinationStore(ABC):
     """Attempts, claims, read observations, receipts, artifacts and events.
 
     Subclasses implement the storage primitives -- `records`, `get_record`,
-    `put_record`, `counts` -- and every question built on them is answered here,
-    once, so the two backends cannot disagree about what "an active claim" is."""
+    `put_record`, `counts`, `commit_transaction`, `revision` -- and every question
+    built on them is answered here, once, so the two backends cannot disagree about
+    what "an active claim" is."""
 
     #: Short identifier matching the sink kind whose state this store holds.
     kind: str = "?"
+
+    #: A fault-injection seam, None in production: called with each commit boundary
+    #: name (`COMMIT_STAGED`, `COMMIT_APPLIED`) as it is reached. The durability
+    #: tests set it to kill a process at a boundary and prove the next operation
+    #: makes the store whole; tic-b03b grows the same matrix for staged file writes.
+    crash_hook: Optional[Callable[[str], None]] = None
+
+    def _crash_point(self, name: str) -> None:
+        if self.crash_hook is not None:
+            self.crash_hook(name)
 
     # ------------------------------------------------------------------
     # Storage primitives -- implemented by each backend
@@ -128,10 +514,7 @@ class CoordinationStore(ABC):
         An unknown type is a `RecordError`, not an empty list: a typo that looked
         like "nothing happened yet" would be the worst possible answer. Checked
         once, here, so both backends refuse a wrong type identically."""
-        if record_type not in RECORD_TYPES:
-            raise RecordError(
-                f"unknown record type '{record_type}' (known: {', '.join(RECORD_TYPES)})"
-            )
+        _check_record_type(record_type)
         return self._records(record_type)
 
     @abstractmethod
@@ -140,15 +523,76 @@ class CoordinationStore(ABC):
 
     def get_record(self, record_type: str, record_id: str) -> Record:
         """One record by id. Raises `CoordinationError` when it is not there."""
-        if record_type not in RECORD_TYPES:
-            raise RecordError(
-                f"unknown record type '{record_type}' (known: {', '.join(RECORD_TYPES)})"
-            )
+        _check_record_type(record_type)
         return self._get_record(record_type, record_id)
 
     @abstractmethod
     def _get_record(self, record_type: str, record_id: str) -> Record:
         """The backend's own lookup by id (see `get_record`)."""
+
+    def find_record(self, record_type: str, record_id: str) -> Optional[Record]:
+        """One record by id, or None when it is not there.
+
+        "Is there one" is a question with a legitimate negative answer -- an
+        attempt that has never run, a token nothing issued -- so it is a lookup
+        rather than an error, and it is the call a writer makes inside a
+        transaction before writing under an id it must not collide with."""
+        _check_record_type(record_type)
+        try:
+            return self._get_record(record_type, record_id)
+        except CoordinationError:
+            return None
+
+    def revision(self, record_type: str, record_id: str) -> int:
+        """The revision counter of a record: how many writes it has taken.
+
+        Explicit, because an optimistic write presents it: read the record, keep
+        its revision, and hand it back through
+        `transaction().replace_record(record, expect_revision)`. A record that is
+        not there, and a record written before revisions existed, both read as 0 --
+        which is the same thing to a writer, whose first write then makes it 1."""
+        _check_record_type(record_type)
+        return self._revision(record_type, record_id)
+
+    @abstractmethod
+    def _revision(self, record_type: str, record_id: str) -> int:
+        """The backend's own revision lookup (see `revision`)."""
+
+    def next_event_cursor(self) -> int:
+        """The cursor an event appended right now would take.
+
+        A hint rather than a promise: the commit assigns the value it can defend,
+        under the backend's serialisation, so the cursor a caller sees on the event
+        `append_event` returned is the committed one. Nothing may use this to
+        reserve a cursor."""
+        return self._next_event_cursor()
+
+    @abstractmethod
+    def _next_event_cursor(self) -> int:
+        """The backend's own next-cursor answer (see `next_event_cursor`)."""
+
+    def transaction(self, operation_id: Optional[str] = None) -> CoordinationTransaction:
+        """A store-local unit of work: records and their events, committed together.
+
+        `operation_id` is the caller's token for the operation. Presenting one that
+        already committed makes the commit a no-op, so re-running an interrupted
+        operation cannot duplicate its effects. Where a caller has no operation id
+        yet -- every command in this slice -- an operation is identified by what it
+        writes instead."""
+        return CoordinationTransaction(self, operation_id=operation_id)
+
+    @abstractmethod
+    def commit_transaction(self, transaction: CoordinationTransaction) -> CommitResult:
+        """Commit `transaction`, atomically.
+
+        Called by `CoordinationTransaction.commit`, and implemented by each backend
+        because *how* the unit is made atomic is exactly what differs: SQLite opens
+        a real transaction and rolls it back on failure, the file backend writes a
+        commit journal, applies it, and removes it -- so a process killed at any
+        point leaves either nothing or a journal the next write replays. Both must
+        assign revisions and cursors inside their serialisation (through
+        `transaction.materialise`) and must refuse a stale `expect_revision` before
+        writing anything."""
 
     @abstractmethod
     def put_record(self, record: Record) -> None:
@@ -252,7 +696,7 @@ class CoordinationStore(ABC):
             )
         return workspaces[0]
 
-    def put_workspace(self, workspace: Workspace) -> None:
+    def put_workspace(self, workspace: Workspace, txn=None) -> None:
         """Record the workspace binding, replacing any previous one.
 
         Replacement is the honest behaviour for a relocated root or a repointed
@@ -261,11 +705,21 @@ class CoordinationStore(ABC):
         exactly one binding at a time. The superseded record is deleted rather than
         left beside the new one, because two bindings in one store is the state
         `get_workspace` has to refuse -- and refusing is worse than replacing when
-        the caller is the command that establishes the binding."""
+        the caller is the command that establishes the binding.
+
+        `txn` writes through a caller's transaction instead of committing each step,
+        which is how an operation that replaces the binding *and* does something
+        else stays one commit. Called without one, the replacement opens its own
+        transaction -- so the removal and the new record still arrive together, and
+        a store never holds two bindings, not even for an instant."""
+        if txn is None:
+            with self.transaction() as own:
+                self.put_workspace(workspace, txn=own)
+            return
         for existing in self.records("workspace"):
             if existing.id != workspace.id:
-                self.delete_record("workspace", existing.id)
-        self.put_record(workspace)
+                txn.delete_record("workspace", existing.id)
+        txn.put_record(workspace)
 
     # ------------------------------------------------------------------
     # Integrity
@@ -398,38 +852,18 @@ class CoordinationStore(ABC):
     # Interfaces for later slices -- defined here, not implemented here
     # ------------------------------------------------------------------
 
-    def transaction(self):
-        """A store-local unit of work for a multi-record operation.
-
-        **Not implemented yet: tic-1a75 (C02) implements it** -- a recoverable
-        journal plus process serialization for the file backend, and real
-        transactions for SQLite. Until then an application-layer operation orders
-        its writes so the last one is the commit point, which leaves a recoverable
-        prefix rather than a half-applied set, and says so rather than implying a
-        guarantee it does not have."""
-        raise NotImplementedError(
-            "coordination transactions are not implemented yet (tic-1a75): a "
-            "multi-record operation is ordered so its last write is the commit point"
-        )
-
-    def revision(self, record_type: str, record_id: str) -> int:
-        """The revision counter of a record, for an optimistic write.
-
-        **Not implemented yet: tic-1a75 (C02).** Every record carries the *schema*
-        revision it was written under (see `records.COORDINATION_SCHEMA_REVISION`);
-        a per-record counter a writer must present is part of the transactional
-        store, so that two writers cannot lose each other's fields."""
-        raise NotImplementedError(
-            "record revisions are not implemented yet (tic-1a75): records carry their "
-            "schema revision, but not a per-record counter"
-        )
-
     def recover(self) -> list:
         """Reconcile operations that were staged and never finalised.
 
-        **Not implemented yet: tic-b03b (C05)** owns the intent journal and the
-        recovery engine. `pending_operations()` below reports what such a run would
-        have to look at; nothing here inspects or changes bytes."""
+        **Not implemented yet: tic-b03b (C05)** owns the file-operation intent
+        journal and the recovery engine. `pending_operations()` above reports what
+        such a run would have to look at; nothing here inspects or changes bytes.
+
+        Deliberately *not* the same thing as the commit journal the file backend
+        replays by itself: finishing a half-applied multi-record commit is not a
+        judgement call (the journal names the exact documents and revisions), while
+        deciding whether the bytes of a staged file write are the before or the
+        after version is, and this epic never guesses that."""
         raise NotImplementedError(
             "recovery is not implemented yet (tic-b03b): 'advance with care' means "
             "reporting, never guessing which version is correct"

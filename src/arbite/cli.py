@@ -510,6 +510,38 @@ def cmd_workspace_show(args):
         print(result.to_text())
 
 
+def cmd_events(args):
+    """Read the coordination event stream: what happened, in cursor order.
+
+    One-shot by construction. `--follow` is *refused* rather than implemented,
+    because a watcher that blocks is a sleeping process and this proxy deliberately
+    has none: the refusal names the pattern that works (read the tail, or poll with
+    your own loop and keep the cursor). The selection rules -- reads are a separate
+    category, `--tail` bootstraps, `--after` resumes -- live in the application
+    layer, and "nothing new since that cursor" is exit 2 rather than an error, so a
+    poll can branch on the code without parsing prose."""
+    if args.follow:
+        # The one refusal this surface prints on stdout: the frozen transcript for
+        # `--follow` (EV7) shows both the error line and the hint there, and the
+        # example harness asserts an empty stderr for every scenario.
+        result = coordination_app.follow_refusal()
+        if args.json:
+            _print_json(result.to_json())
+        else:
+            print(result.to_text())
+        sys.exit(EXIT_ERROR)
+    sink = _require_sink(args)
+    result = _coordination_app(args, sink).events(
+        after=args.after, tail=args.tail, include_reads=args.include_reads
+    )
+    if args.json:
+        _print_json(result.to_json())
+    else:
+        print(result.to_text())
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
 def cmd_status(args):
     """Report the shape of the backlog: how many tickets sit in each status.
 
@@ -2199,6 +2231,45 @@ def build_parser():
     _json_flag(p_workspace_show)
     _sink_flag(p_workspace_show)
     p_workspace_show.set_defaults(func=cmd_workspace_show)
+
+    p_events = sub.add_parser(
+        "events",
+        help="read the coordination event stream: what happened, one line per event",
+        description="Print the coordination event stream in cursor order: one line per event "
+        "with its cursor, kind, subject, operation, ticket/attempt, actor, local time and "
+        "outcome, and the cursor to resume from. Read observations are excluded unless "
+        "--include-reads is given, because a research-heavy agent emits dozens of reads per "
+        "write. The command is one-shot: --follow is refused, so a poll keeps its own cursor "
+        "and calls again, and 'nothing new' exits 2.",
+    )
+    p_events.add_argument(
+        "--after",
+        type=int,
+        metavar="CURSOR",
+        default=None,
+        help="print selected events after this cursor, and report the cursor to resume from",
+    )
+    p_events.add_argument(
+        "--tail",
+        type=int,
+        metavar="N",
+        default=None,
+        help=f"print the last N selected events (a bare 'arbite events' prints the last "
+        f"{coordination_app.DEFAULT_EVENT_TAIL})",
+    )
+    p_events.add_argument(
+        "--include-reads",
+        action="store_true",
+        help="include read observations, which the default view excludes",
+    )
+    p_events.add_argument(
+        "--follow",
+        action="store_true",
+        help="refused: arbite commands are one-shot and never block -- poll with '--after <cursor>'",
+    )
+    _json_flag(p_events)
+    _sink_flag(p_events)
+    p_events.set_defaults(func=cmd_events)
 
     p_status = sub.add_parser(
         "status",

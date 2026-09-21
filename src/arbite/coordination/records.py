@@ -107,8 +107,23 @@ RECEIPT_KINDS = ("create", "write", "edit", "remove", "rename", "passthrough")
 #: Event categories. Reads are their own category on purpose: a research-heavy
 #: agent emits dozens of reads per write, so a job query must be able to exclude
 #: them (`--include-reads` opts in, in the examples document).
+#:
+#: A category names the *stream* an event belongs to, not the verb in its kind.
+#: Everything except `read` is the job stream: lifecycle, attempts, claims, file
+#: activity (including a served read that is part of an operation, which is why
+#: `read.file` appears in the default view of `arbite events --tail`) and
+#: passthrough. `read` is the observation stream -- the reads that are about
+#: bytes having been served rather than about the work changing -- which is what
+#: the default view excludes.
 READ_CATEGORY = "read"
 EVENT_CATEGORIES = ("lifecycle", "attempt", "claim", "file", READ_CATEGORY, "passthrough", "recovery")
+
+#: The two payload keys the events view renders: what the event is *about* (a
+#: path, a ticket id) and its one-line outcome (`+18 -0`, `gen 3`, `read-only`).
+#: They live in `Event.payload` rather than in new record fields, because an
+#: event's detail is per kind and the payload is the versioned place for it.
+EVENT_SUBJECT_KEY = "subject"
+EVENT_RESULT_KEY = "result"
 
 #: Digest prefixes in *text* are shortened for reading; JSON and stored records
 #: always carry the full digest. `doctor` is the exception and prints it whole.
@@ -147,9 +162,12 @@ def new_id(record_type: str, existing=()) -> str:
     """A fresh opaque id for `record_type`, absent from `existing`.
 
     Opaque and random rather than sequential: an id is a handle a caller passes
-    back, never a fact about ordering, and nothing may depend on decoding one. A
-    racing creator can still collide; `put_record` refuses the second write, so
-    the caller retries rather than corrupting the record set."""
+    back, never a fact about ordering, and nothing may depend on decoding one. The
+    id is *not* a uniqueness guarantee: `existing` is only what the caller could
+    see, and both backends replace a record written under an id that is already
+    there. A caller for whom a collision would be corruption asks
+    `CoordinationStore.find_record` inside a transaction and mints another id,
+    rather than relying on the store to refuse the second write."""
     prefix = ID_PREFIXES.get(record_type)
     if prefix is None:
         raise RecordError(
@@ -707,9 +725,10 @@ class Event(Record):
     The cursor is monotonic per store, which is what makes `--after <cursor>`
     resumable and what orders a poll without a second command. The category
     separates reads from everything else, and the payload is versioned with the
-    record so a consumer can tell what shape it holds. Appending with a stable
-    cursor, and committing an event together with the state it describes, are the
-    transaction slice's job (tic-1a75); this record defines the fields it stores."""
+    record so a consumer can tell what shape it holds. The cursor is allocated and
+    the event committed by `CoordinationStore.append_event` (through
+    `transaction()`), which is what makes it stable: a caller that builds one by
+    hand chooses its own cursor, which is how a migration places records."""
 
     RECORD_TYPE: ClassVar[str] = "event"
 
@@ -724,6 +743,25 @@ class Event(Record):
     operation_id: Optional[str] = None
     payload: dict = field(default_factory=dict)
     schema_revision: int = COORDINATION_SCHEMA_REVISION
+
+    @property
+    def subject(self) -> str:
+        """What this event is about, as `arbite events` prints it.
+
+        A convention over `payload` rather than a field, so a kind that has
+        nothing to point at (a lifecycle event about a ticket, say) simply leaves
+        it out and the column stays empty. An event whose payload carries the key
+        with a non-string value renders that value, so a numeric subject cannot
+        break the one-line-per-event rule."""
+        value = self.payload.get(EVENT_SUBJECT_KEY)
+        return "" if value is None else str(value)
+
+    @property
+    def result(self) -> str:
+        """The event's one-line outcome, as `arbite events` prints it (see
+        `subject`)."""
+        value = self.payload.get(EVENT_RESULT_KEY)
+        return "" if value is None else str(value)
 
     def validate(self) -> None:
         _require_id(self.id, "evt", "event id")

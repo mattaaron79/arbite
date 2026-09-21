@@ -24,9 +24,11 @@ Claim lookups by path, and the current-state claim index the plan describes, are
 the exclusive-claim slice's (tic-9b57) and can be added as a projection beside this
 table without changing what is stored.
 
-Two things are *not* here. The writes are not yet one transaction across records
-(tic-1a75): each `put_record` is a committed statement, so a crash between two
-writes leaves the earlier one. And nothing recovers a staged operation (tic-b03b).
+One thing is *not* here: nothing recovers a staged *file* operation (tic-b03b).
+A multi-record unit of work, on the other hand, is exactly what this backend now
+does natively: `commit_transaction` runs it in one `BEGIN IMMEDIATE` transaction,
+so a process killed inside it leaves the database rolled back rather than
+half-applied -- the same observable outcome the file backend reaches with a journal.
 """
 
 from __future__ import annotations
@@ -37,17 +39,27 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..errors import CoordinationError, RecordError
-from .records import Record, parse_record, record_type_of
-from .store import CoordinationStore
+from .records import RECEIPT_PENDING, Record, parse_record
+from .store import (
+    COMMIT_APPLIED,
+    COMMIT_STAGED,
+    CommitResult,
+    CoordinationStore,
+    CoordinationTransaction,
+)
 
 #: The revision of the coordination tables in a database. Separate from the ticket
 #: schema revision (`sinks.sqlite.SCHEMA_VERSION`): coordination state is local
 #: runtime state that can be discarded, while tickets are the development record,
-#: so the two are versioned and migrated independently.
-COORDINATION_SCHEMA_VERSION = 1
+#: so the two are versioned and migrated independently. Revision 2 added the
+#: per-record revision counters; a v1 database gains that table through the same
+#: `CREATE TABLE IF NOT EXISTS` any write runs, and keeps every record it holds.
+COORDINATION_SCHEMA_VERSION = 2
 
-#: One document per record. `document` holds exactly what the file backend writes,
-#: so `arbite migrate`'s coordination round trip (tic-008f) has nothing to translate.
+#: One document per record, plus one counter per record. `document` holds exactly
+#: what the file backend writes, so `arbite migrate`'s coordination round trip
+#: (tic-008f) has nothing to translate; the counters live beside it rather than in
+#: the document, because a record's own document must stay exactly the record.
 COORDINATION_DDL = """
 CREATE TABLE IF NOT EXISTS coordination_records (
     record_type TEXT NOT NULL,
@@ -58,6 +70,13 @@ CREATE TABLE IF NOT EXISTS coordination_records (
 
 CREATE INDEX IF NOT EXISTS coordination_records_type_idx
     ON coordination_records(record_type);
+
+CREATE TABLE IF NOT EXISTS coordination_revisions (
+    record_type TEXT NOT NULL,
+    record_id   TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
+    PRIMARY KEY (record_type, record_id)
+);
 """
 
 
@@ -93,6 +112,11 @@ class SqliteCoordinationStore(CoordinationStore):
             raise CoordinationError(f"could not open the SQLite store at {self._path}: {e}")
         try:
             conn.row_factory = sqlite3.Row
+            # Autocommit, so "one transaction" is exactly `BEGIN` .. `COMMIT` written
+            # where the caller means it. In Python's legacy isolation mode a unit of
+            # work would also depend on when the driver decides to begin one, and a
+            # statement outside a unit would quietly be its own commit.
+            conn.isolation_level = None
             conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
             yield conn
         except sqlite3.Error as e:
@@ -105,11 +129,14 @@ class SqliteCoordinationStore(CoordinationStore):
             conn.close()
 
     @staticmethod
-    def _table_exists(conn) -> bool:
+    def _has_table(conn, name: str) -> bool:
         row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'coordination_records'"
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
         ).fetchone()
         return row is not None
+
+    def _table_exists(self, conn) -> bool:
+        return self._has_table(conn, "coordination_records")
 
     def has_records_table(self) -> bool:
         """Whether this database has the coordination tables yet.
@@ -185,33 +212,159 @@ class SqliteCoordinationStore(CoordinationStore):
         return parse_record(_loads(row["document"]))
 
     def put_record(self, record: Record) -> None:
-        record.validate()
-        record_type = record_type_of(record)
-        document = _dumps(record)
-        with self._connection() as conn:
-            # A write may create the tables -- `arbite init` goes through here for
-            # exactly that reason -- but a *read* never does, which is why this is
-            # the only method that runs the DDL.
-            conn.executescript(COORDINATION_DDL)
-            conn.execute(
-                "INSERT INTO coordination_records (record_type, record_id, document) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT(record_type, record_id) DO UPDATE SET document = excluded.document",
-                (record_type, record.id, document),
-            )
-            conn.commit()
+        """Store `record`, replacing a record of the same type and id.
+
+        One record, one transaction: the document and its revision counter are
+        written together, so a crash cannot leave a counter that disagrees with the
+        document it counts. `validate()` runs first, so an invalid record never
+        reaches storage."""
+        with self.transaction() as txn:
+            txn.put_record(record)
 
     def delete_record(self, record_type: str, record_id: str) -> None:
-        """Delete a record's row. A record that is not there is not an error: the
-        caller is establishing a state, not asserting one."""
+        """Delete a record's row and its revision counter.
+
+        A record that is not there is not an error: the caller is establishing a
+        state, not asserting one. Its counter goes with it, so a later record
+        written under the same id starts again at 1 instead of inheriting a count
+        from a record that no longer exists. A store without the tables is left
+        alone: a delete is not a reason to create anything."""
+        if not self.has_records_table():
+            return
+        with self.transaction() as txn:
+            txn.delete_record(record_type, record_id)
+
+    def commit_transaction(self, transaction: CoordinationTransaction) -> CommitResult:
+        """Commit a unit of work in one SQL transaction.
+
+        `BEGIN IMMEDIATE` takes the write lock up front, so the revisions and cursors
+        assigned here cannot be overtaken and a stale `expect_revision` is refused
+        with nothing written -- including nothing written by the caller's earlier
+        steps, which is what "rollback" means here. A process killed inside the block
+        leaves the database as it was: SQLite discards the uncommitted transaction,
+        which is this backend's route to the same outcome the file backend reaches
+        with a journal.
+
+        The tables are created *before* the transaction begins: `executescript` ends
+        any open transaction, so running the DDL inside one would silently commit a
+        half-applied unit."""
         with self._connection() as conn:
-            if not self._table_exists(conn):
-                return
+            if not self._table_exists(conn) or not self._has_table(conn, "coordination_revisions"):
+                conn.executescript(COORDINATION_DDL)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if transaction.operation_id and self._operation_committed(
+                    conn, transaction.operation_id
+                ):
+                    conn.execute("ROLLBACK")
+                    return CommitResult(applied=False, deduplicated=True)
+                writes = transaction.materialise(
+                    lambda record_type, record_id: self._stored_revision(
+                        conn, record_type, record_id
+                    ),
+                    lambda: self._next_cursor(conn),
+                )
+                if not writes:
+                    conn.execute("ROLLBACK")
+                    return CommitResult(applied=True)
+                self._crash_point(COMMIT_STAGED)
+                for write in writes:
+                    self._apply_write(conn, write)
+                self._crash_point(COMMIT_APPLIED)
+                conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        return CommitResult(
+            applied=True,
+            events=tuple(write.record for write in writes if write.record is not None),
+            revisions={
+                f"{write.record_type}/{write.record_id}": write.revision
+                for write in writes
+                if write.revision is not None
+            },
+        )
+
+    def _apply_write(self, conn, write) -> None:
+        """Write one materialised record and its revision, inside the caller's
+        transaction. The two statements travel together or not at all, which is what
+        makes a counter that disagrees with its document unreachable."""
+        if write.is_delete:
             conn.execute(
                 "DELETE FROM coordination_records WHERE record_type = ? AND record_id = ?",
-                (record_type, record_id),
+                (write.record_type, write.record_id),
             )
-            conn.commit()
+            conn.execute(
+                "DELETE FROM coordination_revisions WHERE record_type = ? AND record_id = ?",
+                (write.record_type, write.record_id),
+            )
+            return
+        conn.execute(
+            "INSERT INTO coordination_records (record_type, record_id, document) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(record_type, record_id) DO UPDATE SET document = excluded.document",
+            (write.record_type, write.record_id, _dumps(write.record)),
+        )
+        conn.execute(
+            "INSERT INTO coordination_revisions (record_type, record_id, revision) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(record_type, record_id) DO UPDATE SET revision = excluded.revision",
+            (write.record_type, write.record_id, write.revision or 0),
+        )
+
+    def _stored_revision(self, conn, record_type: str, record_id: str) -> int:
+        """A record's revision inside the caller's transaction."""
+        row = conn.execute(
+            "SELECT revision FROM coordination_revisions "
+            "WHERE record_type = ? AND record_id = ?",
+            (record_type, record_id),
+        ).fetchone()
+        return int(row["revision"]) if row is not None else 0
+
+    def _revision(self, record_type: str, record_id: str) -> int:
+        with self._connection() as conn:
+            if not self._has_table(conn, "coordination_revisions"):
+                return 0
+            return self._stored_revision(conn, record_type, record_id)
+
+    def _operation_committed(self, conn, operation_id: str) -> bool:
+        """Whether this operation id already has a finalised receipt.
+
+        The deduplication rule, read inside the transaction that would apply the
+        retry: a *pending* receipt is an operation that started and has not finished,
+        so a retry must run it again (that reconciliation is tic-b03b's). A
+        succeeded or failed receipt is an operation that already happened."""
+        row = conn.execute(
+            "SELECT document FROM coordination_records "
+            "WHERE record_type = 'receipt' AND record_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return parse_record(_loads(row["document"])).result != RECEIPT_PENDING
+
+    def _next_event_cursor(self) -> int:
+        with self._connection() as conn:
+            if not self._table_exists(conn):
+                return 1
+            return self._next_cursor(conn)
+
+    def _next_cursor(self, conn) -> int:
+        """One past the highest cursor in the event stream, inside the caller's
+        transaction.
+
+        Derived from the events themselves rather than from a counter column, so an
+        event placed at an explicit cursor by an import (tic-008f) cannot be
+        overtaken. That is an O(events) read per append -- the same order as
+        `arbite events`, which reads the stream anyway; a projection can replace it
+        when a store grows large enough to care."""
+        highest = 0
+        for row in self._rows(conn, "event"):
+            highest = max(highest, parse_record(_loads(row["document"])).cursor)
+        return highest + 1
 
     def counts(self) -> dict:
         """The totals the report needs, derived from the records themselves.

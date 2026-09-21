@@ -10,18 +10,18 @@ the same thing. So an operation is a value here:
   that fails refuses the operation with an outcome (`error`, `busy`, `stale`) and
   changes nothing; the guard's name is what a caller reads to know which rule it
   tripped.
-- `steps` are the record writes, in a defined order, with the *last* one the commit
-  point. Ordering is what makes an interrupted operation recoverable today: the
-  prefix left behind is a state a re-run completes, never a state that claims
-  something the store cannot support. Making those steps atomic -- one transaction,
-  a recoverable journal, a real lock -- is tic-1a75 (C02), which replaces this
-  ordering with a transaction rather than replacing the operations.
+- `steps` are the record writes, in a defined order. They run inside *one*
+  transaction (`store.transaction()`), so an operation's records and events commit
+  together or not at all: the ordering is a reading order now, not a recovery
+  mechanism, because with a real transaction the last step no longer has to be the
+  commit point.
 
 The operations this slice ships are the workspace ones, because the workspace is
 the fact every later operation is anchored to: `workspace_show` reports the derived
-workspace, and `record_workspace` (run by `arbite init`) records the binding.
-Claiming, reads, writes, receipts, events and passthrough arrive in their own
-tickets as further operations here; none of them is implemented ahead of its slice.
+workspace, `record_workspace` (run by `arbite init`) records the binding, and
+`events` reads the stream those operations append to. Claiming, reads, writes,
+receipts and passthrough arrive in their own tickets as further operations here;
+none of them is implemented ahead of its slice.
 
 **Identity is attribution, not authentication.** A worker id, an actor name and a
 declared attempt are what they say they are: cooperating local processes sharing
@@ -37,10 +37,67 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..errors import CoordinationError
-from .records import Workspace, derived_workspace_id
-from .results import OperationResult, succeeded
+from .records import READ_CATEGORY, Workspace, derived_workspace_id, parse_utc
+from .results import (
+    EMPTY,
+    ERROR,
+    OK,
+    OUTCOME_LABELS,
+    OperationResult,
+    Outcome,
+    next_actions_for,
+    register_next_actions,
+    succeeded,
+)
 from .scratch import scratch_root, scratch_summary
 from .store import CoordinationStore, open_coordination_store
+
+#: The event row's columns, pinned by the frozen transcripts (EV2, EV3, EV5): a
+#: cursor, the kind, the subject, the operation, ticket/attempt, actor and time.
+#: The subject column is the only computed one -- four wider than the widest subject
+#: it has to hold (see `_subject_width`).
+EVENT_CURSOR_WIDTH = 4
+EVENT_KIND_WIDTH = 14
+EVENT_OPERATION_WIDTH = 9
+EVENT_WHERE_WIDTH = 19
+EVENT_ACTOR_WIDTH = 18
+EVENT_TIME_WIDTH = 10
+EVENT_SUBJECT_PADDING = 4
+
+#: How many events a bare `arbite events` prints. The same number the `--follow`
+#: refusal suggests, so the hint and the default cannot disagree.
+DEFAULT_EVENT_TAIL = 20
+
+#: The outcome reason for a refused `--follow`, so the exit code, the printed word
+#: and the hint all come from the vocabulary rather than from this function.
+FOLLOW_REFUSED = "follow_refused"
+
+FOLLOW_REFUSAL_MESSAGE = (
+    "unknown argument '--follow'; arbite commands are one-shot and never block"
+)
+
+FOLLOW_REFUSAL_HINT = (
+    f"'arbite events --tail {DEFAULT_EVENT_TAIL}' to read the end of the stream, or poll with\n"
+    "      'arbite events --after <cursor>' and keep the cursor in your own loop"
+)
+
+register_next_actions(FOLLOW_REFUSED, [FOLLOW_REFUSAL_HINT])
+
+
+def follow_refusal() -> OperationResult:
+    """The refusal of `--follow`, as a result rather than a raised failure.
+
+    A blocking watcher is a sleeping process, which this design deliberately does
+    not have, so the flag is refused and the refusal teaches the pattern instead:
+    read the tail, or poll with your own loop and keep the cursor. It is printed on
+    **stdout** because that is where the frozen transcript puts it (EV7) -- unlike
+    every other refusal, which the CLI reports on stderr."""
+    return OperationResult(
+        outcome=Outcome(ERROR, FOLLOW_REFUSED),
+        lines=[f"{OUTCOME_LABELS[ERROR]}: {FOLLOW_REFUSAL_MESSAGE}"],
+        data={"error": FOLLOW_REFUSAL_MESSAGE},
+        next_actions=next_actions_for(ERROR, FOLLOW_REFUSED),
+    )
 
 
 @dataclass(frozen=True)
@@ -68,11 +125,13 @@ class GuardedOperation:
     steps: tuple = ()
 
     def run(self, context: "CoordinationApp") -> list:
-        """Evaluate every guard, then perform every step, returning their names.
+        """Evaluate every guard, then perform every step in one transaction.
 
-        A step that raises leaves the store holding the steps that already ran:
-        that is the recoverable prefix, and it exists because the operations are
-        ordered so the *last* step is the one that makes the state mean something."""
+        A step that raises rolls the whole transaction back, so a refused or failed
+        operation leaves **nothing** behind rather than a prefix. What a *dead*
+        process leaves behind is the store's business, and both backends make it
+        whole without deciding anything: the file backend's journal is replayed by
+        the next write, and SQLite discards an uncommitted transaction."""
         for guard in self.guards:
             try:
                 guard.check()
@@ -81,9 +140,10 @@ class GuardedOperation:
             except OSError as e:
                 raise CoordinationError(f"{self.kind}: {guard.name}: {e}")
         completed = []
-        for name, step in self.steps:
-            step(context)
-            completed.append(name)
+        with context.store.transaction() as txn:
+            for name, step in self.steps:
+                step(context, txn)
+                completed.append(name)
         return completed
 
 
@@ -182,11 +242,12 @@ class CoordinationApp:
     def _workspace_operation(self) -> GuardedOperation:
         """The one write operation this slice ships: record the workspace binding.
 
-        Both steps are named, in order, because the order is what makes the
-        operation recoverable without a transaction: the layout is created first and
-        the workspace record last, so an interruption between them leaves an empty
-        layout (a re-run completes it) and never a record whose store does not
-        exist. `check_layout` runs the same guards without running the steps."""
+        Both steps are named, in order, and both run inside one transaction: the
+        layout is created first and the binding written second, so the operation
+        reads top to bottom -- and because the binding itself is a replacement (the
+        previous record goes, the new one arrives) the transaction is what stops a
+        store from ever holding two bindings. `check_layout` runs the same guards
+        without running the steps."""
         workspace = self.derived_workspace()
         return GuardedOperation(
             kind="workspace.record",
@@ -203,8 +264,8 @@ class CoordinationApp:
                 ),
             ),
             steps=(
-                ("layout", lambda app: app.store.init()),
-                ("workspace", lambda app: app.store.put_workspace(workspace)),
+                ("layout", lambda app, txn: app.store.init()),
+                ("workspace", lambda app, txn: app.store.put_workspace(workspace, txn=txn)),
             ),
         )
 
@@ -230,10 +291,11 @@ class CoordinationApp:
         record, on the SQLite backend a table plus a row), and its guards are
         evaluated before any of it happens.
 
-        No event is appended. Appending one with a stable cursor -- and committing it
-        together with the state it describes -- is tic-1a75 (C02); a second
-        implementation of the cursor here would be one the transaction slice would
-        have to unpick."""
+        No event is appended. The event stream's first real entries belong to the
+        operations that follow this one (claiming, reads, writes), and they append
+        through `transaction().append_event(...)` -- the cursor allocation and the
+        commit machinery are in place, so no later slice has to invent a second
+        cursor."""
         workspace = self.derived_workspace()
         created = self.store.get_workspace() is None
         self._workspace_operation().run(self)
@@ -319,6 +381,74 @@ class CoordinationApp:
             },
         )
 
+    # ------------------------------------------------------------------
+    # The event stream
+    # ------------------------------------------------------------------
+
+    def events(self, after=None, tail=None, include_reads: bool = False) -> OperationResult:
+        """Read the event stream: what happened, in cursor order, one line per event.
+
+        The selection rules are the examples document's (EV2-EV5): read
+        *observations* are their own category and are left out unless
+        `--include-reads` asks for them, because a research-heavy agent emits dozens
+        of reads per write; `--tail N` prints the last N of what is selected;
+        `--after C` prints everything selected after `C`, which is how a poll
+        resumes; and the report ends with the cursor to keep and the command that
+        resumes from it.
+
+        "Nothing new" is an answer with its own exit code (EV4), not an error, so a
+        polling loop branches on the code instead of matching text."""
+        if after is not None and tail is not None:
+            raise CoordinationError(
+                "--after and --tail are alternatives: resume with '--after <cursor>', "
+                "or bootstrap with '--tail <count>'"
+            )
+        if tail is not None and tail < 1:
+            raise CoordinationError(f"--tail must be at least 1, got {tail}")
+        if after is not None and after < 0:
+            raise CoordinationError(f"--after is a cursor, so it is 0 or more, got {after}")
+        window_size = tail if tail is not None else (DEFAULT_EVENT_TAIL if after is None else None)
+
+        selected = [
+            event
+            for event in self.store.events()
+            if include_reads or event.category != READ_CATEGORY
+        ]
+        if window_size is not None:
+            window = selected[-window_size:]
+            # A tail asks for a fixed-size view of the end, so its columns are laid
+            # out for exactly the rows it asked for.
+            laid_out = window
+        else:
+            window = [event for event in selected if event.cursor > after]
+            # A cursor resume asks "everything new", so it keeps the stream's own
+            # width: the same event lines up whether it was read mid-stream or at the
+            # end, which is what a parser following a log expects.
+            laid_out = selected
+
+        subject_width = _subject_width(laid_out)
+        rows = [_event_row(event, subject_width) for event in window]
+        cursor = window[-1].cursor if window else (after or 0)
+        # The resume guidance is a *job stream* affordance: with reads included the
+        # cursor may point at an observation, so the line states the cursor and stops
+        # there. EV2/EV3 (the default view) carry the parenthetical; EV4 (nothing
+        # returned) and EV5 (reads included) do not -- exactly as the transcripts
+        # print them.
+        resume = f"arbite events --after {cursor}"
+        resumable = bool(window) and not include_reads
+        cursor_line = f"cursor: {cursor}" + (f" (resume with '{resume}')" if resumable else "")
+        data = {
+            "events": [_event_json(event) for event in window],
+            "cursor": cursor,
+            "next_actions": [resume] if resumable else [],
+        }
+        if not window:
+            message = (
+                f"no events since cursor {after}" if after is not None else "no events recorded"
+            )
+            return OperationResult(Outcome(EMPTY), [message, cursor_line], data, [])
+        return OperationResult(Outcome(OK), rows + [cursor_line], data, [])
+
     def doctor_facts(self) -> dict:
         """The coordination and scratch facts `doctor` reports.
 
@@ -345,3 +475,57 @@ class CoordinationApp:
         if directory and not text.endswith("/"):
             text += "/"
         return text
+
+
+def _subject_width(events) -> int:
+    """The width of the event row's subject column.
+
+    Four wider than the widest subject the laid-out rows have to hold, so the
+    columns after it start at the same offset in every row. The rows passed in are
+    the ones this command laid out, not necessarily the ones it prints: a tail lays
+    out its own window, a cursor resume lays out the whole stream (see `events`)."""
+    widest = max((len(event.subject) for event in events), default=0)
+    return widest + EVENT_SUBJECT_PADDING
+
+
+def _event_where(event) -> str:
+    """The ticket/attempt column: both when both are known, the one there is
+    otherwise, and an empty column when the event belongs to no ticket."""
+    if event.ticket_id and event.attempt_id:
+        return f"{event.ticket_id}/{event.attempt_id}"
+    return event.ticket_id or event.attempt_id or ""
+
+
+def _event_row(event, subject_width: int) -> str:
+    """One event as a line: cursor, kind, subject, operation, ticket/attempt, actor,
+    local time, and the event's own one-line outcome last.
+
+    The stored timestamp is UTC and the printed one is local, because a human reads
+    the clock on the wall while the record keeps the unambiguous value."""
+    local_time = parse_utc(event.recorded_at).astimezone().strftime("%H:%M:%S")
+    return (
+        f"{event.cursor:<{EVENT_CURSOR_WIDTH}}"
+        f"{event.kind:<{EVENT_KIND_WIDTH}}"
+        f"{event.subject:<{subject_width}}"
+        f"{event.operation_id or '':<{EVENT_OPERATION_WIDTH}}"
+        f"{_event_where(event):<{EVENT_WHERE_WIDTH}}"
+        f"{event.actor or '':<{EVENT_ACTOR_WIDTH}}"
+        f"{local_time:<{EVENT_TIME_WIDTH}}"
+        f"{event.result}"
+    ).rstrip()
+
+
+def _event_json(event) -> dict:
+    """One event as the poll's JSON shape -- the fields, and the field names, the
+    examples document fixes for an orchestrator polling the stream."""
+    return {
+        "cursor": event.cursor,
+        "kind": event.kind,
+        "subject": event.subject,
+        "ticket": event.ticket_id,
+        "attempt": event.attempt_id,
+        "actor": event.actor,
+        "operation": event.operation_id,
+        "at": event.recorded_at,
+        "result": event.result,
+    }

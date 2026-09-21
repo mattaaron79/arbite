@@ -7,13 +7,15 @@ explainable to someone who opens the directory:
 <store root>/coordination/
   workspace.json          the derived workspace binding (one per store)
   attempts/att-XXXX.json  work attempts
-  claims/claims-XXXX.json active and released file claims
+  claims/clm-XXXX.json    active and released file claims
   observations/op-XXXX.json  read receipts (the tokens a write presents)
   receipts/op-XXXX.json   mutation receipts, including pending intent
   events/<cursor>-evt-XXXX.json  the append-only event stream
   artifacts/<digest hex>  the bytes an artifact record describes
   artifacts/index/art-XXXX.json  the artifact records themselves
-  lock                    the runtime mutex (tic-1a75)
+  revisions.json          per-record write counters (see `store.revision`)
+  commit-journal.json     a commit in flight; replayed by the next write
+  lock                    the ephemeral store mutex, held for one commit
 ```
 
 Every one of those files is a non-`.md` document in its own reserved directory, so
@@ -21,13 +23,29 @@ the ticket scan can never mistake coordination state for a ticket and a stray
 record can never be served as one; the file sink skips these directories by name
 for the same reason.
 
-Two properties this backend does *not* claim. Writes are per record and atomic
-(stage a temp file, `os.replace`), but a sequence of them is not one transaction:
-a crash between two writes leaves the earlier ones in place. And there is no
-process serialization here, so two processes writing the same record race exactly
-as two writers of the same file do. Both are tic-1a75 (C02): the recoverable
-journal and the coarse operation lock build on this module rather than replacing
-it, which is why the transaction hook lives in `store.py` and not here.
+What this backend *does* now claim, and what it still does not:
+
+- **Atomic per record, and one commit for a unit of work.** A document is written
+  through a temp file and `os.replace`, and a multi-record commit goes through
+  `commit_transaction` below: the journal is written first, the documents and
+  revision counters are applied, and the journal is removed last -- so the
+  removal *is* the commit point, and a process killed at any point leaves either
+  nothing or a journal the next write replays. Replaying decides nothing, because
+  every write in the journal carries the revision and cursor it must end up at.
+- **Serialised across processes, not across ticket durations.** `_exclusive` takes
+  an advisory `flock` on `lock` for one commit. The kernel drops it when the
+  holder dies, whatever killed it, so process death cannot leave the store locked;
+  and no lock is ever held for the length of an agent's work -- durable *claims*
+  do that job, and they are records rather than locks.
+- **Not isolated reads.** A read takes no lock, so it can see a unit of work
+  half-applied: that is why the multi-record guarantee is "commits together, or
+  recovers deterministically", not "nobody can observe it mid-commit". A read
+  reports an outstanding journal through `record_problems`, and the next write
+  finishes it.
+- **Not durable against power loss.** The journal is written atomically and
+  fsynced, but the containing directory is not, so the guarantee is about a
+  process dying (this ticket's acceptance), not about the machine losing power
+  mid-rename.
 """
 
 from __future__ import annotations
@@ -35,12 +53,35 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
-from ..errors import CoordinationError, RecordError
+from ..errors import Busy, CoordinationError, RecordError
+from ..sinks.base import Problem
 from ..sinks.file import TMP_PREFIX, write_atomic
-from .records import Record, parse_record, record_type_of
-from .store import CoordinationStore
+from .records import (
+    RECEIPT_PENDING,
+    Event,
+    Record,
+    parse_record,
+    record_type_of,
+    utc_now,
+)
+from .store import (
+    COMMIT_APPLIED,
+    COMMIT_STAGED,
+    CommitResult,
+    CoordinationStore,
+    CoordinationTransaction,
+    PendingWrite,
+)
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 
 #: The directory this backend owns, inside the store root (`.arbite/coordination/`
 #: for the default file sink).
@@ -64,9 +105,30 @@ WORKSPACE_FILENAME = "workspace.json"
 #: which is what makes an edit-then-revert keep both versions without duplication.
 ARTIFACT_INDEX_DIRNAME = "index"
 
-#: The runtime mutex's name. Nothing creates it yet (tic-1a75): it is named here so
-#: the lock file the plan lists and the runtime state it protects cannot drift.
+#: The ephemeral store mutex, taken for one commit (see `_exclusive`). Named here
+#: so the lock file the plan lists and the runtime state it protects cannot drift.
 LOCK_FILENAME = "lock"
+
+#: The store's per-record revision counters, in one small document. Separate from
+#: the records because a record's own document has to stay exactly the record --
+#: `to_dict()` is the migration format (tic-008f) -- and because the counters are
+#: rewritten in the same commit as the documents they describe.
+REVISIONS_FILENAME = "revisions.json"
+
+#: The commit journal: the unit of work, written before it is applied and removed
+#: once it has been, so a process killed in between leaves the intent on disk and
+#: the next write finishes it. Deliberately *not* the file-operation intent journal
+#: tic-b03b owns: this one names the exact documents, revisions and cursors it will
+#: store, so replaying it requires no judgement about the workspace's bytes.
+JOURNAL_FILENAME = "commit-journal.json"
+
+#: How long a writer waits for the store lock before refusing. Bounded because
+#: every command is one-shot: matching the SQLite backend's `busy_timeout`, and
+#: longer than any commit this design performs.
+LOCK_TIMEOUT = 5.0
+
+#: How often the lock is retried while another process holds it.
+LOCK_POLL_SECONDS = 0.02
 
 RECORD_SUFFIX = ".json"
 
@@ -98,6 +160,76 @@ def artifact_filename(digest: str) -> str:
     return text.split(":", 1)[1] if text.startswith("sha256:") else text
 
 
+def _try_lock(handle) -> bool:
+    """Take this store's exclusive advisory lock on `handle`, or report that
+    somebody else holds it.
+
+    Advisory and *ephemeral*: the operating system releases it when the holder
+    exits, however it exits, which is what makes "a dead process leaves no permanent
+    lock" true here without any staleness heuristic -- the lock file is a rendezvous
+    point and never a token, so its existence says nothing at all."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    import msvcrt  # pragma: no cover - Windows
+
+    handle.seek(0)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _release_lock(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    import msvcrt  # pragma: no cover - Windows
+
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def revision_key(record_type: str, record_id: str) -> str:
+    """How a record is named in the revision counters: one flat map, with keys a
+    human can read if they have to open the file."""
+    return f"{record_type}/{record_id}"
+
+
+def journal_entry(write: PendingWrite) -> dict:
+    """One write as the journal stores it: the document itself, plus the absolute
+    revision and cursor it must end up at.
+
+    Absolute rather than relative on purpose -- that is what lets a replay run any
+    number of times and land on the same state, so finishing an interrupted commit
+    is a mechanical act rather than a decision about which version is correct."""
+    return {
+        "action": "delete" if write.is_delete else "put",
+        "record_type": write.record_type,
+        "record_id": write.record_id,
+        "revision": write.revision,
+        "cursor": write.cursor,
+        "document": write.document,
+    }
+
+
+def journal_document(writes, operation_id=None) -> str:
+    """The journal's own document: a unit of work, ready to be applied."""
+    return json.dumps(
+        {
+            "operation_id": operation_id,
+            "written_at": utc_now(),
+            "writes": [journal_entry(write) for write in writes],
+        },
+        indent=2,
+        ensure_ascii=False,
+    ) + "\n"
+
+
 class FileCoordinationStore(CoordinationStore):
     """Coordination records as JSON documents under one reserved directory."""
 
@@ -105,6 +237,15 @@ class FileCoordinationStore(CoordinationStore):
 
     def __init__(self, root):
         self._root = Path(root)
+        #: Guards this instance's commit section against another thread in the same
+        #: process, so the file lock's holder is always exactly one thread.
+        self._mutex = threading.Lock()
+        #: How deep the current thread is inside the lock (0 = not held). An flock
+        #: is per open handle, so taking a second one in the same process would
+        #: block on itself; this counter makes the lock re-entrant for the code
+        #: paths that nest (a transaction inside a write path).
+        self._lock_depth = 0
+        self._lock_handle = None
 
     @property
     def root(self) -> str:
@@ -168,6 +309,249 @@ class FileCoordinationStore(CoordinationStore):
         return self._container(record_type) / record_filename(record)
 
     # ------------------------------------------------------------------
+    # Serialisation, revisions and the commit journal
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _exclusive(self):
+        """Hold this store's commit lock for the length of one unit of work.
+
+        Two kinds of mutex exist in this design and they are never conflated: this
+        one is *ephemeral*, an advisory OS lock released when the process exits
+        however it exits, and it is held for one commit rather than for a ticket's
+        duration. A durable *claim* is the other kind, and only a lifecycle command
+        releases it. A caller that has to wait longer than `LOCK_TIMEOUT` is
+        refused with `Busy` -- a structured answer, with nothing written, rather
+        than a command that hangs."""
+        if self._lock_depth:
+            # Already inside a commit on this instance. Same critical section, same
+            # thread: nesting must not open a second handle, which would block on
+            # the lock this same process already holds.
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+        if not self._mutex.acquire(timeout=LOCK_TIMEOUT):
+            raise Busy(
+                f"another thread in this process is committing to {self._root}; "
+                "nothing was written",
+                reason="store_locked",
+            )
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+            handle = open(self._root / LOCK_FILENAME, "a+b")
+            if handle.tell() == 0:
+                handle.write(b"\n")  # a byte for a platform whose lock needs one
+                handle.flush()
+            try:
+                deadline = time.monotonic() + LOCK_TIMEOUT
+                while not _try_lock(handle):
+                    if time.monotonic() >= deadline:
+                        raise Busy(
+                            f"another arbite process is committing to {self._root}; "
+                            "nothing was written",
+                            reason="store_locked",
+                        )
+                    time.sleep(LOCK_POLL_SECONDS)
+            except BaseException:
+                handle.close()
+                raise
+            self._lock_depth = 1
+            self._lock_handle = handle
+            try:
+                yield
+            finally:
+                self._lock_depth = 0
+                self._lock_handle = None
+                try:
+                    _release_lock(handle)
+                finally:
+                    handle.close()
+        finally:
+            self._mutex.release()
+
+    def read_commit_journal(self) -> dict | None:
+        """The journal of a commit that has not been applied in full, or None.
+
+        An unreadable journal is an error naming the file rather than an empty
+        answer: it is the one document whose contents decide what the next write
+        does, and a store that guessed at it could store a half-applied commit
+        twice."""
+        path = self._root / JOURNAL_FILENAME
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            raise CoordinationError(f"could not read the commit journal at {path}: {e}")
+        except ValueError as e:
+            raise RecordError(
+                f"the commit journal at {path} is not valid JSON ({e}); a commit may be "
+                "half-applied, so arbite will not guess at it -- inspect that file by "
+                "hand (its writes are plain coordination records)"
+            )
+        if not isinstance(data, dict) or not isinstance(data.get("writes"), list):
+            raise RecordError(f"the commit journal at {path} is not a commit journal")
+        return data
+
+    def replay_commit_journal(self) -> list:
+        """Finish a commit a dead process left behind, returning what it stored.
+
+        Every write path takes the lock and calls this *before* doing anything else,
+        which is what keeps a half-applied unit of work from being written on top
+        of. It is redo rather than undo and needs no judgement: each entry carries
+        the revision and cursor it must end up at, so replaying once and replaying
+        twice produce the same store."""
+        journal = self.read_commit_journal()
+        if journal is None:
+            return []
+        self._apply_writes(journal["writes"])
+        self._clear_commit_journal()
+        return [
+            revision_key(entry["record_type"], entry["record_id"])
+            for entry in journal["writes"]
+        ]
+
+    def _clear_commit_journal(self) -> None:
+        path = self._root / JOURNAL_FILENAME
+        if path.exists():
+            path.unlink()
+
+    def _apply_writes(self, entries) -> None:
+        """Apply journal entries: the documents first, then the revision counters.
+
+        Documents are individually atomic and independent, so an interruption
+        part-way leaves a prefix a replay completes; the counters are one small
+        document rewritten last, which is a *lag* a replay repairs rather than
+        damage. Every entry's values are absolute, so this is idempotent."""
+        revisions = self._read_revisions()
+        for entry in entries:
+            record_type = entry["record_type"]
+            record_id = entry["record_id"]
+            key = revision_key(record_type, record_id)
+            if entry.get("action") == "delete":
+                self._remove_document(record_type, record_id)
+                revisions.pop(key, None)
+                continue
+            document = entry.get("document")
+            if not isinstance(document, dict):
+                raise RecordError(
+                    f"the commit journal entry for {record_type} {record_id} carries no document"
+                )
+            record = parse_record(document)
+            if record_type_of(record) != record_type or record.id != record_id:
+                raise RecordError(
+                    f"the commit journal entry for {record_type} {record_id} describes "
+                    f"{record_type_of(record)} {record.id}"
+                )
+            self._store_document(record)
+            if entry.get("revision") is not None:
+                revisions[key] = int(entry["revision"])
+        self._write_revisions(revisions)
+
+    def _read_revisions(self) -> dict:
+        """The store's revision counters.
+
+        Absent is ordinary rather than an error: a store written before revisions
+        existed has no counters, and its records then read as revision 0 -- the same
+        answer as a record that is not there, which is what a writer means by "I
+        have seen no version of this"."""
+        path = self._root / REVISIONS_FILENAME
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            raise CoordinationError(f"could not read {path}: {e}")
+        except ValueError as e:
+            raise RecordError(f"{path} is not valid JSON: {e}")
+        if not isinstance(data, dict):
+            raise RecordError(f"{path} must hold a mapping of record to revision")
+        return data
+
+    def _write_revisions(self, revisions: dict) -> None:
+        write_atomic(
+            json.dumps(revisions, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            self._root / REVISIONS_FILENAME,
+        )
+
+    def _revision(self, record_type: str, record_id: str) -> int:
+        value = self._read_revisions().get(revision_key(record_type, record_id), 0)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise RecordError(
+                f"the revision recorded for {record_type} {record_id} is {value!r}, which is "
+                f"not a whole number ({self._root / REVISIONS_FILENAME})"
+            )
+
+    def _next_event_cursor(self) -> int:
+        """One past the highest cursor in the event stream.
+
+        Read from the *filenames*, which carry the zero-padded cursor, so this is a
+        directory listing rather than a parse of every event: the name is the order,
+        and the order is the name (see `event_filename`)."""
+        container = self._container("event")
+        highest = 0
+        if container.is_dir():
+            for path in container.glob(f"*{RECORD_SUFFIX}"):
+                prefix = path.name.split("-", 1)[0]
+                if prefix.isdigit():
+                    highest = max(highest, int(prefix))
+        return highest + 1
+
+    def _operation_committed(self, operation_id: str) -> bool:
+        """Whether this operation id already has a finalised receipt.
+
+        The deduplication rule. A *pending* receipt is an operation that started and
+        has not finished, so a retry must run it again -- that reconciliation is
+        tic-b03b's, and treating it as done here would lose the write. A succeeded
+        or failed receipt is an operation that already happened, so a retry changes
+        nothing."""
+        receipt = self.find_record("receipt", operation_id)
+        return receipt is not None and receipt.result != RECEIPT_PENDING
+
+    def commit_transaction(self, transaction: CoordinationTransaction) -> CommitResult:
+        """Commit a unit of work: journal, apply, clear -- with the removal as the
+        commit point.
+
+        Under the store lock, so the revisions and cursors this assigns cannot be
+        overtaken: a dead predecessor's journal is finished first, then this unit's
+        journal is written, then every document is applied, then the journal goes.
+        Both crash boundaries are crossed with a hook the durability tests use to
+        kill the process there -- and either one leaves a store the next write makes
+        whole, because the journal is the recipe."""
+        with self._exclusive():
+            self.replay_commit_journal()
+            if transaction.operation_id and self._operation_committed(transaction.operation_id):
+                return CommitResult(applied=False, deduplicated=True)
+            writes = transaction.materialise(self._revision, self._next_event_cursor)
+            if not writes:
+                return CommitResult(applied=True)
+            entries = [journal_entry(write) for write in writes]
+            write_atomic(
+                journal_document(writes, transaction.operation_id),
+                self._root / JOURNAL_FILENAME,
+            )
+            self._crash_point(COMMIT_STAGED)
+            self._apply_writes(entries)
+            self._crash_point(COMMIT_APPLIED)
+            self._clear_commit_journal()
+            return CommitResult(
+                applied=True,
+                events=tuple(
+                    write.record for write in writes if isinstance(write.record, Event)
+                ),
+                revisions={
+                    revision_key(write.record_type, write.record_id): write.revision
+                    for write in writes
+                    if write.revision is not None
+                },
+            )
+
+    # ------------------------------------------------------------------
     # Storage primitives
     # ------------------------------------------------------------------
 
@@ -214,7 +598,33 @@ class FileCoordinationStore(CoordinationStore):
         )
 
     def put_record(self, record: Record) -> None:
-        record.validate()
+        """Store `record`, replacing a record of the same type and id.
+
+        One record, one commit -- and the *same* commit path a multi-record operation
+        takes, so there is exactly one way a document is written: a dead
+        predecessor's journal is finished, this write is journaled, the document and
+        its revised counter are applied, and the journal goes. A caller with several
+        records to write opens a transaction rather than looping here."""
+        with self.transaction() as txn:
+            txn.put_record(record)
+
+    def delete_record(self, record_type: str, record_id: str) -> None:
+        """Unlink a record's document and forget its revision counter.
+
+        A record that is not there is not an error: the caller is establishing a
+        state, not asserting one. Its counter goes with it, so a later record written
+        under the same id starts again at 1 rather than inheriting a count from a
+        record that no longer exists."""
+        with self.transaction() as txn:
+            txn.delete_record(record_type, record_id)
+
+    def _store_document(self, record: Record) -> None:
+        """Write a record's document, replacing any copy of the same id.
+
+        Assumes the lock is held (`_exclusive`), because it is the apply step of a
+        commit and of a replay: taking the lock here would nest it and rewriting the
+        revision here would bump a counter that a replay must restore, not
+        increment."""
         record_type = record_type_of(record)
         destination = self.record_path(record)
         # A record whose filename encodes something mutable (an event's cursor) can
@@ -226,9 +636,8 @@ class FileCoordinationStore(CoordinationStore):
             if path != destination and path.is_file():
                 path.unlink()
 
-    def delete_record(self, record_type: str, record_id: str) -> None:
-        """Unlink a record's document. A record that is not there is not an error:
-        the caller is establishing a state, not asserting one."""
+    def _remove_document(self, record_type: str, record_id: str) -> None:
+        """Unlink a record's document, tolerating one that is not there."""
         for path in self._documents_for(record_type, record_id):
             path.unlink()
 
@@ -243,6 +652,30 @@ class FileCoordinationStore(CoordinationStore):
             for path in container.glob(f"*{RECORD_SUFFIX}")
             if path.is_file() and (path.stem == record_id or path.stem.endswith(f"-{record_id}"))
         ]
+
+    def record_problems(self, ticket_ids=None) -> list:
+        """The shared findings, plus the one only this backend can have: a commit
+        journal left behind by a process that died mid-commit.
+
+        Reported rather than silently replayed, to keep a read a read: the next
+        *write* finishes it (which decides nothing -- the journal names the documents
+        and their absolute revisions), and until then a reader is told that a commit
+        is outstanding instead of being shown a half-applied unit of work as if it
+        were finished."""
+        problems = super().record_problems(ticket_ids)
+        journal = self.read_commit_journal()
+        if journal is not None:
+            staged = ", ".join(
+                f"{entry['record_type']} {entry['record_id']}" for entry in journal["writes"]
+            )
+            problems.append(
+                Problem(
+                    "pending_commit",
+                    f"a commit staged {len(journal['writes'])} write(s) ({staged}) and did not "
+                    "finish; the next write to this store replays it",
+                )
+            )
+        return problems
 
     def counts(self) -> dict:
         """The totals the report needs, derived from the records themselves.

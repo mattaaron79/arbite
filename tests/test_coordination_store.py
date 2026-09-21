@@ -459,18 +459,19 @@ def test_a_duplicate_event_cursor_is_reported(store):
 # --- the interfaces later slices fill in -----------------------------------
 
 
-def test_the_transaction_revision_and_recovery_hooks_say_what_is_missing(store):
-    """Defined now, implemented by later slices: a stub that named the ticket is
-    honest, and a command cannot call one by accident."""
-    for call, ticket in ((store.transaction, "tic-1a75"), (store.recover, "tic-b03b")):
-        with pytest.raises(NotImplementedError) as failure:
-            call()
-        assert ticket in str(failure.value)
-
+def test_transactions_are_real_and_the_recovery_hook_says_what_is_missing(store):
+    """The transaction and revision hooks are implemented (tic-1a75); the recovery
+    engine is not, and says which ticket owns it. A stub that named its ticket was
+    honest; now that the two are real, this checks the one that is still to come
+    rather than letting the test pass on a promise nobody kept."""
     with pytest.raises(NotImplementedError) as failure:
-        store.revision("claim", "clm-a1b2")
+        store.recover()
 
-    assert "tic-1a75" in str(failure.value)
+    assert "tic-b03b" in str(failure.value)
+    # A transaction with nothing in it is a commit of nothing, not an error, and
+    # the revision hook answers for a record that was never written.
+    assert store.transaction().commit().applied is True
+    assert store.revision("claim", "clm-a1b2") == 0
 
 
 def test_stored_documents_are_the_same_document_on_both_backends(store):

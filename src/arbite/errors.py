@@ -10,6 +10,8 @@ codes and a test suite uses to assert the *right* failure, not merely a failure.
 
 from __future__ import annotations
 
+from typing import Optional
+
 
 class ArbiteError(Exception):
     """Base for every expected arbite failure. Anything raised through this class
@@ -69,17 +71,30 @@ class Busy(ArbiteError):
     **nothing changed** (see the exit-code table in the coordination handoff).
 
     `label` is the text the CLI prints in front of the message, so the outcome the
-    caller branches on and the word it reads come from one place. The correct
-    caller response is to pick other work, not to retry the busy path."""
+    caller branches on and the word it reads come from one place. `reason` refines
+    *which* busy this is (`file_busy`, `store_locked`, ...), which is what chooses
+    the next actions; it defaults to the bare kind. The correct caller response is
+    to pick other work, not to retry the busy path."""
 
     label = "busy"
+
+    def __init__(self, message: str, reason: Optional[str] = None):
+        super().__init__(message)
+        self.reason = reason or "busy"
 
 
 class Stale(ArbiteError):
     """Outcome 5: a token, digest or generation is no longer current, and
-    **nothing changed**. The correct caller response is to re-read and retry."""
+    **nothing changed**. The correct caller response is to re-read and retry.
+
+    `reason` refines which stale this is (`stale_read`, `stale_revision`,
+    `stale_generation`, ...); it defaults to the bare kind."""
 
     label = "stale_read"
+
+    def __init__(self, message: str, reason: Optional[str] = None):
+        super().__init__(message)
+        self.reason = reason or "stale_read"
 
 
 class SinkError(ArbiteError):

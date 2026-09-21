@@ -217,9 +217,16 @@ class OperationResult:
         return "\n".join(parts)
 
     def to_json(self) -> dict:
-        """The `--json` payload: the facts plus the mirrored next actions."""
+        """The `--json` payload: the facts plus the mirrored next actions.
+
+        An outcome's own `next_actions` win. When it has none, whatever the
+        operation already published under that key survives: the events view prints
+        its continuation inline (the `cursor:` line) and publishes the same command
+        for a poll, and a mirror that overwrote it with `[]` would drop a fact the
+        text carries."""
         payload = dict(self.data)
-        payload["next_actions"] = list(self.next_actions)
+        if self.next_actions or "next_actions" not in payload:
+            payload["next_actions"] = list(self.next_actions)
         return payload
 
     def to_stderr_text(self) -> str:

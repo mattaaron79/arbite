@@ -376,6 +376,7 @@ The package exposes the console script `arbite`, providing:
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
 | Reporting | `status` (per-status counts + total; `--epic`/`--domain`/`--tier`/`--assignee`, `--json`), `progress` (live epics and their full membership, in dependency order; `--epic`, `--json`) |
 | Workspace | `workspace` — `show` reports the derived workspace, the store in use and the coordination backend's counts |
+| Events | `events` — the coordination event stream, one line per event (`--after` / `--tail`, `--include-reads`); `--follow` is refused |
 | Integrity | `doctor [--fix]` |
 | Destruction | `delete <id> --force` |
 
@@ -391,11 +392,28 @@ Key behaviours worth calling out:
 - **Coordination state is groundwork so far.** The versioned records the file proxy
   needs — workspace, work attempt, file claim, read observation, operation receipt,
   artifact and event — exist, are validated, and are stored beside the tickets
-  (`.arbite/coordination/`) or in the ticket database. What does **not** exist yet
-  is the command surface that acquires a claim, reads or writes a file through it,
-  or recovers an interrupted operation: those arrive with the remaining slices, so
-  no command claims ownership of a file today. `arbite doctor --json` names the
-  coordination backend and its counts.
+  (`.arbite/coordination/`) or in the ticket database. A multi-record operation is
+  one commit on both sinks (a journal plus a process lock for the file sink, a real
+  transaction for SQLite), records carry an explicit revision counter for an
+  optimistic write, and events take a stable per-store cursor. What does **not**
+  exist yet is the command surface that acquires a claim, reads or writes a file
+  through it, or recovers an interrupted operation: those arrive with the remaining
+  slices, so no command claims ownership of a file today. `arbite doctor --json`
+  names the coordination backend and its counts.
+- **`arbite events [--after CURSOR | --tail N] [--include-reads]`** reads the event
+  stream in cursor order, one line per event: the cursor, kind, subject, operation,
+  ticket/attempt, actor, local time and outcome, then the cursor to resume from. It
+  is how an orchestrator follows what happened without a second command per event,
+  and it is deliberately one-shot: `--follow` is refused with the pattern that works
+  instead (read the tail, or poll with `--after <cursor>` and keep the cursor
+  yourself), because a blocking watcher is a sleeping process. Read observations are
+  their own category and are left out unless `--include-reads` asks for them, since a
+  research-heavy agent emits dozens of reads per write; a served read that belongs to
+  an operation is file activity and shows either way. "Nothing new since that cursor"
+  exits `2`, and `--json` carries the same facts as `{"events", "cursor",
+  "next_actions"}`. Events exist for a store whose sink has a coordination backend —
+  both of them do — and a sink without one refuses the whole coordination surface
+  rather than pretending.
 - **`arbite list next`** returns the most urgent (lowest `priority` number) `open`
   ticket whose `depends_on` are all closed, in topological dependency order, and can
   filter by `--tier` / `--domain` / `--epic`. If nothing is ready it exits `2`; if
@@ -751,7 +769,8 @@ selected, the CLI says so on stderr rather than quietly reading the other store.
 These exist because agents, not humans, are the main callers:
 
 - **`--json`** on `list`, `list next`, `list raw`, `ref list`, `fetch`, `show`,
-  `search`, `deps`, `doctor`, `sink`, `status`, `progress` and `delete` emits machine-readable
+  `search`, `deps`, `doctor`, `sink`, `status`, `progress`, `workspace show`, `events`
+  and `delete` emits machine-readable
   output whose field names match the frontmatter. The human table format is explicitly *not* a
   stable interface. The `path` field is whatever the sink calls a ticket's location
   (a file path, or `sqlite:/…/arbite.db#tic-a1b2`).

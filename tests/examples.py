@@ -80,6 +80,46 @@ def _blocks(text: str) -> list:
     return [(entry[0], entry[1], entry[2]) for entry in found]
 
 
+def fenced_blocks(scenario_id: str, path: Path = EXAMPLES_DOC) -> list:
+    """Every fenced block body under a scenario heading, in document order.
+
+    The *first* is the transcript (`scenario_block` reads it). A heading may carry a
+    second one documenting a JSON payload the same command prints -- EV3's "poll
+    shape" is one -- and a test that never looked at it could let the JSON drift
+    from the text the document promises it mirrors."""
+    for found_id, title, lines in _blocks(path.read_text(encoding="utf-8")):
+        if found_id != scenario_id:
+            continue
+        blocks, body, in_fence = [], [], False
+        for line in lines:
+            if line.startswith("```"):
+                if in_fence:
+                    blocks.append("\n".join(body))
+                    body = []
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                body.append(line)
+        if in_fence:  # pragma: no cover - a document whose fence is never closed
+            blocks.append("\n".join(body))
+        return blocks
+    raise AssertionError(f"no scenario {scenario_id} in {path}")
+
+
+def scenario_json_blocks(scenario_id: str, path: Path = EXAMPLES_DOC) -> list:
+    """The later fenced blocks under a heading that are JSON documents.
+
+    Parsed rather than compared as text, for the same reason a JSON transcript is:
+    the document indents its blocks for reading while `--json` prints one key per
+    line, so the facts are the assertion."""
+    documents = []
+    for text in fenced_blocks(scenario_id, path)[1:]:
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            documents.append(json.loads(stripped))
+    return documents
+
+
 def scenario_block(scenario_id: str, path: Path = EXAMPLES_DOC) -> Scenario:
     """The frozen scenario `scenario_id`, parsed out of the examples document.
 
