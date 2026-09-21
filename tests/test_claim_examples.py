@@ -8,12 +8,14 @@ the chain the document describes is built by running the earlier blocks for real
 (FC1's acquisition, then FC2's), so "the transcript passes" means the real command
 printed exactly what the document says about a project in the state it describes.
 
-Two blocks are refusals of the *read* surface, which does not exist yet (tic-1c4f):
-LS6's escaping path and RD5's missing path. Their wording belongs to this slice's
-validation layer, so they are asserted through it -- LS6 through `file claim`, which
-raises the same refusal, and RD5 through the refusal function the read slice will call.
-Neither is faked: no `file read` command is added here, and the last test in this file
-pins that.
+Two blocks are refusals of the *read* surface, which did not exist when this slice
+closed: LS6's escaping path and RD5's missing path. Both were asserted at this slice's
+validation layer then, because the wording is its own (`paths.escape_refusal`,
+`paths.missing_path_refusal`); tic-1c4f added `file read` and `file list`, so both are
+now asserted through the commands the blocks name, in `test_read_examples.py` and
+`test_discovery_examples.py`. What stays here is the half that is this slice's
+business: the same refusals are raised by `file claim` (FC5's guard), and a read cannot
+creep into ownership.
 """
 
 from __future__ import annotations
@@ -263,9 +265,13 @@ def _observation(claim, generation: int):
 # --- LS6 --------------------------------------------------------------------
 
 
-def test_LS6_refuse_a_protected_or_escaping_path(tmp_path):
-    """Two refusals, and both are exactly the frozen text: an escape explains what was
-    validated, and `.git` metadata is refused by name with no hint at all."""
+def test_LS6_the_claim_surface_refuses_a_protected_or_escaping_path(tmp_path):
+    """The two frozen refusals, through the command this slice owns.
+
+    The blocks are asserted through `file read`/`file list` in the read and discovery
+    test modules; what this pins is the layer underneath, which is this slice's: a
+    *claim* refuses the same two paths with the same words, so a caller cannot reach
+    `.git` or an escape by acquiring it instead of reading it."""
     project = claims.holder_project(tmp_path)
     escaping = examples.scenario_block("LS6")
     protected = _block_without_command(examples.fenced_blocks("LS6")[1])
@@ -294,10 +300,12 @@ def test_LS6_refuse_a_protected_or_escaping_path(tmp_path):
 # --- RD5 --------------------------------------------------------------------
 
 
-def test_RD5_read_a_path_that_does_not_exist(tmp_path):
-    """The read surface's refusal for a missing path, exactly as frozen -- raised by the
-    function the read slice calls, and reachable in the same shape through this slice's
-    own command, which *claims* that path instead (FC4)."""
+def test_RD5_the_claim_surface_refuses_a_path_that_does_not_exist(tmp_path):
+    """RD5's refusal is the read surface's, and the *other* shape of the same fact is
+    this slice's: a path that does not exist can be claimed (FC4), which is what the
+    frozen hint tells the reader to do. The wording itself is asserted through
+    `file read` in `test_read_examples.py`; here the shared builder is compared against
+    the frozen block so the two paths to it cannot drift."""
     project = claims.holder_project(tmp_path)
     frozen = examples.scenario_block("RD5")
 
@@ -319,24 +327,26 @@ def test_RD5_read_a_path_that_does_not_exist(tmp_path):
     assert not (project / claims.OLD_PY).exists()
 
 
-def test_the_read_surface_is_not_claimed_by_this_slice(tmp_path):
-    """`file read` is tic-1c4f's, so it does not exist yet -- and this asserts that
-    rather than leaving a reader to wonder whether the guide forgot it."""
+def test_a_read_cannot_creep_into_ownership(tmp_path):
+    """A read is the read slice's business, and this slice's assertion about it is that
+    it cannot become an acquisition: reading a path leaves the claim index exactly as it
+    was, so `file claim` is still the only way to hold a file."""
     project = claims.holder_project(tmp_path)
 
-    proc = claims.run(
+    read = claims.run(
         project,
         "file",
         "read",
-        claims.FILE_PY,
+        claims.BASE_PY,
         "--ticket",
         HOLDER_TICKET,
         "--attempt",
         HOLDER,
-        expect=2,
     )
 
-    assert "invalid choice" in proc.stderr
+    assert read.stdout.startswith(claims.BASE_PY), read.stdout
+    assert coordination(project).records("claim") == []
+    assert coordination(project).active_claims() == []
 
 
 # --- the harness itself -----------------------------------------------------

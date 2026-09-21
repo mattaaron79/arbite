@@ -54,6 +54,19 @@ def human_size(count: int) -> str:
     return f"{size:.1f} GiB"
 
 
+def printable_size(count: int) -> str:
+    """A byte count as a *file's* shape prints it: KiB and up, always one decimal.
+
+    The frozen LS2 row prints `0.4 KiB` for a 400-byte file, so a size below one KiB
+    is rendered in KiB rather than in bytes -- the row is about a file's shape, and a
+    file's shape is lines and KiB. The scratch summary deliberately differs (`400 B`),
+    because there the exact number of bytes is the fact being reported."""
+    size = int(count)
+    if size < 1024:
+        return f"{size / 1024:.1f} KiB"
+    return human_size(size)
+
+
 @dataclass(frozen=True)
 class ScratchSummary:
     """What is sitting in the payload area: a count and a size, nothing more.

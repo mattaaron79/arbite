@@ -29,7 +29,9 @@ from typing import Optional
 from . import __version__, config, docs, graph, schema
 from .coordination import app as coordination_app
 from .coordination import claims as coordination_claims
+from .coordination import discovery as coordination_discovery
 from .coordination import lifecycle as coordination_lifecycle
+from .coordination import reads as coordination_reads
 from .coordination import recovery as coordination_recovery
 from .coordination import results as outcomes
 from .coordination.scratch import ensure_scratch_dir, note_lines, scratch_summary
@@ -250,12 +252,30 @@ def _lifecycle(args, sink):
 def _claims(args, sink):
     """The file-claim operations for this command's sink and coordination store.
 
-    Claims are the durable half of the file proxy: what C06's reads, C07's writes and
-    the rename path are all checked against later. The rules -- canonical paths,
-    all-or-nothing acquisition, generation revocation -- live in
-    `coordination.claims`, so every surface that acquires or releases a path goes
-    through the same ones."""
+    Claims are the durable half of the file proxy: what the reads, the writes and the
+    rename path are all checked against. The rules -- canonical paths, all-or-nothing
+    acquisition, generation revocation -- live in `coordination.claims`, so every
+    surface that acquires or releases a path goes through the same ones."""
     return coordination_claims.FileClaims(sink, _lifecycle(args, sink))
+
+
+def _discovery(args, sink):
+    """The bounded-discovery operations for this command's sink and store.
+
+    Listing and searching answer "what is there" without authorising anything: they
+    mint no observation, record no token and change no ownership, and their rules --
+    canonical ordering, the exclusions for scratch and coordination state, the
+    truncation hints -- live in `coordination.discovery`."""
+    return coordination_discovery.FileDiscovery(sink, _lifecycle(args, sink))
+
+
+def _reads(args, sink):
+    """The read surface for this command's sink and store.
+
+    A read serves bytes and records an observation whose id is the token a later
+    mutation presents; whether that token authorises anything is decided by the claim
+    it was taken under, in `coordination.reads`."""
+    return coordination_reads.FileReads(sink, _lifecycle(args, sink))
 
 
 def _emit_file_result(result, as_json):
@@ -1661,6 +1681,65 @@ def cmd_file_claims(args):
         sys.exit(result.exit_code)
 
 
+def cmd_file_list(args):
+    """List the files at or under a path: what is there, and who holds what.
+
+    Bounded and one-shot: at most `--count` rows in canonical path order, and a
+    truncated listing ends with the exact command that continues from the last row it
+    printed (`--after` that path). Every claimable row carries its shape and its claim
+    state, so "can I plan against this?" needs no second command -- and a listing
+    *never* authorises a write: the claim state it reports is what a writer has to
+    acquire, and the read that authorises a change has to be taken after that.
+
+    Scratch and coordination state are not content: the coordination tree and the store
+    files are skipped, the scratch area is reported as transport in one line instead of
+    being walked, and the generated guide is labelled rather than listed as work. A
+    listing that matches nothing exits 2."""
+    sink = _require_sink(args)
+    result = _discovery(args, sink).list(args.path, args.count, args.after)
+    _emit_result(result, args.json)
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
+def cmd_file_search(args):
+    """Find a literal pattern in the managed files at or under a path.
+
+    One row per match (`path:line` and the line), in canonical path order and then line
+    order, bounded by `--count`. A truncated search states how many matches are left, in
+    how many files, how to narrow the search and the exact `--after PATH:LINE` token that
+    continues it -- and that token is always one this command printed, so no continuation
+    is guessed. Like `list`, a search changes nothing and authorises nothing."""
+    sink = _require_sink(args)
+    result = _discovery(args, sink).search(args.pattern, args.path, args.count, args.after)
+    _emit_result(result, args.json)
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
+def cmd_file_read(args):
+    """Serve a path's bytes and record the observation the caller may present later.
+
+    The report carries the whole-file digest -- *always*, even for a ranged read, because
+    a range-scoped hash would authorise a range-scoped lie -- the claim state, any note
+    that the bytes differ from the version arbite last observed, and the read token.
+
+    A read never takes an exclusive lock and never transfers ownership. Reading a path
+    another attempt holds serves the bytes with the holder named and a token that cannot
+    authorise a write; `--fail-if-busy` refuses instead, so a caller that cannot use the
+    bytes does not spend context on them. Reading an unclaimed path authorises nothing
+    either: the write path requires a claim and a read taken under it."""
+    sink = _require_sink(args)
+    result = _reads(args, sink).read(
+        args.path,
+        args.ticket,
+        args.attempt,
+        args.lines,
+        args.fail_if_busy,
+    )
+    _emit_file_result(result, args.json)
+
+
 def cmd_close(args):
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
@@ -2534,15 +2613,17 @@ def build_parser():
 
     p_file = sub.add_parser(
         "file",
-        help="file ownership: claim whole files, release them, list what is held",
-        description="The durable half of the file proxy: which work attempt owns which whole "
-        "file. A claim is what a later read, write, edit or rename is checked against -- it is "
-        "a record, not a lock, so no lock is ever held for the length of an agent's work. "
-        "Acquisition is all-or-nothing and in canonical path order, so two attempts can never "
-        "end up each holding half of a pair; contention is a structured busy answer (exit 4) "
-        "naming the holder, never a wait. Paths are validated against the project root: escapes, "
-        "arbite's own state and `.git` metadata are refused. Reads, writes, edits, renames and "
-        "removes are not here yet -- they arrive with their own slices.",
+        help="the file proxy: discovery, reads, and exclusive claims on whole files",
+        description="The shared-directory proxy: what is in the workspace, what it contains, and "
+        "which work attempt owns which whole file. `list` and `search` are bounded discovery in "
+        "canonical path order and never authorise a change; `read` serves bytes and records an "
+        "observation whose token a mutation may present; `claim`, `release` and `claims` are the "
+        "durable ownership surface. A claim is a record, not a lock, so no lock is ever held for "
+        "the length of an agent's work, and acquisition is all-or-nothing in canonical path "
+        "order, so two attempts can never each hold half of a pair -- contention is a structured "
+        "busy answer (exit 4) naming the holder, never a wait. Paths are validated against the "
+        "project root: escapes, arbite's own state and `.git` metadata are refused. Writes, "
+        "edits, renames and removes are not here yet -- they arrive with their own slices.",
     )
     file_sub = p_file.add_subparsers(
         dest="file_action", required=True, metavar="SUBCOMMAND"
@@ -2632,6 +2713,132 @@ def build_parser():
     _json_flag(p_file_claims)
     _sink_flag(p_file_claims)
     p_file_claims.set_defaults(func=cmd_file_claims)
+
+    p_file_list = file_sub.add_parser(
+        "list",
+        help="list the files at or under a path, with their shape and claim state",
+        description="List what is there, in canonical path order: per claimable file its line "
+        "count, size and whether an attempt holds it (and which). Bounded by `--count`; a "
+        "truncated listing prints how many more match and the exact command that continues from "
+        "its last row, and `--after PATH` resumes from a path a previous listing printed. "
+        "Discovery never authorises a write and mints no read token -- knowing a path is free is "
+        "not permission to change it, and a writer still claims the path and reads it again under "
+        "that claim. Scratch and coordination state are not listed; a path outside the project, "
+        "`.git` metadata and arbite's own runtime state are refused. A listing that matches "
+        "nothing exits 2.",
+    )
+    p_file_list.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help="a directory (listed recursively) or a single file; defaults to the project root, "
+        "written '.'",
+    )
+    p_file_list.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"print at most N entries (default: {coordination_discovery.DEFAULT_LIST_COUNT}); "
+        "the number used is printed back in the truncation hint",
+    )
+    p_file_list.add_argument(
+        "--after",
+        default=None,
+        metavar="PATH",
+        help="resume after this path -- the continuation a previous listing printed, never a "
+        "path to invent",
+    )
+    _json_flag(p_file_list)
+    _sink_flag(p_file_list)
+    p_file_list.set_defaults(func=cmd_file_list)
+
+    p_file_search = file_sub.add_parser(
+        "search",
+        help="find literal text in the files at or under a path",
+        description="Search the text of the managed files under a path, in canonical path order "
+        "and then line order, printing one row per match (`path:line` and the line). The pattern "
+        "is literal text, not a regular expression. Bounded by `--count`; a truncated search "
+        "states how many matches remain in how many files, how to narrow the search, and the "
+        "exact `--after PATH:LINE` token that continues it -- always a token this command "
+        "printed. Scratch is transport, not project content, so searching it answers 'no "
+        "matches' (exit 2) rather than walking it; the coordination tree and the store are not "
+        "searchable at all.",
+    )
+    p_file_search.add_argument("pattern", metavar="PATTERN", help="the literal text to find")
+    p_file_search.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help="a directory (searched recursively) or a single file; defaults to the project root",
+    )
+    p_file_search.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"print at most N matches (default: {coordination_discovery.DEFAULT_SEARCH_COUNT}); "
+        "the number used is printed back in the truncation hint",
+    )
+    p_file_search.add_argument(
+        "--after",
+        default=None,
+        metavar="PATH:LINE",
+        help="resume after this match, e.g. '--after src/arbite/cli.py:56' -- the token a "
+        "previous search's truncation line printed",
+    )
+    _json_flag(p_file_search)
+    _sink_flag(p_file_search)
+    p_file_search.set_defaults(func=cmd_file_search)
+
+    p_file_read = file_sub.add_parser(
+        "read",
+        help="read a file (or a line range) and record a read token",
+        description="Serve a path's bytes and record the observation: the report carries the "
+        "*whole-file* digest (even for a ranged read, because a range-scoped hash would "
+        "authorise a range-scoped lie), the line count and size, the claim state, a note when "
+        "the bytes on disk differ from the version arbite last observed, and the read token -- "
+        "an `op-XXXX` id a mutation presents. A read never takes an exclusive lock and never "
+        "transfers ownership: reading a path another attempt holds serves the bytes with the "
+        "holder named and a token that cannot authorise a write, reading an unclaimed path is a "
+        "pre-claim observation that authorises nothing, and `--fail-if-busy` refuses with no "
+        "bytes served when the caller already knows it cannot use them. `--ticket` and "
+        "`--attempt` are optional and go together: they attribute the observation to an attempt "
+        "that owns the ticket.",
+    )
+    p_file_read.add_argument("path", metavar="PATH", help="the file to read, relative to the root")
+    p_file_read.add_argument(
+        "--ticket",
+        default=None,
+        metavar="TICKET_ID",
+        help="the ticket whose attempt this read is attributed to (optional; give it together "
+        "with --attempt)",
+    )
+    p_file_read.add_argument(
+        "--attempt",
+        default=None,
+        metavar="ATTEMPT_ID",
+        help="the attempt (`att-XXXX`) the observation is attributed to; it must own the ticket "
+        "(optional; give it together with --ticket)",
+    )
+    p_file_read.add_argument(
+        "--lines",
+        default=None,
+        metavar="START[:END]",
+        help="serve only this line range (numbered from 1); the digest still covers the whole "
+        "file",
+    )
+    p_file_read.add_argument(
+        "--fail-if-busy",
+        action="store_true",
+        help="refuse (exit 4, no bytes served) when another attempt holds the path, instead of "
+        "serving bytes whose token cannot authorise a write",
+    )
+    _json_flag(p_file_read)
+    _sink_flag(p_file_read)
+    p_file_read.set_defaults(func=cmd_file_read)
 
     p_events = sub.add_parser(
         "events",

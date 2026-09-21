@@ -18,6 +18,22 @@ output is a JSON document is compared as *parsed* JSON with its string leaves
 normalised, because the document indents its blocks for reading while `--json`
 prints one key per line: the facts are the assertion, not the whitespace.
 
+Two shapes the document uses to *abridge* a long transcript are understood, so a
+block that shows its facts is still asserted on the facts rather than skipped:
+
+- An **elision line** (`… 99 more files`) asserts that exactly that many rows follow
+  where it stands. Their content is the property tests' business; the count is the
+  transcript's.
+- A **body sample** in a read transcript (gutter lines after the `---` separator) names
+  the line it shows by number, so the sample is matched against *that line of the
+  body* -- with a trailing `...` meaning "this line continues". A read block's body
+  may be sampled rather than complete: a whole-file read prints hundreds of lines and
+  the document shows the gutter format, not the file.
+
+A block that needs neither is compared byte for byte, and a block the document
+visibly abridges in other ways (a dropped parenthetical, a hand-aligned column) is
+asserted with `assert_scenario_abridged`, which says so out loud at the call site.
+
 Which stream a transcript's body belongs to is a fact about the outcome, not a
 choice a test makes:
 
@@ -60,6 +76,15 @@ NOTE_PREFIX = "note:"
 #: one of these says "this is what the command printed on stderr", so the harness does
 #: not have to guess which stream to compare (see the module docstring).
 REFUSAL_LABELS = ("error:", "busy:", "stale_read:")
+#: The document's elision line: `… N more files`, `… 499 more matches`. The count is
+#: asserted (that many rows follow) and the rows themselves are not compared here.
+ELISION_RE = re.compile(r"^…\s*(?:(?P<count>\d+)\s+)?more\b")
+#: A read transcript's body sample: `1254 | def cmd_claim(args):`.
+SAMPLE_RE = re.compile(r"^(?P<number>\d+)\s*\|\s?(?P<text>.*)$")
+#: The separator between a read report and the bytes it served.
+BODY_SEPARATOR = "---"
+#: A sample line that trails off (`...` in the document) matches by prefix.
+TRAILING_ELLIPSIS_RE = re.compile(r"\s*(?:\.\.\.|…)\s*$")
 
 ID_RE = re.compile(r"\b(tic|ws|att|clm|op|art|evt)-[0-9a-f]{4}\b")
 #: A content digest, shortened for text or whole (`sha256:<hex>`). Normalised because a
@@ -228,6 +253,37 @@ def scenario_block(scenario_id: str, path: Path = EXAMPLES_DOC) -> Scenario:
     raise AssertionError(f"no scenario {scenario_id} in {path}")
 
 
+def scenario_from_block(block: str, scenario_id: str = "block", title: str = "") -> Scenario:
+    """A `Scenario` built from a fenced block the document nests under a heading.
+
+    A heading may hold more than one transcript -- RD2's `--fail-if-busy` refusal, LS6's
+    protected path, LS5's two commands in one fence -- and `scenario_block` reads only
+    the first. This turns any other block into the same value, so the second transcript
+    is asserted by the same code as the first instead of by a hand-rolled comparison.
+    A block without an `# exit N` comment exits 0, which is what the first half of LS5's
+    fence is."""
+    commands, body, exit_code = [], [], 0
+    for line in block.splitlines():
+        if line.startswith(COMMAND_PREFIX):
+            commands.append(line[len(COMMAND_PREFIX) :].strip())
+            continue
+        exit_match = EXIT_LINE.match(line.strip())
+        if exit_match:
+            exit_code = int(exit_match.group("code"))
+            continue
+        body.append(line)
+    if not commands:
+        raise AssertionError(f"block {scenario_id} has no command line")
+    text = "\n".join(body).strip("\n")
+    return Scenario(
+        id=scenario_id,
+        title=title,
+        command=tuple(shlex.split(commands[0])[1:]),
+        exit_code=exit_code,
+        stdout=text,
+    )
+
+
 def _split_trailing_notes(body: list) -> tuple:
     """`(body_without_notes, notes)`: the run of `note:` lines at the end of a block.
 
@@ -334,9 +390,171 @@ def assert_scenario(scenario: Scenario, cwd, sink: Optional[str] = None, stream:
 
 
 def _assert_text(scenario: Scenario, where: str, actual_text: str, expected_text: str, cwd, what: str):
-    """One stream compared after normalisation, with both sides printed on failure."""
+    """One stream compared after normalisation, with both sides printed on failure.
+
+    A transcript that elides rows or samples a body is compared by the rules at the
+    top of this module; everything else is compared byte for byte, which is what
+    makes "the transcript passes" mean exactly what it says."""
     actual = normalise(actual_text, cwd).strip("\n")
     expected = normalise(expected_text, cwd).strip("\n")
+    if _is_abridged(expected):
+        _assert_abridged(where, actual.split("\n"), expected.split("\n"), what)
+        return
     assert actual == expected, (
         f"{where} {what} differs\n--- actual ---\n{actual}\n--- expected ---\n{expected}"
     )
+
+
+def _is_abridged(expected_text: str) -> bool:
+    """Whether a transcript elides rows or samples a read body (see the docstring)."""
+    lines = expected_text.split("\n")
+    if any(ELISION_RE.match(line.strip()) for line in lines):
+        return True
+    return BODY_SEPARATOR in [line.strip() for line in lines]
+
+
+def _assert_abridged(where: str, actual_lines: list, expected_lines: list, what: str):
+    """Compare an abridged transcript line by line, asserting its counts and samples.
+
+    Every expected line is consumed in order: a plain line must equal the next actual
+    line, an elision line must be backed by exactly the number of rows it states, and a
+    sample names the body line it shows. A read body may be sampled rather than
+    complete, so trailing body lines after a sample are allowed to go uncompared."""
+    failures = []
+
+    def fail(message):
+        failures.append(
+            f"{where} {what} differs: {message}\n--- actual ---\n"
+            + "\n".join(actual_lines)
+            + "\n--- expected ---\n"
+            + "\n".join(expected_lines)
+        )
+
+    cursor = 0
+    sampled = False
+    separator = _separator_index(expected_lines)
+    for index, line in enumerate(expected_lines):
+        elision = ELISION_RE.match(line.strip())
+        if elision:
+            count = int(elision.group("count") or 1)
+            rows = actual_lines[cursor : cursor + count]
+            if len(rows) < count or any(not row.strip() for row in rows):
+                fail(f"the elision needs {count} rows after line {index + 1}")
+                break
+            cursor += count
+            continue
+        if separator is not None and index > separator:
+            sample = SAMPLE_RE.match(line.strip())
+            if sample:
+                sampled = True
+                position = _find_sample(actual_lines, cursor, sample)
+                if position is None:
+                    fail(f"the sample {line.strip()!r} is not the body line it names")
+                    break
+                cursor = position + 1
+                continue
+        if cursor >= len(actual_lines) or actual_lines[cursor] != line:
+            fail(f"line {index + 1} is not {line!r}")
+            break
+        cursor += 1
+    else:
+        if not sampled and separator is None and cursor != len(actual_lines):
+            fail(f"{len(actual_lines) - cursor} unexpected line(s) after the transcript")
+    assert not failures, "\n".join(failures)
+
+
+def _separator_index(expected_lines: list):
+    """Where a read transcript's `---` sits, or None for a transcript without one."""
+    for index, line in enumerate(expected_lines):
+        if line.strip() == BODY_SEPARATOR:
+            return index
+    return None
+
+
+def _find_sample(actual_lines: list, start: int, sample) -> Optional[int]:
+    """The body line a sample names, or None when the body does not hold it."""
+    number, text = int(sample.group("number")), sample.group("text")
+    wanted = TRAILING_ELLIPSIS_RE.sub("", text)
+    for position in range(start, len(actual_lines)):
+        actual = SAMPLE_RE.match(actual_lines[position].strip())
+        if actual is None or int(actual.group("number")) != number:
+            continue
+        shown = actual.group("text")
+        if shown == text or (wanted != text and shown.startswith(wanted)):
+            return position
+    return None
+
+
+def assert_scenario_abridged(
+    scenario: Scenario, cwd, sink: Optional[str] = None, stream: Optional[str] = None
+) -> str:
+    """Assert an *abridged* transcript: every line's facts, not its exact layout.
+
+    The document abridges a handful of blocks in ways no single implementation can
+    reproduce: it drops a parenthetical the JSON carries, writes `142 KiB` for
+    `142.0 KiB`, and aligns a note column by hand. For those blocks the comparison is
+    per line with whitespace collapsed, and each expected line must be a *prefix* of
+    an actual line, in order. It is deliberately weaker than `assert_scenario`, so it
+    is used only where the block itself is visibly abridged -- and the test that calls
+    it says which abridgement it is accepting."""
+    proc = run_scenario(scenario, cwd, sink=sink)
+    where = f"scenario {scenario.id} ('arbite {' '.join(scenario.command)}')"
+    assert proc.returncode == scenario.exit_code, (
+        f"{where} exited {proc.returncode}, expected {scenario.exit_code}\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    on_stderr = scenario.on_stderr if stream is None else stream == "stderr"
+    actual_text, expected_text = proc.stdout, scenario.stdout
+    if on_stderr:
+        assert proc.stdout == "", f"{where} also wrote to stdout:\n{proc.stdout}"
+        actual_text = proc.stderr
+    else:
+        assert proc.stderr == "", f"{where} wrote to stderr:\n{proc.stderr}"
+    assert_facts(where, actual_text, expected_text, cwd)
+    return actual_text
+
+
+def assert_facts(where: str, actual_text: str, expected_text: str, cwd=None, ordered: bool = True) -> None:
+    """Each expected line must be a prefix of an actual line, in order (see
+    `assert_scenario_abridged` for when that is the right question).
+
+    `ordered=False` asks for the same facts in *any* order. That is for a block whose
+    document lists its rows in an order the display rules do not produce (LS5 names
+    `project.yaml` before an agent scratchpad, which canonical path order does not), so
+    the transcript's *contents* are the assertion and its sequence is not. Every fact
+    still has to be present, and each actual line accounts for one expectation at
+    most, so a listing cannot pass by repeating one row."""
+    actual = [_collapse(_whole_units(line)) for line in normalise(actual_text, cwd).splitlines()]
+    expected = [
+        _collapse(_whole_units(line))
+        for line in normalise(expected_text, cwd).splitlines()
+        if line.strip()
+    ]
+    next_position = 0
+    for line in expected:
+        search = range(next_position, len(actual)) if ordered else range(len(actual))
+        found = next(
+            (position for position in search if actual[position].startswith(line)), None
+        )
+        assert found is not None, (
+            f"{where}: no line starts with {line!r}\n--- actual ---\n"
+            + "\n".join(actual)
+            + "\n--- expected ---\n"
+            + "\n".join(expected)
+        )
+        next_position = found + 1
+        if not ordered:
+            # Claim the line, so no second fact can be satisfied by the same row.
+            actual[found] = "\0"
+
+
+def _collapse(text: str) -> str:
+    """`text` with every whitespace run collapsed to one space.
+
+    Column padding and line wrapping are the document's layout, not its facts."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _whole_units(text: str) -> str:
+    """`142.0 KiB` and `142 KiB` are the same number, and the document writes both."""
+    return re.sub(r"(\d)\.0 (?=[KMG]iB)", r"\1 ", text)

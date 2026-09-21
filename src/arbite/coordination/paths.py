@@ -37,7 +37,7 @@ from typing import Optional
 from ..errors import PathRefused
 from .records import ABSENT, digest_bytes
 from .results import REFUSAL_INDENT
-from .scratch import human_size
+from .scratch import SCRATCH_DIRNAME, human_size
 
 #: The names arbite protects. `.git` is VCS metadata rather than content; the
 #: coordination and scratch trees are runtime state (a claim record is not a file a
@@ -52,6 +52,26 @@ ARBITE_DIRNAME = ".arbite"
 PROTECTED_ARBITE_DIRS = ("coordination", "scratch")
 PROTECTED_ARBITE_FILES = ("project.yaml",)
 PROTECTED_ARBITE_PREFIXES = ("arbite.db",)
+
+#: The parts of arbite's own state a path can name, as `arbite_state` reports them.
+#: Separate names because discovery renders them differently -- the coordination
+#: tree is invisible to it while `project.yaml` is a document it lists -- even
+#: though every one of them is refused as a *mutation* target with one message.
+STATE_GIT = "git"
+STATE_SCRATCH = "scratch"
+STATE_COORDINATION = "coordination"
+STATE_STORE = "store"
+STATE_CONFIG = "config"
+
+#: Why each protected path is refused, in the words the frozen LS6 block prints
+#: (`.git`), C04's protected-path cases pin (runtime state, configuration).
+PROTECTED_STATE_REFUSALS = {
+    STATE_GIT: "arbite does not manage .git metadata",
+    STATE_SCRATCH: "arbite does not manage its own runtime state",
+    STATE_COORDINATION: "arbite does not manage its own runtime state",
+    STATE_STORE: "arbite does not manage its own runtime state",
+    STATE_CONFIG: "arbite does not manage its own configuration",
+}
 
 DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
 
@@ -87,13 +107,19 @@ class Version:
         return {"digest": self.digest, "size": self.size, "lines": self.lines}
 
 
-def canonical_relative(raw, root) -> str:
+def canonical_relative(raw, root, allow_arbite_state: bool = False) -> str:
     """`raw` as the one project-relative path that names it, or a refusal.
 
     The single definition of "which file is this" for the whole proxy: absolute
     spellings inside the root, `.`/`..` segments, doubled separators and the same path
     written twice all collapse to one string, so a claim, a read and a write can never
-    disagree about which file they mean."""
+    disagree about which file they mean.
+
+    `allow_arbite_state` is for *discovery*, which has to canonicalise paths it will
+    not manage -- `project.yaml` is a document a listing shows, and the scratch area
+    is reported rather than silently dropped -- before applying its own, more
+    specific rules. It never relaxes the `.git` refusal, and every mutation target
+    keeps the default: a claim, a write or a read must still be refused."""
     text = raw if isinstance(raw, str) else str(raw)
     if not text:
         raise PathRefused("a path is required, and an empty one names nothing")
@@ -118,8 +144,35 @@ def canonical_relative(raw, root) -> str:
             f"'{text}' is the workspace root itself; arbite manages whole files inside "
             "it ('arbite file list .' to see what is there)"
         )
-    _refuse_protected(text, relative)
+    if not allow_arbite_state or arbite_state(relative) == STATE_GIT:
+        _refuse_protected(text, relative)
     return relative
+
+
+def arbite_state(relative: str):
+    """Which part of arbite's own state `relative` names, or None if it names none.
+
+    One classifier for both questions the proxy asks about arbite's own tree: "may
+    this path be claimed, read or written" (any answer but None is a refusal, see
+    `PROTECTED_STATE_REFUSALS`) and "how does discovery render it" (the coordination
+    tree and the store files are invisible, the scratch area is reported as
+    transport, `project.yaml` is a document). Compared with `normcase`, so a
+    case-insensitive filesystem cannot spell its way past the rule."""
+    segments = relative.split("/")
+    if _fold(segments[0]) == _fold(GIT_METADATA_DIRNAME):
+        return STATE_GIT
+    if len(segments) < 2 or _fold(segments[0]) != _fold(ARBITE_DIRNAME):
+        return None
+    inner = _fold(segments[1])
+    if inner == _fold(SCRATCH_DIRNAME):
+        return STATE_SCRATCH
+    if inner in tuple(_fold(name) for name in PROTECTED_ARBITE_DIRS):
+        return STATE_COORDINATION
+    if inner.startswith(PROTECTED_ARBITE_PREFIXES):
+        return STATE_STORE
+    if inner in tuple(_fold(name) for name in PROTECTED_ARBITE_FILES):
+        return STATE_CONFIG
+    return None
 
 
 def probe(root, relative) -> Version:
@@ -201,28 +254,11 @@ def _escape_refusal(raw, root) -> PathRefused:
 
 
 def _refuse_protected(raw, relative: str) -> None:
-    """Refuse arbite's own state, `.git`, and the store files, by name.
-
-    Compared with `normcase`, so a case-insensitive filesystem cannot spell its way
-    past the rule."""
-    segments = relative.split("/")
-    if _fold(segments[0]) == _fold(GIT_METADATA_DIRNAME):
-        raise PathRefused(
-            f"'{raw}' is protected: arbite does not manage .git metadata"
-        )
-    if len(segments) < 2 or _fold(segments[0]) != _fold(ARBITE_DIRNAME):
-        return
-    inner = _fold(segments[1])
-    if inner in tuple(_fold(name) for name in PROTECTED_ARBITE_DIRS) or inner.startswith(
-        PROTECTED_ARBITE_PREFIXES
-    ):
-        raise PathRefused(
-            f"'{raw}' is protected: arbite does not manage its own runtime state"
-        )
-    if inner in tuple(_fold(name) for name in PROTECTED_ARBITE_FILES):
-        raise PathRefused(
-            f"'{raw}' is protected: arbite does not manage its own configuration"
-        )
+    """Refuse arbite's own state, `.git`, and the store files, by name (see
+    `arbite_state` for which paths those are)."""
+    state = arbite_state(relative)
+    if state is not None:
+        raise PathRefused(f"'{raw}' is protected: {PROTECTED_STATE_REFUSALS[state]}")
 
 
 def _is_absolute(text: str) -> bool:
