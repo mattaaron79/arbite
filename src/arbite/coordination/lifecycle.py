@@ -51,10 +51,11 @@ transaction. The consequences are stated honestly rather than hidden:
 
 from __future__ import annotations
 
-from dataclasses import replace
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence
 
-from .. import schema
+from .. import config, schema
 from ..errors import (
     Busy,
     Conflict,
@@ -67,12 +68,18 @@ from ..errors import (
     TicketNotFound,
 )
 from ..sinks import Expect
+from . import recovery
 from .app import CoordinationApp
+from .paths import probe
 from .records import (
+    ABSENT,
     ATTEMPT_ACTIVE,
+    CLAIM_RELEASED,
+    RECEIPT_SUCCEEDED,
     WorkAttempt,
     new_id,
     parse_utc,
+    short_digest,
     utc_now,
 )
 from .results import REFUSAL_INDENT, register_next_actions, succeeded
@@ -90,12 +97,21 @@ ATTEMPT_INVALIDATED = "attempt.invalidated"
 TICKET_CLAIMED = "ticket.claimed"
 TICKET_REOPENED = "ticket.reopened"
 
+#: The two kinds a change in file ownership appends. They are defined here, beside the
+#: cascade that appends `release.file` whenever it ends an attempt, and imported by
+#: `claims` (which appends both for an explicit acquisition or release) so one literal
+#: serves every writer of the claim stream -- a cascade release and a deliberate
+#: `arbite file release` therefore look the same to `arbite events`.
+CLAIM_FILE = "claim.file"
+RELEASE_FILE = "release.file"
+
 #: The attempt states a lifecycle command ends an attempt with, and the outcome it
-#: records beside it. Deliberately three different stories rather than one: a
-#: yielding worker *released* the work, a blocker or an administrator *interrupted*
-#: it, and only the future slice that finishes work marks an attempt `finished`.
+#: records beside it. Deliberately four different stories rather than one: a yielding
+#: worker *released* the work, a blocker or an administrator *interrupted* it, and work
+#: that reached the end of its ticket -- close, submit or accept -- *finished*.
 STATE_RELEASED = "released"
 STATE_INTERRUPTED = "interrupted"
+STATE_FINISHED = "finished"
 
 #: The statuses a generic setter may not reach while an attempt is active, each with
 #: the words the refusal uses and the command that owns the transition. The frozen
@@ -105,7 +121,12 @@ SETTER_STATUS_OWNERS = {
     "open": ("re-open", "arbite release {id} --agent {agent}"),
     "blocked": ("block", 'arbite block {id} --reason "<why>"'),
     "shelved": ("shelve", 'arbite shelve {id} --reason "<why>"'),
+    "review": ("submit", "arbite submit {id} --agent {agent}"),
 }
+
+#: The gap between a released path and the word `free` in a cascade's rows, matching the
+#: column gap the `file claims` table uses.
+RELEASED_COLUMN_GAP = 2
 
 # The indent a wrapped refusal's continuation line uses lives in `results`, beside the
 # label it comes from, so this module and the path validation both wrap the same way.
@@ -146,6 +167,19 @@ def attempt_payload(attempt: WorkAttempt) -> dict:
 def local_time(timestamp: str) -> str:
     """A stored UTC timestamp as the `HH:MM:SS` a report prints beside a record."""
     return parse_utc(timestamp).astimezone().strftime("%H:%M:%S")
+
+
+@dataclass(frozen=True)
+class EndedAttempt:
+    """An attempt a lifecycle command stopped, with the file ownership it released.
+
+    The two travel together because ending them is one decision: an attempt that is no
+    longer active while its claims still reserve their paths is exactly the state
+    `doctor` reports as an orphaned claim, so the cascade below writes both in one
+    commit and every caller reports from this one value."""
+
+    attempt: WorkAttempt
+    released: tuple = ()
 
 
 class TicketLifecycle:
@@ -255,7 +289,11 @@ class TicketLifecycle:
 
         Claiming a ticket this worker already holds is idempotent and returns the
         attempt it already has: a re-claim after a context switch is not a second
-        attempt, and the generation stays what it was."""
+        attempt, and the generation stays what it was.
+
+        A forced claim is the administrative takeover, so it also releases the file
+        ownership the revoked attempt held (see `_start_attempt`), and it holds the
+        store's operation lock across its own ticket exchange and that revocation."""
         agent = (agent or "").strip()
         if not agent:
             raise TicketError("--agent must name the worker claiming the ticket")
@@ -290,7 +328,12 @@ class TicketLifecycle:
             raise self._attempt_in_the_way(ticket, holder, agent)
 
         # The ticket write is the serialisation point: whichever process wins this
-        # exchange owns the ticket, and the loser is told who beat it.
+        # exchange owns the ticket, and the loser is told who beat it. A *forced* claim
+        # also holds the store's operation lock across that write and the revocation
+        # below, so a file operation that is already mid-flight cannot apply bytes under
+        # the generation being revoked: either it finished first (its receipt is evidence
+        # the takeover leaves alone) or it is refused for an attempt that is no longer
+        # current.
         expect = Expect(status=ticket.status, assignee=ticket.assignee)
         taken_from = ticket.assignee if force and ticket.assignee != agent else None
         if taken_from:
@@ -298,24 +341,25 @@ class TicketLifecycle:
         ticket.status = "in_progress"
         ticket.assignee = agent
         ticket.updated = schema.now()
-        try:
-            self.sink.update(ticket, expect=expect)
-        except Conflict:
-            fresh = self.sink.get(ticket.id, unique=True)
-            raise self._lost_race(
-                fresh,
-                self._claim_violations(fresh, agent),
-                agent,
-                self.active_attempt(fresh.id),
-            )
+        with self.store.operation_lock() if force else nullcontext():
+            try:
+                self.sink.update(ticket, expect=expect)
+            except Conflict:
+                fresh = self.sink.get(ticket.id, unique=True)
+                raise self._lost_race(
+                    fresh,
+                    self._claim_violations(fresh, agent),
+                    agent,
+                    self.active_attempt(fresh.id),
+                )
 
-        attempt, revoked = self._start_attempt(
-            ticket,
-            agent,
-            event_kind=ATTEMPT_STARTED,
-            ticket_event=TICKET_CLAIMED,
-            revoke_reason=reason if force else None,
-        )
+            attempt, revoked = self._start_attempt(
+                ticket,
+                agent,
+                event_kind=ATTEMPT_STARTED,
+                ticket_event=TICKET_CLAIMED,
+                revoke_reason=reason if force else None,
+            )
         flagged = self._flag_if_prerequisite_reopened(ticket, attempt)
         return self._claimed_result(
             ticket,
@@ -446,7 +490,12 @@ class TicketLifecycle:
         return succeeded(lines=lines, data=self._lifecycle_data(ticket, ended))
 
     def block(self, ticket, reason: str):
-        """Block a ticket: the attempt is interrupted and nothing is undone."""
+        """Block a ticket: the attempt is interrupted and nothing is undone.
+
+        Blocking stops the *work*, so the attempt ends here and its claims are released
+        with it; whatever it wrote stays on disk for the next worker to re-read. The
+        receipt therefore names the command that resumes the ticket with a fresh attempt
+        (LC2), because that is the step the caller has left."""
         ended = self.end_attempt(
             ticket, state=STATE_INTERRUPTED, outcome="blocked", handoff=reason
         )
@@ -455,9 +504,15 @@ class TicketLifecycle:
         ticket.status = "blocked"
         ticket.updated = schema.now()
         self._write(ticket, expect, action="block", attempt_ended=ended is not None)
-        lines = [f"blocked {ticket.id} ({reason}) -> {self._location(ticket.id)}"]
+        lines = [f"blocked {ticket.id} (blocked_by: {reason}) -> {self._location(ticket.id)}"]
         lines.extend(self._ending_lines(ended))
-        return succeeded(lines=lines, data=self._lifecycle_data(ticket, ended))
+        worker = ended.attempt.worker_id if ended is not None else None
+        return succeeded(
+            lines=lines,
+            data=self._lifecycle_data(ticket, ended),
+            next_actions=[self._unblock_command(ticket.id, worker)],
+            text_hint=self._unblock_hint(ticket.id, worker),
+        )
 
     def shelve(self, ticket, reason: str = ""):
         """Shelve a ticket: parked, and the attempt ends with it."""
@@ -477,11 +532,17 @@ class TicketLifecycle:
     def reopen(self, ticket, agent: str, reason: str, dependents: Sequence = ()):
         """Reopen a ticket, leaving the past in the past.
 
-        Old attempts stay historical and nothing is re-acquired. A dependency that
-        gets reopened is the interesting case: any *running* work that depends on it
-        is told -- an invalidation event naming the attempt -- but is not silently
-        undone, because the bytes on disk are real and only the caller can decide what
-        to do about them.
+        An attempt that is still active ends here, with its claims released -- but
+        nothing is *re-acquired*: no earlier attempt's claim is revived, and no read
+        token taken before this call becomes usable again, because a path has to be
+        claimed afresh and a fresh claim mints a new generation. That is what makes the
+        note the receipt prints true rather than hopeful (LC4). The assignee is cleared
+        with the attempt it named: reopening puts the ticket back in the open pool, and
+        leaving a worker on it would reserve work nobody is doing -- the same hand-back
+        `release` and `unshelve` make. A dependency that gets reopened is the
+        interesting case: any *running* work that depends on it is told -- an
+        invalidation event naming the attempt -- but is not silently undone, because the
+        bytes on disk are real and only the caller can decide what to do about them.
 
         The dependent scan runs **twice**: once before this ticket's own state change
         and once after it, because a claim that is committing at the same moment can
@@ -497,6 +558,7 @@ class TicketLifecycle:
         expect = Expect(status=ticket.status, assignee=ticket.assignee)
         ticket.closed = None
         ticket.blocked_by = None
+        ticket.assignee = None
         ticket.status = "open"
         ticket.updated = schema.now()
         schema.append_note(ticket, agent, f"Reopened: {reason}.")
@@ -504,20 +566,134 @@ class TicketLifecycle:
         late = self._invalidate_dependents(
             ticket, dependents, agent, flagged={attempt.id for _, attempt in invalidated}
         )
-        lines = [f"reopened {ticket.id} -> {self._location(ticket.id)}"]
+        lines = [f"reopened {ticket.id} -> {self._location(ticket.id)} (reason recorded)"]
+        lines.append(
+            "note: previous attempts and file claims are historical; nothing is re-acquired"
+        )
         lines.extend(self._ending_lines(ended))
         for dependent, attempt in [*invalidated, *late]:
             lines.append(
                 f"invalidated: attempt {attempt.id} on {dependent.id} depends on "
                 f"{ticket.id} (running work was flagged, not undone)"
             )
+        claim_command = f"arbite claim {ticket.id} --agent {agent}"
         return succeeded(
             lines=lines,
             data={
                 **self._lifecycle_data(ticket, ended),
                 "invalidated": len(invalidated) + len(late),
             },
+            next_actions=[claim_command],
+            text_hint=f"next: '{claim_command}' to start a new attempt",
         )
+
+    # ------------------------------------------------------------------
+    # Finishing: close, submit and accept
+    # ------------------------------------------------------------------
+
+    def close(self, ticket, actor: Optional[str] = None):
+        """Close a ticket, ending its attempt and releasing the paths it held (LC1).
+
+        Closing is the end of the work as well as of the ticket, so it is one cascade:
+        the pending operations of the attempt are reconciled first (an operation that
+        can never be retried behind a closed ticket is finished rather than left
+        half-recorded), the attempt ends, its claims are released, and only then is the
+        ticket written closed. Holding the store's operation lock across all of it is
+        what makes "no observer can mutate under an old token after close succeeds"
+        true: a file operation either finishes before the close -- and its receipt is
+        part of the manifest this reports -- or it finds a ticket that is no longer
+        `in_progress` and an attempt that is no longer current, and is refused with
+        nothing written (WR5, RC2).
+
+        The manifest is reported, never pruned: closing a ticket does not delete the
+        evidence of what was done to it."""
+        who = (actor or ticket.assignee or "").strip()
+        ended, unresolved = self._close_work(ticket, actor=who or None)
+        lines = [f"closed {ticket.id}{f' ({who})' if who else ''} -> {self._location(ticket.id)}"]
+        lines.extend(self._closed_lines(ended))
+        lines.extend(self._pending_lines(unresolved))
+        lines.append(self._manifest_line(ticket.id))
+        return succeeded(lines=lines, data=self._manifest_data(ticket, ended))
+
+    def submit(self, ticket, agent: str, message: Optional[str] = None):
+        """Submit a finished ticket: into review, or closed when the project says so.
+
+        Either way the work stops here, so the attempt ends and its claims are
+        released. The difference is where the ticket lands -- and that is the project's
+        committed answer (`review:` in `.arbite/project.yaml`), read here rather than by
+        the command layer, because "does finishing this ticket park it or close it" is
+        policy. A ticket in review keeps its assignee: it is still owned by whoever did
+        the work, and they are who a reviewer sends it back to."""
+        if ticket.status == "closed":
+            raise TicketError(f"ticket {ticket.id} is already closed")
+        detail = f": {message}" if message else "."
+        if not config.review_enabled():
+            # Exactly what `arbite close` writes -- same cascade, same dating, same
+            # move -- with the note this command contributes.
+            ended, unresolved = self._close_work(
+                ticket, actor=agent, note=(agent, f"Submitted; closed (review disabled){detail}")
+            )
+            lines = [f"submitted {ticket.id} -> {self._location(ticket.id)} (closed)"]
+            lines.extend(self._closed_lines(ended))
+            lines.extend(self._pending_lines(unresolved))
+            lines.append(self._manifest_line(ticket.id))
+            return succeeded(lines=lines, data=self._manifest_data(ticket, ended))
+
+        ended = self.end_attempt(ticket, state=STATE_FINISHED, outcome="submitted", actor=agent)
+        expect = Expect(status=ticket.status, assignee=ticket.assignee)
+        ticket.status = "review"
+        ticket.updated = schema.now()
+        schema.append_note(ticket, agent, f"Submitted for review{detail}")
+        self._write(ticket, expect, action="submit", attempt_ended=ended is not None)
+        lines = [f"submitted {ticket.id} -> {self._location(ticket.id)} (review)"]
+        lines.extend(self._ending_lines(ended))
+        return succeeded(lines=lines, data=self._lifecycle_data(ticket, ended))
+
+    def accept(self, ticket, agent: str, message: Optional[str] = None):
+        """Close a ticket that is in review: the reviewer's counterpart to `submit`.
+
+        Only work actually awaiting review can be accepted, and the note is attributed
+        to the *accepting* agent, because the record is about who approved the work. The
+        cascade is the close cascade: whatever attempt was still live ends, its claims
+        are released, and the evidence stays."""
+        if ticket.status != "review":
+            raise TicketError(
+                f"ticket {ticket.id} is not in review (status: {ticket.status}); only a ticket "
+                "awaiting review can be accepted (use 'arbite close' to close one)"
+            )
+        detail = f": {message}" if message else "."
+        ended, unresolved = self._close_work(
+            ticket, actor=agent, note=(agent, f"Accepted{detail}")
+        )
+        lines = [f"accepted {ticket.id} -> {self._location(ticket.id)}"]
+        lines.extend(self._closed_lines(ended))
+        lines.extend(self._pending_lines(unresolved))
+        lines.append(self._manifest_line(ticket.id))
+        return succeeded(lines=lines, data=self._manifest_data(ticket, ended))
+
+    def _close_work(self, ticket, *, actor: Optional[str], note=None) -> tuple:
+        """The close cascade: reconcile, end, release, and write the ticket closed.
+
+        One place, because `close`, `submit` (with review disabled) and `accept` differ
+        only in the note and the line they print -- the record and the ownership they
+        leave behind have to be identical."""
+        with self.store.operation_lock():
+            unresolved = recovery.reconcile(self.store, self.app.project_root)
+            ended = self.end_attempt(
+                ticket, state=STATE_FINISHED, outcome="closed", actor=actor
+            )
+            expect = Expect(status=ticket.status, assignee=ticket.assignee)
+            if note is not None:
+                schema.append_note(ticket, note[0], note[1])
+            ticket.closed = schema.now()
+            ticket.updated = ticket.closed
+            ticket.status = "closed"
+            self._write(ticket, expect, action="close", attempt_ended=ended is not None)
+        return ended, unresolved
+
+    # ------------------------------------------------------------------
+    # Ending an attempt
+    # ------------------------------------------------------------------
 
     def end_attempt(
         self,
@@ -527,37 +703,100 @@ class TicketLifecycle:
         outcome: str,
         handoff: Optional[str] = None,
         actor: Optional[str] = None,
-    ) -> Optional[WorkAttempt]:
-        """End the ticket's active attempt, if it has one, and record the event.
+        release_reason: Optional[str] = None,
+    ) -> Optional[EndedAttempt]:
+        """End the ticket's active attempt, releasing its file claims with it.
 
-        The optimistic write is what makes two commands that end the same attempt
-        serial: one wins, the other is told (outcome 5) that the record moved, rather
-        than both writing a state the history then contradicts."""
+        The two halves commit together, and that is the point: an attempt that is no
+        longer active while its claims still reserve their paths is exactly the state
+        `doctor` reports as an orphaned claim, and splitting the write would leave that
+        state in place for as long as the second commit took -- permanently if the
+        process died between them. The optimistic revision check on the attempt record
+        is what makes two commands that end the same attempt serial: one wins, the other
+        is told (outcome 5) that the record moved, rather than both writing a state the
+        history then contradicts.
+
+        The store's operation lock is held across the commit so this cannot land between
+        a file operation's verification and its bytes: either that operation finished
+        first, or it is refused for an attempt that is no longer current."""
         active = self.active_attempt(ticket.id)
         if active is None:
             return None
+        now = utc_now()
         ended = replace(
             active,
             state=state,
             outcome=outcome,
             handoff=handoff if handoff is not None else active.handoff,
-            ended=utc_now(),
-            last_activity=utc_now(),
+            ended=now,
+            last_activity=now,
         )
-        revision = self.store.revision("attempt", active.id)
-        with self.store.transaction() as txn:
-            txn.replace_record(ended, expect_revision=revision)
-            txn.append_event(
-                ATTEMPT_ENDED,
-                "attempt",
-                subject=ended.id,
-                result=state,
-                ticket_id=ticket.id,
-                attempt_id=ended.id,
-                actor=actor,
-                payload={"outcome": outcome, "handoff": handoff or ""},
+        reason = release_reason or f"released with attempt {active.id} ({outcome})"
+        with self.store.operation_lock():
+            revision = self.store.revision("attempt", active.id)
+            claims = self._active_claims(active.id)
+            expectations = {
+                claim.id: self.store.revision("claim", claim.id) for claim in claims
+            }
+            with self.store.transaction() as txn:
+                txn.replace_record(ended, expect_revision=revision)
+                txn.append_event(
+                    ATTEMPT_ENDED,
+                    "attempt",
+                    subject=ended.id,
+                    result=state,
+                    ticket_id=ticket.id,
+                    attempt_id=ended.id,
+                    actor=actor,
+                    payload={
+                        "outcome": outcome,
+                        "handoff": handoff or "",
+                        "claims_released": len(claims),
+                    },
+                )
+                released = self._release_claims(txn, claims, expectations, reason, actor)
+        return EndedAttempt(ended, tuple(released))
+
+    def _active_claims(self, attempt_id: str) -> list:
+        """The paths an attempt still holds, in canonical path order.
+
+        Canonical order because that is the order every claim report prints, so a
+        cascade's rows and `arbite file claims` list the same paths the same way."""
+        return sorted(
+            (claim for claim in self.store.active_claims() if claim.held_by(attempt_id)),
+            key=lambda claim: claim.path,
+        )
+
+    def _release_claims(self, txn, claims, expectations, reason: str, actor) -> list:
+        """Release `claims` inside the caller's transaction, keeping them as history.
+
+        A released claim is kept rather than deleted (the plan's "release events are
+        kept after active ownership is removed"), and the release appends the same
+        `release.file` event an explicit `arbite file release` does, so the stream does
+        not distinguish a cascade from a hand-back except by its reason."""
+        released = []
+        at = utc_now()
+        for claim in claims:
+            released_claim = replace(
+                claim, state=CLAIM_RELEASED, released=at, release_reason=reason
             )
-        return ended
+            txn.replace_record(released_claim, expect_revision=expectations[claim.id])
+            txn.append_event(
+                RELEASE_FILE,
+                "claim",
+                subject=claim.path,
+                result="released",
+                ticket_id=claim.ticket_id,
+                attempt_id=claim.attempt_id,
+                actor=actor,
+                payload={
+                    "generation": claim.generation,
+                    "version": claim.observed_version,
+                    "reason": reason,
+                },
+            )
+            released.append(released_claim)
+        return released
 
     # ------------------------------------------------------------------
     # Guards for the generic setters
@@ -566,10 +805,12 @@ class TicketLifecycle:
     def guard_status_change(self, ticket, new_status: str) -> None:
         """Refuse a status change that would strand an active attempt.
 
-        Only the statuses whose lifecycle command exists are refused, and each
-        refusal names that command. A status the attempt survives (`in_progress`
-        kept, `review` awaiting the cascade slice) is left alone rather than blocked
-        behind a command that does not exist yet."""
+        Only the statuses whose lifecycle command exists are refused, and the refusal
+        names that command, so a setter routes the caller to the transition instead of
+        leaving an attempt behind. The statuses the attempt *survives* are left alone:
+        asking for the status a ticket already has writes nothing, and `in_progress`
+        without an attempt is the legacy state `attempt adopt` migrates -- not a
+        transition a setter can use to bypass one."""
         active = self.active_attempt(ticket.id)
         if active is None or new_status == ticket.status:
             return
@@ -610,6 +851,42 @@ class TicketLifecycle:
             f"{REFUSAL_INDENT}use {takeover}{hand_back} to hand it back",
             [f"{takeover}{hand_back}"],
         )
+
+    def guard_delete(self, ticket) -> None:
+        """Refuse deleting a ticket that still owns live work or live paths (LC3).
+
+        Deleting removes the ticket a receipt, a claim and an event all point at, so
+        doing it while an attempt is working -- or while a path is still reserved by
+        one -- would leave evidence nobody can act on and ownership nobody can release.
+        The refusal names the two commands that make the delete honest instead: hand
+        the work back first, or close the ticket and keep the record."""
+        active = self.active_attempt(ticket.id)
+        held = [claim for claim in self.store.active_claims() if claim.ticket_id == ticket.id]
+        if active is None and not held:
+            return
+        if active is not None:
+            count = len(held)
+            noun = "file claim" if count == 1 else "file claims"
+            what = f"an active attempt ({active.id}) with {count} {noun}"
+            hand_back = f"arbite release {ticket.id} --agent {active.worker_id}"
+        else:
+            count = len(held)
+            noun = "active file claim" if count == 1 else "active file claims"
+            holders = ", ".join(sorted({claim.attempt_id for claim in held}))
+            what = f"{count} {noun} ({holders})"
+            hand_back = None
+        keep = f"arbite close {ticket.id}"
+        spoken = (
+            f"'{hand_back}' then delete, or '{keep}' to keep the record"
+            if hand_back
+            else f"'{keep}' to keep the record"
+        )
+        failure = TicketError(
+            f"{ticket.id} has {what}; delete would discard change history"
+        )
+        failure.next_actions = tuple([*([hand_back] if hand_back else []), keep])
+        failure.text_hint = f"next: {spoken}"
+        raise failure
 
     # ------------------------------------------------------------------
     # Internals
@@ -780,9 +1057,12 @@ class TicketLifecycle:
         serialisation this rule needs, because the attempt is what a second claimant
         would collide with.
 
-        With `revoke_reason`, whatever is active is revoked as `interrupted` first:
-        that is a takeover, and the reason is kept with the attempt it ended as well
-        as in the revocation event."""
+        With `revoke_reason`, whatever is active is revoked as `interrupted` first, and
+        the claims that attempt still held are released in the same commit: that is a
+        takeover, and its reason is kept with the attempt it ended, with each released
+        claim and in the revocation event. Releasing them here rather than afterwards is
+        what stops a takeover from leaving the very orphaned claims `doctor` reports --
+        work that no live attempt can use, reserving paths nobody can take."""
         stored = self.store.active_attempts(ticket.id)
         revoked = []
         with self.store.transaction() as txn:
@@ -804,6 +1084,10 @@ class TicketLifecycle:
                     ended=now,
                     last_activity=now,
                 )
+                claims = self._active_claims(other.id)
+                expectations = {
+                    claim.id: self.store.revision("claim", claim.id) for claim in claims
+                }
                 txn.replace_record(ended, expect_revision=self.store.revision("attempt", other.id))
                 txn.append_event(
                     ATTEMPT_REVOKED,
@@ -813,9 +1097,20 @@ class TicketLifecycle:
                     ticket_id=ticket.id,
                     attempt_id=ended.id,
                     actor=agent,
-                    payload={"generation": ended.generation, "reason": revoke_reason},
+                    payload={
+                        "generation": ended.generation,
+                        "reason": revoke_reason,
+                        "claims_released": len(claims),
+                    },
                 )
-                revoked.append(ended)
+                released = self._release_claims(
+                    txn,
+                    claims,
+                    expectations,
+                    f"released with attempt {ended.id} (taken over by {agent})",
+                    agent,
+                )
+                revoked.append(EndedAttempt(ended, tuple(released)))
             attempt = WorkAttempt(
                 id=self._new_attempt_id(),
                 ticket_id=ticket.id,
@@ -948,62 +1243,273 @@ class TicketLifecycle:
         taken_from: Optional[str] = None,
         reopened: Sequence = (),
     ):
-        """What `claim` reports: the ticket, the attempt, and what the caller does next."""
+        """What `claim` reports: the ticket, the attempt, and what the caller does next.
+
+        A takeover reports three facts the next worker needs and could not recover
+        later: the generation it revoked, that the revoked attempt's file ownership was
+        released with it, and that whatever bytes that attempt wrote are still on disk.
+        What is then genuinely new is the attempt, so that line carries only its
+        generation (CL7) -- the ticket and the workspace were already stated above, and
+        the frozen block ends there: a takeover hands back the attempt id and no
+        instruction, because which of the freed paths the new attempt works on is
+        exactly the decision it was taken over to make."""
         takeover = f" (taken over from {taken_from})" if taken_from else ""
         lines = [
             f"claimed {ticket.id} for {agent} -> {self._location(ticket.id)}{takeover}"
         ]
         for ended in revoked:
-            lines.append(
-                f"revoked: attempt {ended.id} generation {ended.generation} (reason recorded)"
-            )
+            lines.append(self._revoked_line(ended))
+            if ended.released:
+                lines.append(self._released_line(ended.released))
         for dependency in reopened:
             lines.append(
                 f"note: {dependency.id} was reopened while this claim was being "
                 "recorded, so the attempt is flagged as depending on it "
                 "(see 'arbite events'); nothing was undone"
             )
-        label = "new attempt" if revoked else "attempt"
-        lines.append(
-            f"{label}: {attempt.id} (generation {attempt.generation}, ticket {ticket.id}, "
-            f"workspace {attempt.workspace_id})"
-        )
+        if revoked:
+            lines.append(f"new attempt: {attempt.id} (generation {attempt.generation})")
+        else:
+            lines.append(
+                f"attempt: {attempt.id} (generation {attempt.generation}, ticket {ticket.id}, "
+                f"workspace {attempt.workspace_id})"
+            )
+        data = {
+            **ticket.to_dict(self._location(ticket.id)),
+            "attempt": attempt_payload(attempt),
+        }
+        if revoked:
+            data["revoked"] = [
+                {
+                    **attempt_payload(ended.attempt),
+                    "released": [claim.path for claim in ended.released],
+                }
+                for ended in revoked
+            ]
+        if revoked:
+            return succeeded(lines=lines, data=data)
         return succeeded(
             lines=lines,
-            data={
-                **ticket.to_dict(self._location(ticket.id)),
-                "attempt": attempt_payload(attempt),
-                **(
-                    {"revoked": [attempt_payload(ended) for ended in revoked]}
-                    if revoked
-                    else {}
-                ),
-            },
+            data=data,
             next_actions=[self.file_hint(ticket.id, attempt.id)],
             text_hint=self.file_hint_text(ticket.id, attempt.id),
         )
 
-    def _ending_lines(self, ended: Optional[WorkAttempt]) -> list:
-        """The lines an ended attempt adds: what stopped, and that bytes remain.
+    # ------------------------------------------------------------------
+    # What an ending reports
+    # ------------------------------------------------------------------
 
-        The claim-and-receipt cascade (tic-e9ed) extends the first line with the
-        file claims it releases; the bytes-remain line is already true here, because
-        an attempt ends without anyone undoing what it wrote."""
+    def _ended_line(self, ended: EndedAttempt) -> str:
+        """`ended attempt <id>`, with what the cascade released (LC1, LC2).
+
+        The parenthetical is the release when there was one and the state the attempt
+        ended in when there was not: an attempt that held nothing has no release to
+        report, and how it stopped is then the fact the caller is left with. A single
+        released path is named inline, which is the shape the frozen LC2 receipt prints;
+        several are listed as rows below the line."""
+        head = f"ended attempt {ended.attempt.id}"
+        count = len(ended.released)
+        if not count:
+            return f"{head} ({ended.attempt.state})"
+        noun = "file claim" if count == 1 else "file claims"
+        if count == 1:
+            return f"{head} ({count} {noun} released): {ended.released[0].path} is free"
+        return f"{head} ({count} {noun} released):"
+
+    def _ending_lines(self, ended: Optional[EndedAttempt]) -> list:
+        """The lines an ending attempt adds: what stopped, what it released, what stays.
+
+        The bytes-remain line is a fact rather than a warning: an attempt ends without
+        anyone undoing what it wrote, so the next worker has to read the current bytes
+        instead of assuming either version."""
         if ended is None:
             return []
+        lines = [self._ended_line(ended)]
+        if len(ended.released) > 1:
+            lines.extend(self._released_rows(ended.released))
+        lines.append("partial work is left on disk and visible; the next worker must re-read it")
+        return lines
+
+    def _closed_lines(self, ended: Optional[EndedAttempt]) -> list:
+        """A closure's cascade: the attempt that ended and the paths it released (LC1).
+
+        No bytes-remain line here: a closed ticket's next reader is not a worker who
+        will write the file again, and the manifest line below is what says the work and
+        its evidence are retained."""
+        if ended is None:
+            return []
+        lines = [self._ended_line(ended)]
+        if len(ended.released) > 1:
+            lines.extend(self._released_rows(ended.released))
+        return lines
+
+    def _revoked_line(self, ended: EndedAttempt) -> str:
+        """One revoked attempt, and whether the cascade released its claims with it (CL7)."""
+        line = (
+            f"revoked: attempt {ended.attempt.id} generation {ended.attempt.generation} "
+            "(reason recorded)"
+        )
+        count = len(ended.released)
+        if count:
+            noun = "file claim" if count == 1 else "file claims"
+            verb = "was" if count == 1 else "were"
+            line += f"; its {count} {noun} {verb} released"
+        return line
+
+    def _released_line(self, released) -> str:
+        """The paths a takeover released, and whether anything was written under them.
+
+        The list is what the next worker has to re-read, and the summary separates
+        "there is partial work here" from "nothing was written", because those are
+        different situations to walk into."""
+        paths = ", ".join(claim.path for claim in released)
+        return f"released: {paths} ({self._moved_summary(released)})"
+
+    def _released_rows(self, released) -> list:
+        """One row per released path: the path, that it is free, and what it leaves."""
+        entries = self._released_report(released)
+        width = max(len(entry["claim"].path) for entry in entries) + RELEASED_COLUMN_GAP
         return [
-            f"ended attempt {ended.id} ({ended.state})",
-            "partial work is left on disk and visible; the next worker must re-read it",
+            f"  {entry['claim'].path.ljust(width)}free ({entry['phrase']})" for entry in entries
         ]
 
-    def _lifecycle_data(self, ticket, ended: Optional[WorkAttempt]) -> dict:
+    def _moved_summary(self, released) -> str:
+        """What changed under a cascade's released claims, counted (CL7).
+
+        `created`/`modified`/`removed` are the three ways bytes can have moved, and the
+        absence of all three is stated rather than left to be inferred."""
+        counts = {"created": 0, "modified": 0, "removed": 0}
+        for entry in self._released_report(released):
+            if entry["change"] in counts:
+                counts[entry["change"]] += 1
+        parts = [
+            f"{count} file{'' if count == 1 else 's'} {change}"
+            for change, count in counts.items()
+            if count
+        ]
+        if not parts:
+            return "nothing was written under these claims"
+        return "partial work left on disk: " + ", ".join(parts)
+
+    def _released_report(self, released) -> list:
+        """What is at each released path now, and whether it moved since the claim.
+
+        `last written by` is *checked* rather than assumed: a path counts as this
+        ticket's work only when the bytes on disk are exactly the after version some
+        successful receipt of that ticket recorded. Anything else says that the bytes
+        differ without a receipt, instead of attributing them to somebody who may not
+        have written them.
+
+        The comparison is against the *set* of versions the ticket's receipts recorded,
+        not the last one seen: receipts come back in record-id order, which says nothing
+        about when they happened, and the bytes on disk are what the retry or the edit
+        after them left."""
+        written = {}
+        for receipt in self.store.receipts():
+            if receipt.ticket_id != released[0].ticket_id or receipt.result != RECEIPT_SUCCEEDED:
+                continue
+            for path, digest in (receipt.after or {}).items():
+                written.setdefault(path, set()).add(digest)
+        entries = []
+        for claim in released:
+            current = probe(self.app.project_root, claim.path).digest
+            if current == ABSENT:
+                if claim.observed_version == ABSENT:
+                    change = "unchanged"
+                    phrase = "nothing to keep; the path was absent under the claim"
+                elif ABSENT in written.get(claim.path, ()):
+                    change, phrase = "removed", f"removed by {claim.ticket_id}"
+                else:
+                    change, phrase = "removed", "removed since the claim"
+            elif current == claim.observed_version:
+                change = "unchanged"
+                phrase = f"unchanged since claim, {short_digest(current)}"
+            elif current in written.get(claim.path, ()):
+                change = "modified"
+                phrase = f"last written by {claim.ticket_id}, {short_digest(current)}"
+            elif claim.observed_version == ABSENT:
+                change = "created"
+                phrase = f"created since the claim, {short_digest(current)}"
+            else:
+                change = "modified"
+                phrase = (
+                    f"changed since the claim, not by this ticket, {short_digest(current)}"
+                )
+            entries.append({"claim": claim, "change": change, "phrase": phrase})
+        return entries
+
+    def _manifest_line(self, ticket_id: str) -> str:
+        """The receipt manifest a closure leaves: how much evidence is retained, and the
+        command that reads it (tic-7c42's `arbite changes`)."""
+        count = self._manifest_size(ticket_id)
+        if not count:
+            return "receipts: no operations were recorded for this ticket"
+        noun = "operation" if count == 1 else "operations"
+        return f"receipts: {count} {noun} retained ('arbite changes {ticket_id}')"
+
+    def _manifest_size(self, ticket_id: str) -> int:
+        """The finalized receipts recorded for a ticket.
+
+        A pending receipt is one somebody still has to reconcile, and it is reported
+        separately (`_pending_lines`); counting it here as retained evidence would
+        overstate what can be read today."""
+        return sum(
+            1
+            for receipt in self.store.receipts()
+            if receipt.ticket_id == ticket_id and not receipt.is_pending
+        )
+
+    def _pending_lines(self, unresolved) -> list:
+        """The operations a closure could not finish, one line each.
+
+        `recovery.reconcile` writes what is unambiguous and leaves drift alone; an
+        operation it left pending is named here rather than silently absorbed into the
+        closure, because its receipt is the only record of what was intended."""
+        return [
+            f"pending: {judged.receipt.id} staged a {judged.receipt.kind} of "
+            f"{', '.join(judged.receipt.paths)} and is still unresolved "
+            "('arbite doctor' reports it)"
+            for judged in unresolved
+            if judged.finalised is None
+        ]
+
+    def _manifest_data(self, ticket, ended: Optional[EndedAttempt]) -> dict:
+        """A closure's JSON: the lifecycle facts, plus how much evidence is retained."""
         return {
+            **self._lifecycle_data(ticket, ended),
+            "receipts": self._manifest_size(ticket.id),
+        }
+
+    def _unblock_command(self, ticket_id: str, worker: Optional[str]) -> str:
+        """The command that resumes a blocked ticket, naming its current owner when that
+        is known: `unblock` returns the ticket to the worker the ended attempt belonged
+        to, so the agent id in the hint is the one the command will need."""
+        return (
+            f"arbite unblock {ticket_id} --agent {worker}"
+            if worker
+            else f"arbite unblock {ticket_id}"
+        )
+
+    def _unblock_hint(self, ticket_id: str, worker: Optional[str]) -> str:
+        """That command as the frozen LC2 sentence, with what follows from it."""
+        return (
+            f"next: '{self._unblock_command(ticket_id, worker)}' when the blocker clears "
+            "(a fresh attempt is created)"
+        )
+
+    def _lifecycle_data(self, ticket, ended: Optional[EndedAttempt]) -> dict:
+        """The JSON facts every ending command publishes: the ticket, the attempt it
+        ended, and the paths the cascade released."""
+        data = {
             "id": ticket.id,
             "status": ticket.status,
             "assignee": ticket.assignee,
             "path": self._location(ticket.id),
-            "attempt": attempt_payload(ended) if ended is not None else None,
+            "attempt": attempt_payload(ended.attempt) if ended is not None else None,
         }
+        if ended is not None:
+            data["released"] = [claim.path for claim in ended.released]
+        return data
 
     def _write(self, ticket, expect, *, action: str, attempt_ended: bool) -> None:
         """Write the ticket, and say honestly when the write lost its race.

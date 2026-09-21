@@ -1644,12 +1644,16 @@ def cmd_unblock(args):
     message = f"Unblocked: {args.reason}" if args.reason else "Unblocked."
     if reason:
         message = f"{message.rstrip('.')} (was blocked by: {reason})."
+    # Back to whoever was working it if it is still assigned, otherwise open. Sending a
+    # ticket back to the open pool while an attempt still holds it would strand that
+    # attempt (`set status open` is refused for the same reason), so the guard runs first
+    # -- it is a no-op for the resume path, where the new attempt is created below.
+    dest = "in_progress" if (t.assignee and not args.open) else "open"
+    _lifecycle(args, sink).guard_status_change(t, dest)
     expect = _expect_from(t)
     schema.append_note(t, args.agent, message)
     t.blocked_by = None
     t.updated = schema.now()
-    # Back to whoever was working it if it is still assigned, otherwise open.
-    dest = "in_progress" if (t.assignee and not args.open) else "open"
     t.status = dest
     if dest == "open":
         t.assignee = None
@@ -1917,14 +1921,17 @@ def cmd_scratch_clear(args):
 
 
 def cmd_close(args):
+    """Close a ticket: the end of its work as well as of its status.
+
+    Closing is a cascade rather than a field change, because the attempt that was
+    working the ticket and the file claims it holds have to end with it -- otherwise the
+    ticket is closed while ownership of paths and the "who is doing this" record are
+    still live, which is exactly the orphaned state `doctor` reports. The operation
+    (and the lock it takes while it runs) is in `coordination.lifecycle`, so this stays
+    one call and the exit code comes from the result."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
-    expect = _expect_from(t)
-    t.closed = schema.now()
-    t.updated = t.closed
-    t.status = "closed"
-    sink.update(t, expect=expect)
-    print(f"closed {t.id} -> {sink.location(t.id)}")
+    _emit_result(_lifecycle(args, sink).close(t), False)
 
 
 def cmd_reopen(args):
@@ -1936,8 +1943,10 @@ def cmd_reopen(args):
     --reason is enforced by argparse, so a bare `arbite reopen <id>` fails before
     any of this runs, and the note it writes is exactly 'Reopened: <reason>.'
     (timestamped and attributed like every other automatic note). The ticket goes
-    back to open with its closed date and any block reason cleared; a ticket that
-    is already open is still refused.
+    back to open with its closed date, block reason and assignee cleared -- it is
+    back in the unclaimed pool, because the attempt that held it ends here and
+    nothing should still name a worker for it. A ticket that is already open is
+    still refused.
 
     An attempt that is still active ends here, and old attempts and file claims stay
     historical: nothing is re-acquired. Reopening a *prerequisite* is the interesting
@@ -1974,27 +1983,14 @@ def cmd_submit(args):
     the same shape release/shelve/unblock use. A ticket that is already closed is
     refused: there is nothing left to hand off. Everything else is accepted, because
     submit is a hand-off rather than a validator -- `arbite doctor` is what reports a
-    ticket sitting in a status its history does not explain."""
+    ticket sitting in a status its history does not explain.
+
+    Submitting stops the *work*, so the attempt ends and its file claims are released
+    either way; where the ticket lands (review, or closed when review is disabled) is
+    the policy `coordination.lifecycle` reads from the project's committed flag."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
-    if t.status == "closed":
-        raise TicketError(f"ticket {t.id} is already closed")
-    expect = _expect_from(t)
-    detail = f": {args.message}" if args.message else "."
-    if config.review_enabled():
-        t.status = "review"
-        t.updated = schema.now()
-        schema.append_note(t, args.agent, f"Submitted for review{detail}")
-        landed = "review"
-    else:
-        # Exactly what `arbite close` writes: same dating, same status, same move.
-        t.closed = schema.now()
-        t.updated = t.closed
-        t.status = "closed"
-        schema.append_note(t, args.agent, f"Submitted; closed (review disabled){detail}")
-        landed = "closed"
-    sink.update(t, expect=expect)
-    print(f"submitted {t.id} -> {sink.location(t.id)} ({landed})")
+    _emit_result(_lifecycle(args, sink).submit(t, args.agent, args.message), False)
 
 
 def cmd_accept(args):
@@ -2006,22 +2002,11 @@ def cmd_accept(args):
     "reviewed and accepted" and "never reviewed at all". The note is attributed to
     the **accepting** agent (`--agent`), not to the ticket's assignee: the point of
     the record is who approved the work. `--message` is appended as detail, and
-    `closed` is dated the same way `arbite close` dates it."""
+    `closed` is dated the same way `arbite close` dates it -- through the same close
+    cascade, so an attempt still live on a review ticket ends here too."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
-    if t.status != "review":
-        raise TicketError(
-            f"ticket {t.id} is not in review (status: {t.status}); only a ticket "
-            "awaiting review can be accepted (use 'arbite close' to close one)"
-        )
-    expect = _expect_from(t)
-    detail = f": {args.message}" if args.message else "."
-    schema.append_note(t, args.agent, f"Accepted{detail}")
-    t.closed = schema.now()
-    t.updated = t.closed
-    t.status = "closed"
-    sink.update(t, expect=expect)
-    print(f"accepted {t.id} -> {sink.location(t.id)}")
+    _emit_result(_lifecycle(args, sink).accept(t, args.agent, args.message), False)
 
 
 def cmd_shelve(args):
@@ -2041,11 +2026,16 @@ def cmd_unshelve(args):
     paused) is moved back into the open status so it shows up in
     `arbite list next` again. The assignee and any stale block reason are
     cleared -- an unshelved ticket is back in the unclaimed pool, not reserved
-    for whoever parked it."""
+    for whoever parked it.
+
+    Shelving ends the attempt, so there is normally nothing live here; the
+    lifecycle guard is what keeps that true for a ticket a stored state left with
+    an attempt still active, by naming the command that hands it back."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     if t.status != "shelved":
         raise TicketError(f"ticket {t.id} is not shelved (status: {t.status})")
+    _lifecycle(args, sink).guard_status_change(t, "open")
     expect = _expect_from(t)
     t.updated = schema.now()
     message = "Unshelved." if not args.reason else f"Unshelved: {args.reason}"
@@ -2510,9 +2500,17 @@ def cmd_delete(args):
     'Deleted by <agent>' note immediately before removing the ticket so the last
     state a ticket ever had is attributable. The receipt (id, title, location,
     note) is printed and included in --json, so a calling agent can log what it
-    destroyed even though the ticket is gone."""
+    destroyed even though the ticket is gone.
+
+    --force is not a way past live work: a ticket an attempt is still holding, or
+    whose paths a claim still reserves, is refused with the commands that make the
+    delete honest (LC3), because deleting it would leave receipts and events
+    pointing at a ticket nobody can read. That check runs before the --force one:
+    a delete that cannot happen either way is better answered with the reason it
+    cannot."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
+    _lifecycle(args, sink).guard_delete(t)
     if not args.force:
         raise TicketError(
             f"refusing to delete {t.id} without --force (deletion is irreversible; "
@@ -3806,8 +3804,13 @@ def build_parser():
     p_close = sub.add_parser(
         "close",
         help="close a ticket",
-        description="Set status to closed, stamp the closed date, and update updated. A file "
-        "sink additionally archives the ticket by close month; other sinks just record it.",
+        description="Close a ticket: end the work and the ticket together. Any attempt still "
+        "working it is ended, the file claims it holds are released, its unfinished operations "
+        "are reconciled, and the receipts it produced are kept -- then the ticket is set to "
+        "closed, the closed date is stamped, and updated follows. After it succeeds no worker "
+        "can change a file under the old attempt: their tokens name an attempt that is no "
+        "longer current. A file sink additionally archives the ticket by close month; other "
+        "sinks just record it.",
     )
     p_close.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
     _sink_flag(p_close)

@@ -9,8 +9,10 @@ the holder really dies.
 Usage: python3 tests/coordination_worker.py <operation> <project-dir> <sink-kind> [args...]
 
 Exit codes: 0 for the operation (printing what it did), 3 for a lost revision race,
-9 for a deliberate death at a commit boundary. `claim` and `claim-crash` run the real
-CLI in this process, so what races (or dies) is the acquisition an agent would run.
+9 for a deliberate death at a commit boundary. `claim`, `claim-crash`, `file-claim`,
+`file-write`, `close` and `close-crash` run the real CLI in this process, so what
+races (or dies) is the command an agent would run -- including the lifecycle cascade,
+whose attempt-and-claims commit is what `close-crash` interrupts.
 """
 
 from __future__ import annotations
@@ -34,6 +36,9 @@ from arbite.sinks import SinkSpec, build_sink  # noqa: E402
 RACE_CLAIM = "clm-abcd"
 CRASH_CLAIM = "clm-c0de"
 WORKSPACE = "ws-0000"
+
+#: The payload `file-write` sends: the name the parent stages inside `.arbite/scratch/`.
+PAYLOAD = "payload.py"
 
 
 def open_store(project: str, kind: str):
@@ -216,6 +221,49 @@ def op_claim(store, ticket: str, agent: str, go: str) -> int:
     return _run_cli(["arbite", "claim", ticket, "--agent", agent])
 
 
+def op_file_write(store, ticket: str, attempt: str, token: str, path: str, go: str) -> int:
+    """Write one claimed path through the real CLI, released by a shared starting gun.
+
+    Nothing here re-implements the mutation: what races the close is `arbite file
+    write`, which is exactly the command an agent runs, and the parent asserts on the
+    documented serial outcomes rather than on a schedule."""
+    if not _wait_for_go(go):
+        return 4
+    return _run_cli(
+        [
+            "arbite", "file", "write", path,
+            "--ticket", ticket,
+            "--attempt", attempt,
+            "--read-token", token,
+            "--input", PAYLOAD,
+        ]
+    )
+
+
+def op_close(store, ticket: str, go: str) -> int:
+    """Close one ticket through the real CLI, released by a shared starting gun."""
+    if not _wait_for_go(go):
+        return 4
+    return _run_cli(["arbite", "close", ticket])
+
+
+def op_close_crash(store, ticket: str, boundary: str) -> int:
+    """Close one ticket through the real CLI, and die at a commit boundary.
+
+    The hook goes on the *class*, so the store the CLI opens for itself is the one that
+    dies, and what the parent inspects is a store the cascade was interrupted in: the
+    attempt it ended and every claim it released are one commit, so either both landed
+    or neither did."""
+    from arbite.coordination.store import CoordinationStore
+
+    def die_at(*names) -> None:
+        if names and names[-1] == boundary:
+            os._exit(9)
+
+    CoordinationStore.crash_hook = staticmethod(die_at)
+    return _run_cli(["arbite", "close", ticket])
+
+
 def op_claim_crash(store, ticket: str, agent: str, boundary: str) -> int:
     """Claim one ticket through the real CLI, and die at a commit boundary.
 
@@ -284,6 +332,9 @@ OPERATIONS = {
     "claim": (op_claim, 3),
     "claim-crash": (op_claim_crash, 3),
     "file-claim": (op_file_claim, 4),
+    "file-write": (op_file_write, 5),
+    "close": (op_close, 2),
+    "close-crash": (op_close_crash, 2),
 }
 
 

@@ -7,6 +7,12 @@ revoked, and -- with real processes -- that two claims for one ticket produce on
 (RC1's target) and that a claim racing a reopened prerequisite always leaves a record of
 the conflict.
 
+The cascade is here for the same reason: an ending command releases the paths the
+attempt held, and the evidence for that is a store whose active claims always name a
+live attempt -- checked with real processes for a close that races a write and for a
+process killed inside the cascade's own commit, where the attempt and its claims land
+together or not at all.
+
 Two storage domains and no shared lock is the constraint the race tests are shaped by:
 the ticket store's compare-and-swap decides a *claim* race, and the coordination store's
 commit decides which of a claim and a reopen saw the other. So every assertion here is
@@ -23,21 +29,27 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import cascade_state as cascade
 import examples
 import lifecycle_state as state
+import writes_state
 from arbite.coordination import lifecycle as lifecycle_module
 from arbite.coordination.app import CoordinationApp
 from arbite.coordination.lifecycle import TicketLifecycle
 from arbite.coordination.store import open_coordination_store
 from arbite.errors import Busy, StaleGeneration
+from arbite.sinks import Expect
 
 SINK_KINDS = ("file", "sqlite")
 WORKER = Path(__file__).resolve().parent / "coordination_worker.py"
 REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+#: The payload name `coordination_worker.file-write` sends, staged in `.arbite/scratch/`.
+PAYLOAD = "payload.py"
 
 
 def lifecycle_for(project, kind: str = "file"):
@@ -623,6 +635,13 @@ def test_the_generic_setters_route_to_the_lifecycle_or_refuse(tmp_path, kind):
     assert released.returncode == 1
     assert "arbite release tic-cf9f --agent claude.opus.001" in released.stderr
 
+    # `review` is a lifecycle transition too: submitting ends the work, so a setter that
+    # reaches it by hand routes there rather than stranding the attempt (tic-e9ed added
+    # this entry once `submit` owned the transition).
+    submitting = examples.run_cli(project, "set", "tic-cf9f", "status", "review", sink=kind)
+    assert submitting.returncode == 1
+    assert "arbite submit tic-cf9f --agent claude.opus.001" in submitting.stderr
+
     moved = examples.run_cli(project, "set", "tic-cf9f", "assignee", "claude.haiku.003", sink=kind)
     assert moved.returncode == 1
     assert "arbite claim tic-cf9f --agent claude.haiku.003 --force --reason" in moved.stderr
@@ -899,3 +918,301 @@ def test_a_claim_racing_a_reopen_always_leaves_a_record(tmp_path):
         assert "is not ready" in claim_stderr, claim_stderr
         assert active == [], "a refused claim leaves no attempt"
         assert state.sink_for(project).get("tic-9b57").status == "open"
+
+
+# --- the cascade: ending work also releases what it owns --------------------
+
+
+def claimed_path(project, ticket_id: str, kind: str = "file", path: str = "src/arbite/schema.py"):
+    """Claim a ticket and one of its paths through the real commands, and return the attempt.
+
+    Both facts the cascade acts on are produced the way an agent produces them -- the
+    attempt by `arbite claim`, the ownership by `arbite file claim` -- because a fixture
+    that wrote those records itself could pass while the commands disagreed with it."""
+    target = project / path
+    if not target.exists():
+        # A claim on a path whose directories are missing is refused, because arbite does
+        # not create directories for a mutation: the file has to exist for the cascade to
+        # have something real to release.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# a file the cascade releases\n", encoding="utf-8")
+    claimed = examples.run_cli(
+        project, "claim", ticket_id, "--agent", "claude.opus.001", sink=kind
+    )
+    assert claimed.returncode == 0, claimed.stderr
+    attempt = store_for(project, kind).active_attempts(ticket_id)[0]
+    owner = examples.run_cli(
+        project,
+        "file",
+        "claim",
+        path,
+        "--ticket",
+        ticket_id,
+        "--attempt",
+        attempt.id,
+        sink=kind,
+    )
+    assert owner.returncode == 0, owner.stderr
+    return attempt
+
+
+@pytest.mark.parametrize("kind", SINK_KINDS)
+def test_every_ending_command_releases_the_paths_it_stops(tmp_path, kind):
+    """Release, block, shelve and close each end the attempt *and* the paths it held, on
+    either coordination backend, with the state that says why it stopped. None of them
+    leaves a path reserved by an attempt that is over -- the orphaned claim `doctor`
+    reports, which the cascade is what removes."""
+    project = state.initialise(tmp_path, kind)
+    endings = (
+        ("release", ("--agent", "claude.opus.001"), "released", "open"),
+        ("block", ("--reason", "waiting on upstream"), "interrupted", "blocked"),
+        ("shelve", ("--reason", "later"), "released", "shelved"),
+        ("close", (), "finished", "closed"),
+    )
+    for index, (command, options, ended_as, landed) in enumerate(endings):
+        ticket = f"tic-a{index:03x}"
+        state.claimable(project, ticket, kind)
+        attempt = claimed_path(project, ticket, kind)
+
+        proc = examples.run_cli(project, command, ticket, *options, sink=kind)
+
+        assert proc.returncode == 0, proc.stderr
+        store = store_for(project, kind)
+        assert store.active_claims() == [], f"'{command}' left a path reserved"
+        assert store.active_attempts(ticket) == []
+        ended = store.get_attempt(attempt.id)
+        assert (ended.state, ended.ended is not None) == (ended_as, True)
+        assert state.sink_for(project, kind).get(ticket).status == landed
+        assert store.record_problems() == [], f"'{command}' left a finding behind"
+
+    doctor = examples.run_cli(project, "doctor", "--json", sink=kind)
+    assert doctor.returncode == 0, doctor.stdout
+    assert json.loads(doctor.stdout)["problems"] == []
+
+
+@pytest.mark.parametrize("kind", SINK_KINDS)
+def test_submit_and_accept_end_the_work_they_finish(tmp_path, kind):
+    """Submitting stops the work wherever it lands: in review the attempt ends and the
+    paths are released while the assignee stays (the reviewer sends it back to them), and
+    with review disabled the same cascade closes the ticket. Accepting is the close
+    cascade again, applied to what a reviewer approved."""
+    project = state.initialise(tmp_path, kind)
+    in_review = "tic-c0de"
+    state.claimable(project, in_review, kind)
+    attempt = claimed_path(project, in_review, kind)
+
+    submitted = examples.run_cli(
+        project, "submit", in_review, "--agent", "claude.opus.001", sink=kind
+    )
+
+    assert submitted.returncode == 0, submitted.stderr
+    store = store_for(project, kind)
+    assert store.active_attempts(in_review) == []
+    assert store.active_claims() == [], "submit releases what the attempt held"
+    assert store.get_attempt(attempt.id).outcome == "submitted"
+    ticket = state.sink_for(project, kind).get(in_review)
+    assert (ticket.status, ticket.assignee) == ("review", "claude.opus.001")
+    assert json.loads(
+        examples.run_cli(project, "doctor", "--json", sink=kind).stdout
+    )["problems"] == []
+
+    accepting = "tic-acce"
+    state.claimable(project, accepting, kind)
+    accepted_attempt = claimed_path(project, accepting, kind)
+    # A review ticket whose attempt is still live is a stored state no command produces
+    # (a submit whose cascade was interrupted, or a ticket put in review by hand), so it
+    # is written straight to the sink -- and accepting it has to end that work too.
+    sink = state.sink_for(project, kind)
+    stored = sink.get(accepting)
+    sink.update(
+        replace(stored, status="review"),
+        expect=Expect(status=stored.status, assignee=stored.assignee),
+    )
+
+    accepted = examples.run_cli(
+        project, "accept", accepting, "--agent", "claude.haiku.004", sink=kind
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    store = store_for(project, kind)
+    assert store.active_attempts(accepting) == []
+    assert store.active_claims() == [], "accept releases what the attempt held"
+    assert store.get_attempt(accepted_attempt.id).outcome == "closed"
+    assert store.record_problems() == []
+
+
+@pytest.mark.parametrize(
+    "ending",
+    (
+        ("release", ("--agent", "claude.opus.001")),
+        ("block", ("--reason", "waiting on upstream")),
+        ("shelve", ("--reason", "later")),
+        ("close", ()),
+    ),
+)
+def test_a_released_worker_cannot_write_under_its_old_token(tmp_path, ending):
+    """The other half of "no observer mutates under an old token": the worker a cascade
+    stopped is refused, and refused before any byte changes -- because the attempt it
+    names is no longer current, whatever state the ticket ended in. The token is real (a
+    read taken under the claim) and the payload is staged, so only the cascade can be
+    what stops it, and the refusal records nothing (`arbite changes` in tic-7c42 reads
+    what is there)."""
+    command, options = ending
+    project = cascade.holder_world(tmp_path)
+    token = writes_state.read_token(
+        project, cascade.SCHEMA_PY, cascade.HOLDER_TICKET, cascade.HOLDER
+    )
+    before = (project / cascade.SCHEMA_PY).read_bytes()
+    ended = examples.run_cli(project, command, cascade.HOLDER_TICKET, *options)
+    assert ended.returncode == 0, ended.stderr
+
+    writes_state.staged(
+        project, cascade.PAYLOAD, cascade.schema_text(cascade.RECEIPTS + 1)
+    )
+    refused = examples.run_cli(
+        project,
+        "file",
+        "write",
+        cascade.SCHEMA_PY,
+        "--ticket",
+        cascade.HOLDER_TICKET,
+        "--attempt",
+        cascade.HOLDER,
+        "--read-token",
+        token,
+        "--input",
+        cascade.PAYLOAD,
+    )
+
+    assert refused.returncode == 5, refused.stdout + refused.stderr
+    assert "no longer current" in refused.stderr
+    assert "no bytes were changed" in refused.stderr
+    assert (project / cascade.SCHEMA_PY).read_bytes() == before
+    assert (
+        cascade.retained_receipts(project, cascade.HOLDER_TICKET) == cascade.RECEIPTS
+    ), "a refusal records no receipt"
+    assert store_for(project).active_claims() == []
+
+
+def test_a_close_racing_a_write_has_one_serial_outcome(tmp_path):
+    """The race the operation lock exists for, with two real processes and a starting gun.
+
+    Both orders are legal and this asserts the invariants of either. If the write landed
+    first, its bytes *and* its receipt are on disk, and the close then released the path
+    it had written. If the close landed first, the write is refused for an attempt that
+    is no longer current and changed nothing. What is never legal is a write that lands
+    after the close succeeded, or a refusal that changed a byte."""
+    project = cascade.holder_world(tmp_path)
+    token = writes_state.read_token(
+        project, cascade.SCHEMA_PY, cascade.HOLDER_TICKET, cascade.HOLDER
+    )
+    original = (project / cascade.SCHEMA_PY).read_bytes()
+    replacement = cascade.schema_text(cascade.RECEIPTS + 1)
+    writes_state.staged(project, PAYLOAD, replacement)
+
+    gun = project / "go"
+    environment = dict(os.environ, PYTHONPATH=str(REPO_SRC))
+    writer = subprocess.Popen(
+        [
+            sys.executable, str(WORKER), "file-write", str(project), "file",
+            cascade.HOLDER_TICKET, cascade.HOLDER, token, cascade.SCHEMA_PY, str(gun),
+        ],
+        cwd=str(project),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    closer = subprocess.Popen(
+        [
+            sys.executable, str(WORKER), "close", str(project), "file",
+            cascade.HOLDER_TICKET, str(gun),
+        ],
+        cwd=str(project),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.4)  # both commands are inside their critical sections before either writes
+    gun.write_text("go", encoding="utf-8")
+    write_out, write_err, write_code = (*writer.communicate(timeout=90), writer.returncode)
+    close_out, close_err, close_code = (*closer.communicate(timeout=90), closer.returncode)
+
+    assert close_code == 0, close_err
+    assert write_code in (0, 5), (write_out, write_err)
+    if write_code == 0:
+        assert (project / cascade.SCHEMA_PY).read_text(encoding="utf-8") == replacement
+        assert (
+            cascade.retained_receipts(project, cascade.HOLDER_TICKET) == cascade.RECEIPTS + 1
+        ), "the write that landed left its receipt, and the close kept it"
+    else:
+        assert "no bytes were changed" in write_err, write_err
+        assert (project / cascade.SCHEMA_PY).read_bytes() == original
+        assert cascade.retained_receipts(project, cascade.HOLDER_TICKET) == cascade.RECEIPTS
+
+    store = store_for(project)
+    assert state.sink_for(project).get(cascade.HOLDER_TICKET).status == "closed"
+    assert store.active_claims() == []
+    assert store.active_attempts(cascade.HOLDER_TICKET) == []
+    assert store.record_problems() == []
+
+
+@pytest.mark.parametrize("boundary", ("commit_staged", "commit_applied"))
+def test_a_cascade_killed_mid_commit_leaves_no_orphaned_claim(tmp_path, boundary):
+    """A real `os._exit` inside the cascade's commit, and what the store says afterwards.
+
+    The attempt the cascade ends and every claim it releases are one commit, so a death
+    inside it leaves either both (the attempt is terminal and its paths are released) or
+    neither (the attempt is active and still holds them) -- and never an attempt that is
+    over with its paths still reserved, which is the `orphaned_claim` finding C04 flagged.
+    The ticket can then be closed cleanly: the next write to the store finishes the
+    interrupted unit, and the close that follows is an ordinary one."""
+    project = cascade.holder_world(tmp_path)
+    opened = (project / cascade.SCHEMA_PY).read_bytes()
+
+    died = subprocess.run(
+        [
+            sys.executable, str(WORKER), "close-crash", str(project), "file",
+            cascade.HOLDER_TICKET, boundary,
+        ],
+        cwd=str(project),
+        env=dict(os.environ, PYTHONPATH=str(REPO_SRC)),
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert died.returncode == 9, (died.stdout, died.stderr)
+
+    store = store_for(project)
+    ended = not store.get_attempt(cascade.HOLDER).is_active
+    released = [claim for claim in store.records("claim") if not claim.is_active]
+    assert (ended and len(released) == 2) or (not ended and not released), (
+        "the attempt and the claims it held land together or not at all"
+    )
+    live = {attempt.id for attempt in store.active_attempts()}
+    for claim in store.active_claims():
+        assert claim.attempt_id in live, "an active claim always names a live attempt"
+
+    # `write` is the store's own "next relevant operation": it finishes the commit the
+    # dead process left, which is what clears that unit's journal.
+    made_whole = run_worker("write", str(project), "file")
+    assert made_whole.returncode == 0, made_whole.stderr
+    assert store_for(project).record_problems() == [], "the interrupted unit was finished"
+    assert not [p for p in store_for(project).record_problems() if p.kind == "orphaned_claim"]
+
+    closed = examples.run_cli(project, "close", cascade.HOLDER_TICKET)
+    if closed.returncode != 0:
+        # The unit the dead process left is replayed by the next commit, which can make
+        # that very commit stale: the caller re-reads and runs the command again.
+        closed = examples.run_cli(project, "close", cascade.HOLDER_TICKET)
+    assert closed.returncode == 0, closed.stdout + closed.stderr
+
+    final = store_for(project)
+    assert final.active_claims() == []
+    assert final.active_attempts(cascade.HOLDER_TICKET) == []
+    assert final.record_problems() == []
+    assert (project / cascade.SCHEMA_PY).read_bytes() == opened, "no bytes were touched"
+    doctor = examples.run_cli(project, "doctor", "--json")
+    assert doctor.returncode == 0, doctor.stdout
+    assert json.loads(doctor.stdout)["problems"] == []

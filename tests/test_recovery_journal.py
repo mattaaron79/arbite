@@ -465,9 +465,13 @@ def test_RC2_a_close_racing_a_write_changes_nothing(file_scene):
     stale in the same words, the caller is told no bytes were changed, and the file still
     holds the version it held before. Either the write completes first and the close records
     it, or the close wins and no observer mutates under the old token -- never both.
-    """
+
+    The attempt is read *before* the close since tic-e9ed: closing now ends the attempt
+    (that is the cascade), so it is no longer there to read afterwards, and the refusal it
+    produces names the attempt the caller presented rather than one that is still active."""
     scene = file_scene
     request = scene.replace(PATH, AFTER)
+    attempt = scene.attempt
     closed = examples.run_cli(scene.project, "close", TICKET)
     assert closed.returncode == 0, closed.stderr
 
@@ -479,11 +483,13 @@ def test_RC2_a_close_racing_a_write_changes_nothing(file_scene):
     # the same outcome (5, nothing changed) with a different repair -- reopen or stop --
     # so it carries its own key and its own sentence rather than the re-read hint.
     assert failure.value.reason == "attempt_not_current"
-    assert f"attempt {scene.attempt.id} generation {scene.attempt.generation} is no longer " in message
+    assert f"attempt {attempt.id} generation {attempt.generation} is no longer " in message
     assert "current" in message
     assert f"({TICKET} closed" in message
     assert "no bytes were changed" in message
     assert scene.bytes(PATH) == BEFORE
+    assert scene.store.active_attempts(TICKET) == [], "the close ended the attempt"
+    assert scene.store.active_claims() == [], "and released the paths it held"
 
 
 def test_a_remove_and_a_rename_round_trip_through_the_receipt(tmp_path):

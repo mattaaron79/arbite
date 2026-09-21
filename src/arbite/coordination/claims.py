@@ -40,7 +40,7 @@ from dataclasses import replace
 from typing import Optional
 
 from ..errors import CoordinationError, NotOwner, Stale
-from .lifecycle import TicketLifecycle, local_time
+from .lifecycle import CLAIM_FILE, RELEASE_FILE, TicketLifecycle, local_time
 from .paths import canonical_relative, probe
 from .records import (
     ABSENT,
@@ -52,12 +52,13 @@ from .records import (
 )
 from .results import BUSY, EMPTY, OK, OUTCOME_LABELS, OperationResult, Outcome, succeeded
 
-#: The event kinds a claim change appends. `claim.file` is the kind the frozen event
-#: stream uses for an acquisition (`arbite events --tail`, EV2), and its subject is the
-#: path with the generation as the one-line result -- so "who acquired what, at which
-#: generation" is answerable from the stream after the claim record itself has moved on.
-CLAIM_FILE = "claim.file"
-RELEASE_FILE = "release.file"
+#: The event kinds a claim change appends (`CLAIM_FILE` on acquisition, `RELEASE_FILE`
+#: on release) live with the lifecycle, because the cascade that ends an attempt appends
+#: the same `release.file` this module's explicit release does: one literal, one kind, so
+#: `arbite events` cannot show two spellings of "this path changed hands". `claim.file` is
+#: the kind the frozen event stream uses for an acquisition (`arbite events --tail`, EV2),
+#: and its subject is the path with the generation as the one-line result -- so "who
+#: acquired what, at which generation" is answerable after the claim record has moved on.
 
 #: The `file claims` table's columns, pinned by the frozen FC6 transcript: each text
 #: column is as wide as its widest value plus one gap, and the generation is a *number*
