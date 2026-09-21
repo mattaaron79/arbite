@@ -382,6 +382,7 @@ The package exposes the console script `arbite`, providing:
 | Storage | `migrate --to <sink> [--from] [--overwrite] [--prune] [--dry-run]` |
 | Reporting | `status` (per-status counts + total; `--epic`/`--domain`/`--tier`/`--assignee`, `--json`), `progress` (live epics and their full membership, in dependency order; `--epic`, `--json`) |
 | Workspace | `workspace` — `show` reports the derived workspace, the store in use and the coordination backend's counts |
+| Payloads | `scratch` — `list` shows what `file write --input` / `file edit --edits` would read, `clear NAME...` and `clear --all` delete it |
 | Events | `events` — the coordination event stream, one line per event (`--after` / `--tail`, `--include-reads`); `--follow` is refused |
 | Integrity | `doctor [--fix]` |
 | Destruction | `delete <id> --force` |
@@ -413,10 +414,14 @@ Key behaviours worth calling out:
   stages the new bytes, its retry is deduplicated by operation id, and a kill at any
   boundary leaves either the recorded before or the recorded after version on disk, which
   `arbite doctor` reports (and, for the unambiguous cases, `--fix` finalises or discards)
-  rather than guessing at. What does **not** exist yet are the *commands* that change
-  bytes — reads, writes, edits, renames and removes are tic-1c4f, tic-60c7 and tic-74e2 —
-  so no command changes a file's bytes through arbite today. `arbite doctor --json` names
-  the coordination backend and its counts.
+  rather than guessing at. The **file proxy is live** as well: `arbite file
+  list|search|read|claim|release|claims|write|edit|remove|rename` are commands today
+  (tic-1c4f, tic-60c7, tic-74e2), and the payloads a write or an edit reads are managed
+  by `arbite scratch list|clear` (tic-95c0). What does **not** exist yet are the views
+  and the cascades: `arbite receipt` and `arbite changes` (tic-7c42), the lifecycle
+  cascade (tic-e9ed), migrations and export (tic-008f), and `arbite cmd` passthrough
+  (tic-faae, tic-42d2). `arbite doctor --json` names the coordination backend and its
+  counts.
 - **`arbite file claim|release|claims`** is file ownership. `claim PATH... --ticket T
   --attempt A` acquires exclusive writer ownership of whole files for one work attempt,
   all-or-nothing and in canonical path order, so two agents can never each end up
@@ -430,8 +435,24 @@ Key behaviours worth calling out:
   (with `--all`, the released history too). Paths are validated against the project
   root: escapes, `.git` metadata, arbite's own runtime state and configuration,
   directories, special files, symlinked components and hard-linked targets are refused
-  before anything is written. Reads, writes, edits, renames and removes are not here
-  yet.
+  before anything is written. `list`, `search`, `read`, `write`, `edit`, `remove` and
+  `rename` are the rest of the proxy (tic-1c4f, tic-60c7, tic-74e2), and a write or an
+  edit reads its payload from the project's own `arbite scratch` area or from stdin —
+  never from a path outside the project.
+- **`arbite scratch list|clear`** is payload transport, not content. `.arbite/scratch/`
+  is the project-local area that `file write --input NAME` and `file edit --edits NAME`
+  read, `-` reads the payload from stdin instead, and a payload path outside the project
+  is refused — so no documented command ever needs one. `list` shows each payload's
+  name, size, age and the agent the store can name as working most recently (arbite did
+  not perform the write that staged the file, so that is attribution rather than
+  authorship), and exits `2` when nothing is staged. `clear NAME...` and `clear --all`
+  delete payloads deliberately, and they are the only thing that does; the `doctor`
+  report carries the area's count and size as a note that points at `clear --all` and
+  never changes its exit code. A payload is never a ticket, never claimable, and
+  excluded from discovery, scanning and the doctor's stray-file findings. A successful
+  write or edit consumes its payload because the bytes now live in the receipt, `--keep`
+  opts out, and a refusal that stopped on the bytes keeps the payload and says so, so a
+  recoverable error never forces a model to re-emit a file.
 - **`arbite events [--after CURSOR | --tail N] [--include-reads]`** reads the event
   stream in cursor order, one line per event: the cursor, kind, subject, operation,
   ticket/attempt, actor, local time and outcome, then the cursor to resume from. It
@@ -836,7 +857,8 @@ selected, the CLI says so on stderr rather than quietly reading the other store.
 These exist because agents, not humans, are the main callers:
 
 - **`--json`** on `list`, `list next`, `list raw`, `ref list`, `fetch`, `show`,
-  `search`, `deps`, `doctor`, `sink`, `status`, `progress`, `workspace show`, `events`
+  `search`, `deps`, `doctor`, `sink`, `status`, `progress`, `workspace show`, `events`,
+  `scratch list`, `scratch clear`
   and `delete` emits machine-readable
   output whose field names match the frontmatter. The human table format is explicitly *not* a
   stable interface. The `path` field is whatever the sink calls a ticket's location

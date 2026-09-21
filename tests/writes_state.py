@@ -114,9 +114,9 @@ def store_for(project: Path, sink_kind: str = "file"):
 def staged(project: Path, name: str, data) -> Path:
     """Write one scratch payload, returning its path.
 
-    Straight to disk, because a payload is transport a *caller* stages: no arbite command
-    produces one yet (tic-95c0 owns `scratch list|clear`), and the mutation commands read
-    whatever is in the area."""
+    Straight to disk, because a payload is transport a *caller* stages: `arbite scratch
+    list|clear` reports and clears the area, but no arbite command produces a payload, and
+    the mutation commands read whatever is in it."""
     payload = project / ".arbite" / "scratch" / name
     payload.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(data, bytes):

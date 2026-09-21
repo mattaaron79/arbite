@@ -735,20 +735,20 @@ def test_the_json_payload_carries_the_facts_the_text_prints(tmp_path, project_ki
 def test_help_text_names_only_commands_that_exist():
     """A refusal may not point at a command this build does not have: the hints here name
     `file read`, `file claim`, `file write`, `file edit`, `file remove`, `file rename`,
-    `reopen` and `close`, all of which exist.
+    `scratch list`, `scratch clear`, `reopen` and `close`, all of which exist.
 
     The second list is the same rule in the other direction, and it is why the check is worth
     having: a slice that has not landed must not be named by anything output today. tic-74e2
-    landed `file remove` and `file rename`, so they moved to the first list; scratch transport
-    (tic-95c0) and the receipt and change views (tic-7c42) are still ahead."""
+    landed `file remove` and `file rename`, tic-95c0 landed `scratch list|clear`, so they
+    moved to the first list; the receipt and change views (tic-7c42) are still ahead."""
     from arbite import cli
 
     for path in (
         "file read", "file claim", "file write", "file edit", "file remove", "file rename",
-        "reopen", "close",
+        "scratch list", "scratch clear", "reopen", "close",
     ):
         assert cli.knows_command(path), path
-    for path in ("scratch list", "scratch clear", "receipt", "changes"):
+    for path in ("receipt", "changes"):
         assert not cli.knows_command(path), f"{path} is another slice's"
 
 

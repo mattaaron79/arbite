@@ -6,13 +6,18 @@ exit code, output -- with ids, times and paths normalised on both sides (`exampl
 which is the property the two backends exist for. `recovery_state.py` builds the damaged store
 the transcripts describe.
 
-**Two documented deviations, and only two.** Both are sentences the frozen blocks print that
-name a command another slice owns: `arbite scratch clear --all` (tic-95c0) and
-`arbite receipt`/`arbite changes` (tic-7c42). Arbite may not name a command it does not have --
-that is a capability claimed on paper only -- so the report prints an honest sentence without
-the command until it exists, and the test accepts the frozen text the moment it can be printed
-(`_either_frozen_or_deferred`). Everything else -- every problem line, the wrapping and its
-indentation, the fixed/not-fixed markers, the counts, the exit code -- is asserted exactly.
+**One documented deviation.** The frozen blocks print a sentence naming a command another
+slice owns: `arbite receipt`/`arbite changes` (tic-7c42). Arbite may not name a command it does
+not have -- that is a capability claimed on paper only -- so the report prints an honest
+sentence without the command until it exists, and the test accepts the frozen text the moment
+it can be printed (`_either_frozen_or_deferred`). Everything else -- every problem line, the
+wrapping and its indentation, the fixed/not-fixed markers, the counts, the exit code -- is
+asserted exactly.
+
+The scratch sentence *was* the second deviation and is one no longer: tic-95c0 landed
+`arbite scratch clear`, so the note now prints the frozen two-line guidance naming it (see
+`test_the_scratch_guidance_prints_because_its_command_exists`). That is what the capability
+probe was for -- the frozen text comes back by itself, and only the deviation list shrinks.
 """
 
 from __future__ import annotations
@@ -35,15 +40,15 @@ SINKS = ("file", "sqlite")
 #: The test accepts either form, so nothing has to be remembered when that slice lands.
 DEFERRED = (
     (
-        "note: .arbite/scratch/ holds 3 files (12.4 KiB) -- transport left behind, expected "
-        "after an\n      interrupted run; clear with 'arbite scratch clear --all'",
-        "note: .arbite/scratch/ holds 3 files (12.4 KiB) -- transport left behind, expected "
-        "after an interrupted run",
-    ),
-    (
         "inspect 'arbite receipt op-4f19' and 'arbite changes tic-1a75'",
         "inspect the receipt op-4f19 and the ticket's recorded change history",
     ),
+)
+
+#: DR1's scratch note, frozen and with the guidance tic-95c0's command now makes printable.
+SCRATCH_NOTE = (
+    "note: .arbite/scratch/ holds 3 files (12.4 KiB) -- transport left behind, expected "
+    "after an\n      interrupted run; clear with 'arbite scratch clear --all'"
 )
 
 
@@ -71,11 +76,14 @@ def _either_frozen_or_deferred(actual: str, frozen: str, project) -> None:
 
 def _only_deferred(scenario):
     """The transcript with the deferred sentences replaced, for a byte-exact comparison of
-    everything else (ids, times and paths normalised by the harness, as usual)."""
+    everything else (ids, times and paths normalised by the harness, as usual).
+
+    A block that now holds none is compared verbatim -- DR1's scratch sentence stopped being
+    a deviation when tic-95c0 landed the command it names, and the remaining one appears only
+    in DR2's block -- so this rewrites what it finds and asserts nothing about finding it."""
     text = scenario.stdout
     for frozen_text, deferred in DEFERRED:
         text = text.replace(frozen_text, deferred)
-    assert text != scenario.stdout, f"{scenario.id} no longer contains a deferred sentence"
     return replace(scenario, stdout=text)
 
 
@@ -89,6 +97,12 @@ def test_DR1_problems_found(damaged_project):
     scenario = examples.scenario_block("DR1")
     stdout = examples.assert_scenario(_only_deferred(scenario), damaged_project)
 
+    # The scratch note is the frozen one, guidance sentence and all, because `arbite scratch
+    # clear` exists now (tic-95c0) -- and it is a note, not a problem, so the exit code is
+    # the findings' business alone.
+    assert examples.normalise(SCRATCH_NOTE, damaged_project) in examples.normalise(
+        stdout, damaged_project
+    )
     # ...and the deferred sentence is the only reason it is not the frozen block verbatim.
     _either_frozen_or_deferred(stdout, scenario.stdout, damaged_project)
     assert scenario.exit_code == 3
@@ -190,17 +204,21 @@ def test_the_doctor_report_names_no_command_this_arbite_does_not_have(damaged_pr
             )
 
 
-def test_the_deferred_sentences_are_absent_because_their_commands_are(damaged_project):
-    """The deviation is a *consequence* of the capability probe, not a hard-coded choice: with
-    no `arbite scratch clear` and no `arbite receipt`, the report prints the honest shorter
-    sentences; the moment those commands exist, the frozen ones come back by themselves."""
-    assert not cli.knows_command("scratch clear"), "tic-95c0 has landed: update the deviations"
+def test_the_scratch_guidance_prints_because_its_command_exists(damaged_project):
+    """A deviation is a *consequence* of the capability probe, not a hard-coded choice.
+
+    tic-95c0 landed `arbite scratch clear`, so the DR1/DR2 notes print the frozen guidance
+    naming it -- and the remaining `arbite receipt`/`arbite changes` sentences stay absent
+    while tic-7c42 owns those commands, which is the rule the deviation list exists for."""
+    assert cli.knows_command("scratch list") and cli.knows_command("scratch clear")
     assert not cli.knows_command("receipt"), "tic-7c42 has landed: update the deviations"
     assert not cli.knows_command("changes"), "tic-7c42 has landed: update the deviations"
 
-    proc = examples.run_cli(damaged_project, "doctor", "--fix")
+    # `doctor` rather than `--fix`: the guidance sentence belongs to the report that is only
+    # *judging* the store, while a repair run names the files it left alone (DR1 vs DR2).
+    proc = examples.run_cli(damaged_project, "doctor")
 
-    assert "arbite scratch clear" not in proc.stdout
+    assert "clear with 'arbite scratch clear --all'" in proc.stdout
     assert "arbite receipt" not in proc.stdout and "arbite changes" not in proc.stdout
 
 

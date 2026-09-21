@@ -24,6 +24,14 @@ Every refusal happens before the engine stages anything, and says **no bytes wer
 changed**: a caller that cannot tell "refused" from "may have written half a file" is
 never put in that position.
 
+The payload's fate is part of the report. Success consumes it and says so, unless the
+caller asked for it to survive (`--keep`, which says that instead). A refusal that stopped
+on the *bytes* -- the file moved after the read -- keeps it too, and says so, because
+re-applying the same change is exactly what the hint offers (SC2, WR2). A refusal raised
+before the bytes are judged stays silent about it -- the payload is still there, but
+"re-apply" is not the step that refusal asks for -- and a payload that arrived on stdin has
+no staged copy to report at all.
+
 The few helpers a *command* needs rather than the engine -- the canonical mutation target,
 the probe a mutation records for itself under its claim, the artifact read-back a report
 renders, and the refusals for a change that names no ticket, no attempt or no read token --
@@ -37,7 +45,7 @@ from __future__ import annotations
 import difflib
 from pathlib import Path
 
-from ..errors import PathRefused
+from ..errors import PathRefused, Stale
 from . import edits as edit_batches
 from .mutations import (
     FileMutations,
@@ -84,7 +92,8 @@ CREATED_BINARY = "created, {size} (binary)"
 #: cannot render as text says so instead, because a receipt holding a byte payload is not
 #: a text diff and printing it as one would claim evidence the receipt does not hold. A
 #: creation has no before to name, and an edit names only the generation, which is the
-#: shape the frozen ED1 and ED3 blocks print.
+#: shape the frozen ED1 and ED3 blocks print. An edit folds the payload's fate into its
+#: receipt line, because that is where the frozen ED1 block prints it.
 RECEIPT_WRITE = "receipt: {receipt} · {ticket} / {attempt} · claim gen {generation} · before {before}"
 RECEIPT_BINARY = (
     "receipt: {receipt} · {ticket} / {attempt} · claim gen {generation} "
@@ -93,6 +102,7 @@ RECEIPT_BINARY = (
 RECEIPT_CREATED = "receipt: {receipt} · {ticket} / {attempt} · claim gen {generation}"
 RECEIPT_EDITED = "receipt: {receipt} · claim gen {generation}"
 RECEIPT_PAYLOAD = " · payload {display} consumed and cleared"
+RECEIPT_PAYLOAD_KEPT = " · payload {display} kept (--keep)"
 
 #: The success hint a whole-file text write ends with: the token it just spent, and the
 #: command that takes a fresh one. A caller that wants to keep going needs exactly that,
@@ -209,6 +219,42 @@ def require_read_token(path, ticket_id, attempt_id) -> None:
     )
 
 
+def kept_refusal(exc: Stale, payload: Payload, keep: bool) -> Stale:
+    """The refusal of a mutation that stopped on the bytes, with the payload it left (SC2).
+
+    "You read one version and the file is another" is the one stale refusal whose next step
+    is to re-apply the *same* change, so it is the one that says the staged bytes are still
+    there: a caller that finds it must not re-emit a file the refusal just preserved. A
+    piped payload has no copy to keep, and `--keep` already asked for the copy to survive --
+    neither has anything to add. Every other refusal (a spent token, an attempt that is no
+    longer current) stops before the bytes are judged, and the frozen WR3 and WR5 blocks
+    print no payload line there."""
+    if keep or payload.from_stdin or getattr(exc, "reason", None) != REASON_STALE_VERSION:
+        return exc
+    return Stale(
+        f"{exc}\n{payload.kept_note()}",
+        reason=exc.reason,
+        next_actions=exc.next_actions,
+        text_hint=exc.text_hint,
+    )
+
+
+def require_a_file_to_keep(keep: bool, payload: Payload, flag: str) -> None:
+    """Refuse `--keep` for a payload that arrived on stdin.
+
+    `--keep` is the promise that a staged copy survives the mutation; a piped payload never
+    had one, so accepting the flag would accept a request arbite cannot honour."""
+    if not keep or not payload.from_stdin:
+        return
+    raise UsageRefused(
+        f"'{flag} -' reads the payload from stdin, which leaves no file for '--keep' to keep",
+        text_hint=(
+            f"next: drop '--keep', or stage the bytes in .arbite/scratch/ and name them "
+            f"with '{flag} NAME'"
+        ),
+    )
+
+
 def record_claim_probe(
     store, workspace_id, path, ticket_id, attempt_id, actor, claim_generation, digest
 ) -> ReadObservation:
@@ -276,18 +322,28 @@ class FileWrites:
         attempt_id: str,
         read_token: str,
         payload: Payload,
+        keep: bool = False,
     ) -> OperationResult:
         """Replace a path's bytes with the payload's, if the token still authorises it.
 
         Writing a path that does not exist is the *creation* case, and it needs the same
         two things: the claim, and a read (a probe, there) taken under it that found the
         path absent. Nothing else distinguishes it -- the evidence records `absent` as the
-        version the write replaced."""
+        version the write replaced.
+
+        `keep` is the caller's opt-out of consuming the payload: the bytes reach the file
+        and the receipt either way, and only the staged copy's fate changes."""
         path = mutation_target(raw_path, self.project_root)
         before = probe(self.project_root, path)
+        require_a_file_to_keep(keep, payload, "--input")
         token = self._write_token(path, ticket_id, attempt_id, read_token, before)
-        outcome = self._apply("write", path, ticket_id, attempt_id, token, before, payload.data)
-        return self._write_report(path, ticket_id, attempt_id, token, outcome, payload)
+        try:
+            outcome = self._apply(
+                "write", path, ticket_id, attempt_id, token, before, payload.data
+            )
+        except Stale as exc:
+            raise kept_refusal(exc, payload, keep) from None
+        return self._write_report(path, ticket_id, attempt_id, token, outcome, payload, keep)
 
     def _write_token(self, path, ticket_id, attempt_id, read_token, before):
         """The token this write presents, which a creation has to take for itself.
@@ -334,14 +390,17 @@ class FileWrites:
         return observation.id
 
     def _write_report(
-        self, path, ticket_id, attempt_id, read_token, outcome, payload
+        self, path, ticket_id, attempt_id, read_token, outcome, payload, keep=False
     ) -> OperationResult:
         """The frozen shape for a whole-file write, assembled from what was recorded."""
         receipt = outcome.receipt
         before, before_bytes = evidence(self.store, receipt.before[path])
         after, after_bytes = evidence(self.store, receipt.after[path])
         created = before.is_absent
-        binary = before.lines is None or after.lines is None
+        # A creation has no *before* to render, so only the new bytes decide whether the report
+        # describes lines or a size (SC3 creates a text file and prints `created, 84 lines`); a
+        # replacement is binary when either side of it is, since both are printed.
+        binary = after.lines is None or (not created and before.lines is None)
 
         if created:
             shape = (
@@ -394,12 +453,18 @@ class FileWrites:
                 )
             )
 
-        consumed = payload.consume()
-        if not created and not binary and consumed:
-            lines.append(payload.consume_note())
+        if keep:
+            # The caller asked for the staged copy to survive, so the report says it did:
+            # a kept payload nobody mentions would look like one this command forgot.
+            lines.append(payload.keep_note())
+            consumed = False
+        else:
+            consumed = payload.consume()
+            if not created and not binary and consumed:
+                lines.append(payload.consume_note())
 
         data = self._payload(
-            path, receipt, before, after, payload, read_token, consumed=consumed
+            path, receipt, before, after, payload, read_token, consumed=consumed, keep=keep
         )
         if created or binary:
             # Nothing to re-apply line by line, so no line-based continuation: the two
@@ -425,6 +490,7 @@ class FileWrites:
         attempt_id: str,
         read_token: str,
         payload: Payload,
+        keep: bool = False,
         flag: str = "--edits",
     ) -> OperationResult:
         """Apply an exact-substitution batch to a text file, or change nothing at all.
@@ -434,9 +500,13 @@ class FileWrites:
         refused as bad input, naming the lines the caller has to look at, and the engine
         is never reached. That ordering is what makes "no partial write" a property of the
         shape rather than a cleanup path -- the new text is assembled in memory and handed
-        over as one version, replaced once."""
+        over as one version, replaced once.
+
+        `keep` is the caller's opt-out of consuming the batch, exactly as it is for a
+        whole-file write."""
         path = mutation_target(raw_path, self.project_root)
         before = probe(self.project_root, path)
+        require_a_file_to_keep(keep, payload, flag)
         if before.is_absent:
             raise PathRefused(
                 f"no such path '{path}'; `file edit` changes text that exists",
@@ -462,15 +532,18 @@ class FileWrites:
         )
         after_bytes = batch.text.encode("utf-8")
 
-        outcome = self._apply(
-            "edit", path, ticket_id, attempt_id, read_token, before, after_bytes
-        )
+        try:
+            outcome = self._apply(
+                "edit", path, ticket_id, attempt_id, read_token, before, after_bytes
+            )
+        except Stale as exc:
+            raise kept_refusal(exc, payload, keep) from None
         return self._edit_report(
-            path, attempt_id, read_token, outcome, payload, batch, before
+            path, attempt_id, read_token, outcome, payload, batch, before, keep
         )
 
     def _edit_report(
-        self, path, attempt_id, read_token, outcome, payload, batch, before
+        self, path, attempt_id, read_token, outcome, payload, batch, before, keep=False
     ) -> OperationResult:
         """The frozen shape for an edit: the delta, one row per replacement, the receipt."""
         receipt = outcome.receipt
@@ -496,13 +569,17 @@ class FileWrites:
         receipt_line = RECEIPT_EDITED.format(
             receipt=receipt.id, generation=receipt.claim_generation
         )
-        consumed = payload.consume()
-        if consumed:
-            receipt_line += RECEIPT_PAYLOAD.format(display=payload.display)
+        if keep:
+            receipt_line += RECEIPT_PAYLOAD_KEPT.format(display=payload.display)
+            consumed = False
+        else:
+            consumed = payload.consume()
+            if consumed:
+                receipt_line += RECEIPT_PAYLOAD.format(display=payload.display)
         lines.append(receipt_line)
 
         data = self._payload(
-            path, receipt, before, after, payload, read_token, consumed=consumed
+            path, receipt, before, after, payload, read_token, consumed=consumed, keep=keep
         )
         data["edits"] = [_edit_data(edit) for edit in batch.applied]
         return succeeded(lines=lines, data=data)
@@ -556,13 +633,16 @@ class FileWrites:
         payload: Payload,
         token: str,
         consumed: bool = False,
+        keep: bool = False,
     ) -> dict:
         """The `--json` facts of a mutation: the same story the text tells.
 
         The token is the id the caller presented, and `spent_by` is the operation that
         used it -- the two halves of "one token authorises one mutation", which the store
-        holds and the report mirrors."""
-        return {
+        holds and the report mirrors. `keep` appears only when the caller asked for the
+        staged copy to survive, so the flag's own effect is branchable and a payload that
+        was consumed carries exactly the fields it always did."""
+        facts = {
             "path": path,
             "receipt": receipt.id,
             "ticket": receipt.ticket_id,
@@ -579,8 +659,10 @@ class FileWrites:
                 "name": payload.name,
                 "source": payload.display,
                 "consumed": consumed,
+                **({"keep": True} if keep else {}),
             },
         }
+        return facts
 
 
 def _stdin_shape(data: bytes) -> str:

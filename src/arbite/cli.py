@@ -351,10 +351,11 @@ def known_commands() -> set:
     """Every command path this parser defines, as `('command', 'command subcommand', ...)`.
 
     Output may only name commands that exist: `doctor --fix` tells a human what to run next,
-    and the receipt and change views it points at are tic-7c42's while scratch clearing is
-    tic-95c0's. Asking the parser -- rather than keeping a list here -- is what keeps those
-    sentences true in the build they are printed from, and lets them name the command the
-    moment the slice that owns it lands."""
+    and the receipt and change views it points at are tic-7c42's -- a slice that has not
+    landed must not be named by anything printed today. Asking the parser, rather than
+    keeping a list here, is what keeps those sentences true in the build they are printed
+    from: the scratch guidance appeared by itself when tic-95c0 landed `scratch clear`, and
+    the receipt sentences will do the same."""
     global _KNOWN_COMMANDS
     if _KNOWN_COMMANDS is None:
         _, choices = build_parser()
@@ -1788,7 +1789,9 @@ def cmd_file_write(args):
     path absent.
 
     Nothing here retries, waits or works around a refusal: a stale token, a foreign
-    claim and a generated path each change nothing and say exactly what to do next."""
+    claim and a generated path each change nothing and say exactly what to do next. The
+    payload is consumed on success unless `--keep` says otherwise, and a refusal that
+    stopped on the bytes reports the copy it left (`coordination.writes`)."""
     sink = _require_sink(args)
     _mutation_context(args)
     writes = _writes(args, sink)
@@ -1796,7 +1799,7 @@ def cmd_file_write(args):
         writes.app.arbite_dir, args.payload, "--input", sys.stdin.buffer
     )
     result = writes.write(
-        args.path, args.ticket, args.attempt, args.read_token, payload
+        args.path, args.ticket, args.attempt, args.read_token, payload, keep=args.keep
     )
     _emit_file_result(result, args.json)
 
@@ -1853,7 +1856,10 @@ def cmd_file_edit(args):
     `-` for stdin) and is matched against the version the token served: each edit has to
     select exactly one occurrence, may not overlap another, and a batch that fails
     anywhere is refused with the lines to look at and no bytes changed. The replacement
-    is assembled in memory and written once, which is what makes the guarantee structural."""
+    is assembled in memory and written once, which is what makes the guarantee structural.
+
+    The batch is consumed on success unless `--keep` says otherwise, exactly as a
+    whole-file write's payload is."""
     sink = _require_sink(args)
     _mutation_context(args)
     writes = _writes(args, sink)
@@ -1861,9 +1867,53 @@ def cmd_file_edit(args):
         writes.app.arbite_dir, args.payload, "--edits", sys.stdin.buffer
     )
     result = writes.edit(
-        args.path, args.ticket, args.attempt, args.read_token, payload
+        args.path, args.ticket, args.attempt, args.read_token, payload, keep=args.keep
     )
     _emit_file_result(result, args.json)
+
+
+def cmd_scratch_list(args):
+    """Report what is staged in the payload area, and nothing else.
+
+    Scratch is transport rather than content, so this is its only view: each payload's
+    name, size and age, and the agent the store can name as working most recently
+    (`coordination.scratch` says why that is attribution rather than authorship). An
+    empty area is exit 2 -- the answer a listing that matched nothing gives -- and a
+    leftover payload is never an error here, because keeping one is what a refusal is
+    supposed to do."""
+    sink = _require_sink(args)
+    app = _coordination_app(args, sink)
+    result = coordination_scratch.scratch_list(app.arbite_dir, app.store)
+    _emit_result(result, args.json)
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
+def cmd_scratch_clear(args):
+    """Delete staged payloads deliberately: the named ones, or all of them with `--all`.
+
+    This is the command the doctor note hands a human, so it is the only thing that
+    removes transport; nothing else deletes a payload. Nothing here consults a ticket, an
+    attempt or a claim, because scratch authorises nothing and therefore nothing
+    authorises clearing it either -- only a caller who meant to. A name that is not
+    staged, or one that points outside the area, is refused with the list that shows what
+    is really there."""
+    sink = _require_sink(args)
+    if args.all and args.names:
+        raise UsageRefused(
+            coordination_scratch.CLEAR_NOT_BOTH,
+            text_hint=coordination_scratch.STAGED_HINT,
+        )
+    if not args.all and not args.names:
+        raise UsageRefused(
+            coordination_scratch.CLEAR_NEEDS_TARGET,
+            text_hint=coordination_scratch.STAGED_HINT,
+        )
+    arbite_dir = config.find_project_root() / config.ARBITE_DIRNAME
+    result = coordination_scratch.scratch_clear(arbite_dir, args.names, all_=args.all)
+    _emit_result(result, args.json)
+    if result.exit_code:
+        sys.exit(result.exit_code)
 
 
 def cmd_close(args):
@@ -2757,7 +2807,9 @@ def build_parser():
         "deletes as receipt evidence, and `rename` holds both paths at one claim generation, "
         "records both, and replaces a destination that already exists only when `--expect-dest` "
         "names the version it is replacing. Neither ever touches a directory: arbite has no "
-        "recursive deletion and no mutation creates one.",
+        "recursive deletion and no mutation creates one. The payloads `write` and `edit` read "
+        "come from the project's own scratch area (`arbite scratch list`, `arbite scratch "
+        "clear NAME|--all`), or from stdin.",
     )
     file_sub = p_file.add_subparsers(
         dest="file_action", required=True, metavar="SUBCOMMAND"
@@ -2988,9 +3040,11 @@ def build_parser():
         "created, provided the read that found it absent was taken under the claim. The write "
         "reports the version it produced, the receipt that holds both versions as evidence, and "
         "the fresh read the token it just spent requires before another change. Success consumes "
-        "the scratch payload; a refusal leaves it in place. Removing and renaming are their own "
-        "commands: `arbite file remove` keeps the bytes it deletes, and `arbite file rename` "
-        "moves them between two paths this attempt holds.",
+        "the scratch payload unless `--keep` asks for it to stay, a refusal leaves it in place "
+        "(and says so when the refusal stopped on the bytes, so the change can be re-applied "
+        "without re-sending the file), and `arbite scratch list` shows what is staged. Removing "
+        "and renaming are their own commands: `arbite file remove` keeps the bytes it deletes, "
+        "and `arbite file rename` moves them between two paths this attempt holds.",
     )
     p_file_write.add_argument("path", metavar="PATH", help="the file to write, relative to the root")
     p_file_write.add_argument(
@@ -3015,6 +3069,11 @@ def build_parser():
         required=True,
         metavar="NAME|-",
         help="a payload name inside .arbite/scratch/, or '-' to read it from stdin",
+    )
+    p_file_write.add_argument(
+        "--keep",
+        action="store_true",
+        help="keep the staged payload instead of consuming it (a piped payload has none)",
     )
     _json_flag(p_file_write)
     _sink_flag(p_file_write)
@@ -3120,7 +3179,8 @@ def build_parser():
         "overlap, and the whole batch is applied in memory and written once -- so a batch that "
         "is ambiguous, absent or overlapping changes no bytes and names the lines to read. The "
         "line numbers in the report are the ones the caller read. The claim, attempt, token and "
-        "version checks are the write command's, and so are its exit codes.",
+        "version checks are the write command's, and so are its exit codes, its `--keep` and its "
+        "payload reporting.",
     )
     p_file_edit.add_argument("path", metavar="PATH", help="the text file to edit, relative to the root")
     p_file_edit.add_argument(
@@ -3144,9 +3204,78 @@ def build_parser():
         metavar="NAME|-",
         help="an edit batch inside .arbite/scratch/, or '-' to read it from stdin",
     )
+    p_file_edit.add_argument(
+        "--keep",
+        action="store_true",
+        help="keep the staged batch instead of consuming it (a piped batch has none)",
+    )
     _json_flag(p_file_edit)
     _sink_flag(p_file_edit)
     p_file_edit.set_defaults(func=cmd_file_edit)
+
+    p_scratch = sub.add_parser(
+        "scratch",
+        help="the payload area: what is staged for a write or an edit, and clearing it",
+        description="Scratch is the project-local payload area (`.arbite/scratch/`) that "
+        "`file write --input` and `file edit --edits` read from, and it is transport rather "
+        "than content: a payload authorises nothing, is never a ticket, is never claimable, "
+        "and is excluded from discovery, scanning and the doctor's stray-file findings "
+        "(the doctor report carries its file count and size as a note, which never changes "
+        "its exit code). `list` shows what is staged -- name, size, age and the agent the "
+        "store can name -- and exits 2 when nothing is staged. `clear NAME...` deletes the "
+        "named payloads and `clear --all` empties the area; clearing is deliberate, and it "
+        "is the only thing that removes transport. A successful write or edit consumes its "
+        "payload because the bytes now live in the receipt, `--keep` opts out, and a "
+        "refusal that stopped on the bytes leaves the payload there to re-apply (the "
+        "refusal says so).",
+    )
+    scratch_sub = p_scratch.add_subparsers(
+        dest="scratch_action", required=True, metavar="SUBCOMMAND"
+    )
+    _sink_flag(p_scratch)
+    p_scratch_list = scratch_sub.add_parser(
+        "list",
+        help="show the payloads staged in .arbite/scratch/ (exit 2 when there are none)",
+        description="List the payload files in `.arbite/scratch/` in name order: each "
+        "payload's name, size and age, and the agent the coordination store can name as "
+        "working most recently -- arbite did not perform the write that staged the file, so "
+        "that attribution is reported rather than claimed, and a store that names no "
+        "attempt says so. Nothing staged exits 2, and a leftover payload is never an error: "
+        "keeping one is what a failed mutation is supposed to do.",
+    )
+    p_scratch_list.add_argument(
+        "--json", action="store_true", help="emit the same facts as JSON"
+    )
+    _sink_flag(p_scratch_list)
+    p_scratch_list.set_defaults(func=cmd_scratch_list)
+
+    p_scratch_clear = scratch_sub.add_parser(
+        "clear",
+        help="delete staged payloads: the named ones, or the whole area with --all",
+        description="Delete payloads from `.arbite/scratch/`, deliberately: this is the "
+        "command the doctor note points at, and the only thing that removes transport. A "
+        "named clear prints a sentence per file and hands back `arbite scratch list`; "
+        "`--all` reports how many files and how many bytes it cleared. A name that is not "
+        "staged, or one that points outside the project, is refused with the list that "
+        "shows what is really there. No ticket, attempt or claim is consulted: scratch "
+        "authorises nothing, so nothing authorises clearing it either.",
+    )
+    p_scratch_clear.add_argument(
+        "names",
+        nargs="*",
+        metavar="NAME",
+        help="payload names inside .arbite/scratch/ (omit them and pass --all to empty it)",
+    )
+    p_scratch_clear.add_argument(
+        "--all",
+        action="store_true",
+        help="clear every payload in .arbite/scratch/ (the tidy-up the doctor note suggests)",
+    )
+    p_scratch_clear.add_argument(
+        "--json", action="store_true", help="emit the same facts as JSON"
+    )
+    _sink_flag(p_scratch_clear)
+    p_scratch_clear.set_defaults(func=cmd_scratch_clear)
 
     p_events = sub.add_parser(
         "events",
