@@ -43,10 +43,10 @@ def test_SC1_a_payload_is_consumed_on_success(tmp_path, kind):
 
     The list must name the payload's size and age *and* the agent the store can name; the
     write must report the consumed payload so the caller knows the bytes now live in the
-    receipt. The two halves are asserted against the two worlds their own numbers describe,
-    and the write half on the file sink only: a *successful* mutation cannot be recorded by
-    the sqlite coordination backend yet (it stores no artifact content -- tic-7c42), which is
-    why the refusal halves and the payload-area commands are the ones asserted on both."""
+    receipt. The two halves are asserted against the two worlds their own numbers describe:
+    the listing on both sinks, and the write on the file sink, whose transcript the block
+    is (both sinks record a successful mutation since tic-7c42, and the cross-sink evidence
+    round trips are asserted in test_change_evidence.py)."""
     for_list = tmp_path / "list"
     for_list.mkdir()
     listed = examples.assert_scenario(_fence("SC1", 0), state.transport(for_list, kind))
@@ -103,8 +103,7 @@ def test_SC2_a_payload_survives_a_failure(tmp_path, kind):
 
 def test_SC2_the_payload_is_reusable_after_the_fresh_read_the_refusal_names(tmp_path):
     """The refusal's hint is runnable, and the payload it kept is still the change: read
-    again under the same claim, retry, and the same file lands. (The file sink: the retry
-    succeeds, and a successful mutation needs a backend that can record its evidence.)"""
+    again under the same claim, retry, and the same file lands."""
     project = state.refused(tmp_path)
     token = state.rival_token(project)
     writes.external_edit(project)

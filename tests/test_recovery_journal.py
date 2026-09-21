@@ -9,9 +9,10 @@ human is then told which of the two it was.
 
 Two storage domains again: the coordination store records the intent, and the project
 tree holds the bytes, so every claim here is checked against *both* ("the receipt says
-this" and "the file holds that"). The SQLite backend cannot store artifact content yet
-(tic-7c42 decides how content lives in a database), so a mutation is refused there before
-any byte changes; that refusal is asserted, rather than the write it will allow later.
+this" and "the file holds that"). Both backends store artifact content (tic-7c42: a file
+named by the digest, or a BLOB in the database), so the protocol is exercised on both --
+including what a version over the size limit refuses, which is the one way a mutation can
+still be stopped before it changes anything.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import examples
 import lifecycle_state as state
 from arbite.coordination import records as coordination_records
 from arbite.coordination import recovery
+from arbite.coordination import store as coordination_store
 from arbite.coordination.app import CoordinationApp
 from arbite.coordination.claims import FileClaims
 from arbite.coordination.lifecycle import TicketLifecycle
@@ -40,7 +42,7 @@ from arbite.coordination.mutations import (
 )
 from arbite.coordination.paths import probe
 from arbite.coordination.store import open_coordination_store
-from arbite.errors import Busy, CoordinationError, Stale
+from arbite.errors import Busy, CoordinationError, EvidenceRefused, Stale
 from arbite.sinks import SinkSpec, build_sink
 
 TICKET = "tic-cf9f"
@@ -56,6 +58,13 @@ RENAMED = "src/greeting.py"
 BEFORE = b"one\n"
 AFTER = b"two\n"
 SINKS = ("file", "sqlite")
+
+
+@pytest.fixture(params=SINKS)
+def any_scene(request, tmp_path):
+    """The same world on both sinks: with both backends storing artifact content (tic-7c42),
+    the protocol itself is what has to be identical, not only its refusals."""
+    return scene_for(tmp_path, request.param)
 
 
 @dataclass
@@ -214,18 +223,13 @@ def file_scene(tmp_path):
     return scene_for(tmp_path, "file")
 
 
-@pytest.fixture
-def sqlite_scene(tmp_path):
-    return scene_for(tmp_path, "sqlite")
-
-
 # --- the protocol, in one process -------------------------------------------
 
 
-def test_a_write_applies_and_records_both_versions(file_scene):
-    """The whole protocol for one replacement: the bytes change, the receipt says so, and
-    both versions are kept as evidence addressed by their digests."""
-    scene = file_scene
+def test_a_write_applies_and_records_both_versions(any_scene):
+    """The whole protocol for one replacement, on both sinks: the bytes change, the receipt
+    says so, and both versions are kept as evidence addressed by their digests."""
+    scene = any_scene
     outcome = scene.mutations.apply(scene.replace(PATH, AFTER))
 
     assert outcome.applied is True
@@ -293,11 +297,10 @@ def test_recover_reconciles_a_pending_operation_on_both_sinks(tmp_path, kind):
 
 
 @pytest.mark.parametrize("kind", SINKS)
-def test_drift_is_reported_on_both_sinks_and_archived_where_the_backend_can(tmp_path, kind):
-    """The same finding on both sinks, with the one difference the backends honestly have:
-    the file backend archives the bytes it found as an artifact, while SQLite -- which does not
-    store artifact content yet (tic-7c42) -- leaves them in place, which is where they were and
-    where the finding tells a human to look."""
+def test_drift_is_reported_on_both_sinks_and_the_bytes_are_archived(tmp_path, kind):
+    """The same finding on both sinks: the bytes that match neither recorded version are kept as
+    an artifact and left exactly where they are, because "which version is correct" is not a
+    question arbite may answer -- and a human told to restore by hand needs the bytes it saw."""
     scene = scene_for(tmp_path, kind, content=b"a third version\n")
     receipt = pending_receipt(scene)
     drift_version = scene.version(PATH)
@@ -310,12 +313,8 @@ def test_drift_is_reported_on_both_sinks_and_archived_where_the_backend_can(tmp_
     assert [problem.kind for problem in scene.store.record_problems([TICKET])] == [
         "pending_operation"
     ]
-    if kind == "file":
-        assert outcome.preserved == drift_version
-        assert scene.store.get_artifact_bytes(drift_version) == b"a third version\n"
-    else:
-        assert outcome.preserved is None
-        assert scene.store.records("artifact") == []
+    assert outcome.preserved == drift_version
+    assert scene.store.get_artifact_bytes(drift_version) == b"a third version\n"
 
 
 def test_an_operation_arbite_will_not_read_is_unjudgeable_not_drift(tmp_path):
@@ -512,25 +511,30 @@ def test_a_remove_and_a_rename_round_trip_through_the_receipt(tmp_path):
     assert removed.receipt.after[RENAMED] == coordination_records.ABSENT
 
 
-def test_a_backend_that_cannot_store_evidence_refuses_before_anything_changes(
-    sqlite_scene,
-):
-    """SQLite cannot store artifact content yet (that is tic-7c42's decision), and the
-    engine refuses rather than recording a mutation without evidence: the refusal names the
-    owning ticket, and the project is untouched -- no bytes, no staged copy, no pending
-    receipt, no event."""
-    scene = sqlite_scene
-    events = len(scene.store.events())
+@pytest.mark.parametrize("kind", SINKS)
+def test_evidence_over_the_size_limit_refuses_before_anything_changes(tmp_path, kind, monkeypatch):
+    """The one way a mutation is still refused for its *evidence*: a version this proxy will
+    not keep.
 
-    with pytest.raises(CoordinationError) as failure:
+    The same engine, the same message and the same promise on both sinks, because the limit is
+    one number in the store interface rather than a backend's own temperament. The refusal
+    names the size, the limit and the repair, and the project is untouched -- no bytes, no
+    staged copy, no pending receipt, no event, and not even a partial artifact."""
+    scene = scene_for(tmp_path, kind)
+    events = len(scene.store.events())
+    monkeypatch.setattr(coordination_store, "MAX_ARTIFACT_BYTES", len(AFTER) - 1)
+
+    with pytest.raises(EvidenceRefused) as failure:
         scene.mutations.apply(scene.replace(PATH, AFTER))
 
-    assert "tic-7c42" in str(failure.value)
-    assert "nothing was changed" in str(failure.value)
+    message = str(failure.value)
+    assert f"over the {len(AFTER) - 1}-byte limit" in message
+    assert "nothing was changed" in message
     assert scene.bytes(PATH) == BEFORE
     assert scene.stages() == []
     assert scene.store.pending_operations() == []
     assert scene.store.records("receipt") == []
+    assert scene.store.records("artifact") == []
     assert len(scene.store.events()) == events
 
 

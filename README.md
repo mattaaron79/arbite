@@ -384,6 +384,7 @@ The package exposes the console script `arbite`, providing:
 | Workspace | `workspace` — `show` reports the derived workspace, the store in use and the coordination backend's counts |
 | Payloads | `scratch` — `list` shows what `file write --input` / `file edit --edits` would read, `clear NAME...` and `clear --all` delete it |
 | Events | `events` — the coordination event stream, one line per event (`--after` / `--tail`, `--include-reads`); `--follow` is refused |
+| Evidence | `receipt <OP>` — one operation's receipt (`receipt`), both versions and the artifacts that hold them, verified before printing; `changes <T> [--all]` — what a ticket changed per attempt (`changes`), or the ordered operation log with `--all` |
 | Integrity | `doctor [--fix]` |
 | Destruction | `delete <id> --force` |
 
@@ -417,11 +418,26 @@ Key behaviours worth calling out:
   rather than guessing at. The **file proxy is live** as well: `arbite file
   list|search|read|claim|release|claims|write|edit|remove|rename` are commands today
   (tic-1c4f, tic-60c7, tic-74e2), and the payloads a write or an edit reads are managed
-  by `arbite scratch list|clear` (tic-95c0). What does **not** exist yet are the views
-  and the cascades: `arbite receipt` and `arbite changes` (tic-7c42), the lifecycle
-  cascade (tic-e9ed), migrations and export (tic-008f), and `arbite cmd` passthrough
-  (tic-faae, tic-42d2). `arbite doctor --json` names the coordination backend and its
-  counts.
+  by `arbite scratch list|clear` (tic-95c0). What does **not** exist yet is migrations
+  and export (tic-008f) and `arbite cmd` passthrough (tic-faae, tic-42d2). `arbite
+  doctor --json` names the coordination backend and its counts.
+- **`arbite receipt` and `arbite changes`** are the evidence views. `receipt OP` prints one
+  operation: what it was, who did it, the paths it named, both versions with the line count
+  or byte size each one has, and the artifact that keeps them. Every version is read back out
+  of the store and hashed again before anything is printed, so a digest here is one arbite
+  checked; a receipt whose evidence is gone (or whose artifact record is missing) is refused
+  with nothing changed rather than printed with digits nobody could verify. `changes T` is the
+  *net* answer — one row per path from the version the first operation found to the version
+  the last one left, with the operations that produced it named in the row — and `--all` adds
+  the ordered operation log, one row per operation. The two are deliberately different views:
+  a net view collapses an edit and its undo into one honest `no net change` row, so that row
+  names *both* operations and points at `--all`, which is where a reverted change stays
+  visible as the operation it was. An operation that was never applied is counted in the
+  header and listed by `--all`, never netted into a summary. Evidence is content-addressed and
+  stored once per digest (an edit-then-revert keeps two versions once each), one version may
+  be at most `MAX_ARTIFACT_BYTES` (64 MiB) — a mutation whose evidence is larger is refused
+  *before* any byte changes — and nothing is summarised or uploaded: the receipt is arbite's
+  own record of bytes, and prose about a change belongs in a ticket note.
 - **`arbite file claim|release|claims`** is file ownership. `claim PATH... --ticket T
   --attempt A` acquires exclusive writer ownership of whole files for one work attempt,
   all-or-nothing and in canonical path order, so two agents can never each end up

@@ -6,25 +6,24 @@ exit code, output -- with ids, times and paths normalised on both sides (`exampl
 which is the property the two backends exist for. `recovery_state.py` builds the damaged store
 the transcripts describe.
 
-**One documented deviation.** The frozen blocks print a sentence naming a command another
-slice owns: `arbite receipt`/`arbite changes` (tic-7c42). Arbite may not name a command it does
-not have -- that is a capability claimed on paper only -- so the report prints an honest
-sentence without the command until it exists, and the test accepts the frozen text the moment
-it can be printed (`_either_frozen_or_deferred`). Everything else -- every problem line, the
-wrapping and its indentation, the fixed/not-fixed markers, the counts, the exit code -- is
-asserted exactly.
+**No deviations remain.** Two sentences in these blocks name commands other slices owned, and
+`arbite` may not name a command it does not have -- a capability claimed on paper only -- so
+each of them printed an honest sentence without the command until that slice landed:
 
-The scratch sentence *was* the second deviation and is one no longer: tic-95c0 landed
-`arbite scratch clear`, so the note now prints the frozen two-line guidance naming it (see
-`test_the_scratch_guidance_prints_because_its_command_exists`). That is what the capability
-probe was for -- the frozen text comes back by itself, and only the deviation list shrinks.
+- `arbite scratch clear` arrived with tic-95c0, so the DR1 note prints the frozen guidance
+  naming it.
+- `arbite receipt` and `arbite changes` arrived with tic-7c42, so the DR2 `--fix` detail prints
+  the frozen `inspect 'arbite receipt op-4f19' and 'arbite changes tic-1a75'` sentence.
+
+Both blocks are therefore compared byte for byte, and
+`test_the_doctor_report_names_no_command_this_arbite_does_not_have` is what keeps that honest:
+a hint that names a command is checked against the parser rather than trusted.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import replace
 
 import pytest
 
@@ -36,16 +35,7 @@ from arbite.coordination.store import open_coordination_store
 
 SINKS = ("file", "sqlite")
 
-#: `(frozen, printed here)`: the sentences that name a command this build does not have yet.
-#: The test accepts either form, so nothing has to be remembered when that slice lands.
-DEFERRED = (
-    (
-        "inspect 'arbite receipt op-4f19' and 'arbite changes tic-1a75'",
-        "inspect the receipt op-4f19 and the ticket's recorded change history",
-    ),
-)
-
-#: DR1's scratch note, frozen and with the guidance tic-95c0's command now makes printable.
+#: DR1's scratch note, frozen, with the guidance tic-95c0's command makes printable.
 SCRATCH_NOTE = (
     "note: .arbite/scratch/ holds 3 files (12.4 KiB) -- transport left behind, expected "
     "after an\n      interrupted run; clear with 'arbite scratch clear --all'"
@@ -57,36 +47,6 @@ def damaged_project(request, tmp_path):
     return state.damaged(tmp_path, request.param)
 
 
-def _either_frozen_or_deferred(actual: str, frozen: str, project) -> None:
-    """Assert the real output matches the transcript, allowing the documented deviations.
-
-    The frozen text is tried first: once the slice that owns the missing command has landed,
-    the report names it and the transcript compares byte for byte again -- the deviations
-    disappear by themselves rather than by somebody remembering to delete them."""
-    actual = examples.normalise(actual, project).strip("\n")
-    if actual == examples.normalise(frozen, project).strip("\n"):
-        return
-    relaxed = frozen
-    for frozen_text, deferred in DEFERRED:
-        relaxed = relaxed.replace(frozen_text, deferred)
-    assert actual == examples.normalise(relaxed, project).strip("\n"), (
-        "DR1/DR2 differ from the frozen block by more than the two documented deviations"
-    )
-
-
-def _only_deferred(scenario):
-    """The transcript with the deferred sentences replaced, for a byte-exact comparison of
-    everything else (ids, times and paths normalised by the harness, as usual).
-
-    A block that now holds none is compared verbatim -- DR1's scratch sentence stopped being
-    a deviation when tic-95c0 landed the command it names, and the remaining one appears only
-    in DR2's block -- so this rewrites what it finds and asserts nothing about finding it."""
-    text = scenario.stdout
-    for frozen_text, deferred in DEFERRED:
-        text = text.replace(frozen_text, deferred)
-    return replace(scenario, stdout=text)
-
-
 # --- DR1 ----------------------------------------------------------------------
 
 
@@ -95,7 +55,7 @@ def test_DR1_problems_found(damaged_project):
     operation whose bytes are neither version, and a claim naming an attempt this store does
     not have. The payload note rides along without changing the exit code."""
     scenario = examples.scenario_block("DR1")
-    stdout = examples.assert_scenario(_only_deferred(scenario), damaged_project)
+    stdout = examples.assert_scenario(scenario, damaged_project)
 
     # The scratch note is the frozen one, guidance sentence and all, because `arbite scratch
     # clear` exists now (tic-95c0) -- and it is a note, not a problem, so the exit code is
@@ -103,8 +63,6 @@ def test_DR1_problems_found(damaged_project):
     assert examples.normalise(SCRATCH_NOTE, damaged_project) in examples.normalise(
         stdout, damaged_project
     )
-    # ...and the deferred sentence is the only reason it is not the frozen block verbatim.
-    _either_frozen_or_deferred(stdout, scenario.stdout, damaged_project)
     assert scenario.exit_code == 3
 
 
@@ -131,13 +89,13 @@ def test_DR1_the_three_findings_are_the_three_the_store_holds(damaged_project):
 
 def test_DR2_fix_repairs_only_the_unambiguous(damaged_project):
     """`--fix` releases the two claims nobody can use and leaves the drift exactly as it was,
-    saying why: which of two versions is "correct" is not a question arbite may answer."""
-    scenario = examples.scenario_block("DR2")
+    saying why -- and naming the two views a human compares the versions with, which is the
+    sentence the receipt slice (tic-7c42) made printable."""
     # One run only: `--fix` repairs, so a second invocation is a different state (asserted
     # separately below).
-    stdout = examples.assert_scenario(_only_deferred(scenario), damaged_project)
+    scenario = examples.scenario_block("DR2")
+    examples.assert_scenario(scenario, damaged_project)
 
-    _either_frozen_or_deferred(stdout, scenario.stdout, damaged_project)
     assert scenario.exit_code == 3
 
 
@@ -188,7 +146,7 @@ def test_DR2_a_second_fix_run_reports_the_drift_and_repairs_nothing_more(damaged
 
 
 def test_the_doctor_report_names_no_command_this_arbite_does_not_have(damaged_project):
-    """The rule the two deviations exist for, asserted directly rather than trusted: every
+    """The rule the two deviations existed for, asserted directly rather than trusted: every
     `arbite <command>` a report names is a command the parser really defines.
 
     Guidance is only useful if the caller can run it; a hint naming a slice that has not
@@ -196,30 +154,36 @@ def test_the_doctor_report_names_no_command_this_arbite_does_not_have(damaged_pr
     for args in (("doctor",), ("doctor", "--fix")):
         proc = examples.run_cli(damaged_project, *args)
         # Quoted, which is how this surface writes a runnable hint: prose that happens to say
-        # "what arbite can correct automatically" is not naming a command.
-        for named in re.findall(r"'arbite ([a-z][a-z-]*(?: [a-z][a-z-]*)?)", proc.stdout):
-            assert cli.knows_command(named.strip()), (
-                f"'arbite {named}' is named by {' '.join(args)} but this arbite has no such "
-                "command"
-            )
+        # "what arbite can correct automatically" is not naming a command. A hint may carry
+        # arguments (`'arbite receipt op-4f19'`), so the check is that some prefix of the
+        # quoted words is a command the parser defines.
+        for quoted in re.findall(r"'arbite ([^']+)'", proc.stdout):
+            words = quoted.split()
+            assert any(
+                cli.knows_command(" ".join(words[:depth]))
+                for depth in range(len(words), 0, -1)
+            ), f"'arbite {quoted}' is named by {' '.join(args)} but no part of it is a command"
 
 
-def test_the_scratch_guidance_prints_because_its_command_exists(damaged_project):
-    """A deviation is a *consequence* of the capability probe, not a hard-coded choice.
+def test_both_guidance_sentences_print_because_their_commands_exist(damaged_project):
+    """A deviation was a *consequence* of the capability probe, not a hard-coded choice.
 
-    tic-95c0 landed `arbite scratch clear`, so the DR1/DR2 notes print the frozen guidance
-    naming it -- and the remaining `arbite receipt`/`arbite changes` sentences stay absent
-    while tic-7c42 owns those commands, which is the rule the deviation list exists for."""
+    `arbite scratch clear` (tic-95c0) and `arbite receipt`/`arbite changes` (tic-7c42) all
+    exist, so the notes print the frozen guidance naming them and the two blocks are compared
+    byte for byte. This asserts the probe's premise -- the commands really are there -- rather
+    than re-reading the transcripts for sentences the blocks already carry."""
     assert cli.knows_command("scratch list") and cli.knows_command("scratch clear")
-    assert not cli.knows_command("receipt"), "tic-7c42 has landed: update the deviations"
-    assert not cli.knows_command("changes"), "tic-7c42 has landed: update the deviations"
+    assert cli.knows_command("receipt") and cli.knows_command("changes")
 
-    # `doctor` rather than `--fix`: the guidance sentence belongs to the report that is only
-    # *judging* the store, while a repair run names the files it left alone (DR1 vs DR2).
-    proc = examples.run_cli(damaged_project, "doctor")
+    # `doctor` rather than `--fix`: the scratch guidance belongs to the report that is only
+    # *judging* the store, while the receipt sentence belongs to the repair run's detail (DR1
+    # prints one, DR2 the other).
+    judging = examples.run_cli(damaged_project, "doctor")
+    repairing = examples.run_cli(damaged_project, "doctor", "--fix")
 
-    assert "clear with 'arbite scratch clear --all'" in proc.stdout
-    assert "arbite receipt" not in proc.stdout and "arbite changes" not in proc.stdout
+    assert "clear with 'arbite scratch clear --all'" in judging.stdout
+    assert "arbite receipt" not in judging.stdout and "arbite changes" not in judging.stdout
+    assert "inspect 'arbite receipt op-4f19' and 'arbite changes tic-1a75'" in repairing.stdout
 
 
 def _sink_kind(project) -> str:

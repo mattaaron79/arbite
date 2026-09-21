@@ -40,6 +40,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..errors import CoordinationError, RecordError
+from .locking import StoreLock
 from .records import RECEIPT_PENDING, Record, parse_record
 from .store import (
     COMMIT_APPLIED,
@@ -47,6 +48,7 @@ from .store import (
     CommitResult,
     CoordinationStore,
     CoordinationTransaction,
+    require_storable_artifact,
 )
 
 #: The revision of the coordination tables in a database. Separate from the ticket
@@ -55,12 +57,28 @@ from .store import (
 #: so the two are versioned and migrated independently. Revision 2 added the
 #: per-record revision counters; a v1 database gains that table through the same
 #: `CREATE TABLE IF NOT EXISTS` any write runs, and keeps every record it holds.
-COORDINATION_SCHEMA_VERSION = 2
+#: Revision 3 added `coordination_artifacts`, which a database written by revision 1
+#: or 2 gains the same way -- additively, losing nothing (tic-008f owns the migration
+#: pass that moves records between sinks and checks them).
+COORDINATION_SCHEMA_VERSION = 3
 
-#: One document per record, plus one counter per record. `document` holds exactly
-#: what the file backend writes, so `arbite migrate`'s coordination round trip
-#: (tic-008f) has nothing to translate; the counters live beside it rather than in
-#: the document, because a record's own document must stay exactly the record.
+#: One document per record, one counter per record, and the bytes an artifact record
+#: describes. `document` holds exactly what the file backend writes, so `arbite
+#: migrate`'s coordination round trip (tic-008f) has nothing to translate; the counters
+#: live beside it rather than in the document, because a record's own document must stay
+#: exactly the record.
+#:
+#: **Artifact content is a BLOB in this same database**, not a sidecar directory, and
+#: that is the deliberate answer to the question this table exists for: the SQLite sink
+#: keeps its tickets and its coordination state in one file so a project has one thing to
+#: back up, one thing to move, and no way for the tickets and the claims about them to
+#: disagree. Content beside the database would introduce exactly that second durability
+#: domain -- a database copied without its sidecar would hold receipts whose evidence is
+#: gone -- and would make the artifact write impossible to commit with the receipt that
+#: names it. A BLOB means the bytes travel with the records. The accepted cost is a
+#: larger database and a whole-blob write per version; there is no pruning yet, and the
+#: size limit one version may have is `store.MAX_ARTIFACT_BYTES`, checked before either
+#: this row or a byte of the project changes.
 COORDINATION_DDL = """
 CREATE TABLE IF NOT EXISTS coordination_records (
     record_type TEXT NOT NULL,
@@ -78,6 +96,12 @@ CREATE TABLE IF NOT EXISTS coordination_revisions (
     revision    INTEGER NOT NULL,
     PRIMARY KEY (record_type, record_id)
 );
+
+CREATE TABLE IF NOT EXISTS coordination_artifacts (
+    digest  TEXT PRIMARY KEY,
+    size    INTEGER NOT NULL,
+    content BLOB NOT NULL
+);
 """
 
 
@@ -89,6 +113,16 @@ class SqliteCoordinationStore(CoordinationStore):
     def __init__(self, path, timeout: float = 5.0):
         self._path = Path(path)
         self._timeout = timeout
+        #: The store's ephemeral mutex, held across a *file operation*'s check and apply
+        #: (`operation_lock`), on a lock file beside the database the way the file backend
+        #: holds one in its own directory. A real SQL transaction serialises this backend's
+        #: records, but an operation is not one transaction: it verifies the claim and the
+        #: read token, commits the intent, changes the project's bytes, then finalises the
+        #: receipt, so without this two processes could both verify before either committed.
+        self._lock = StoreLock(
+            self._path.with_name(self._path.name + ".lock"),
+            describe=self._path,
+        )
 
     @property
     def root(self) -> str:
@@ -347,6 +381,16 @@ class SqliteCoordinationStore(CoordinationStore):
             return False
         return parse_record(_loads(row["document"])).result != RECEIPT_PENDING
 
+    def operation_lock(self):
+        """Hold this store's lock across a file operation's check and apply.
+
+        The same lock, with the same meaning and the same refusal, as the file backend's
+        (`coordination.locking`): the operation's records and the bytes it changes are one
+        critical section against every other arbite process, and the lock is an ephemeral
+        flock the kernel releases when its holder dies -- so a killed operation cannot leave
+        the store locked and no staleness heuristic is needed to notice."""
+        return self._lock.hold()
+
     def _next_event_cursor(self) -> int:
         with self._connection() as conn:
             if not self._table_exists(conn):
@@ -366,6 +410,66 @@ class SqliteCoordinationStore(CoordinationStore):
         for row in self._rows(conn, "event"):
             highest = max(highest, parse_record(_loads(row["document"])).cursor)
         return highest + 1
+
+    # ------------------------------------------------------------------
+    # Artifact content
+    # ------------------------------------------------------------------
+
+    def put_artifact_bytes(self, digest: str, data: bytes) -> str:
+        """Store `data` as the content for `digest`, once, in this database.
+
+        The row is keyed by the digest, so a version already stored is left exactly as
+        it is: two receipts that share a version share these bytes, which is what makes
+        an edit-then-revert cost one copy of each version rather than two. The size limit
+        is checked before the database is even touched (`store.require_storable_artifact`),
+        so a version this proxy will not keep never reaches a transaction.
+
+        Returns the database the bytes live in -- this backend has no per-artifact file
+        to name, and a caller that wants a location can only be told the one truth."""
+        require_storable_artifact(digest, data)
+        with self._connection() as conn:
+            self._ensure_artifacts_table(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO coordination_artifacts (digest, size, content) "
+                    "VALUES (?, ?, ?) ON CONFLICT(digest) DO NOTHING",
+                    (digest, len(data), data),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.root
+
+    def get_artifact_bytes(self, digest: str) -> bytes:
+        """The stored bytes for `digest`. Missing content is reported, never read back
+        as an empty file: an artifact record whose content is gone is drift, and a
+        report that served zero bytes would hide it."""
+        with self._connection() as conn:
+            row = None
+            if self._has_table(conn, "coordination_artifacts"):
+                row = conn.execute(
+                    "SELECT content FROM coordination_artifacts WHERE digest = ?", (digest,)
+                ).fetchone()
+        if row is None:
+            raise CoordinationError(
+                f"artifact {digest} has no stored bytes in {self._path}"
+            )
+        return bytes(row["content"])
+
+    def _ensure_artifacts_table(self, conn) -> None:
+        """Create the artifact table on a database written before revision 3.
+
+        Additive and idempotent, exactly as the revision counters were: a store that
+        already holds records keeps them, and the table arrives with the first content
+        write rather than through a migration nobody has run (tic-008f owns moving
+        records between sinks)."""
+        if not self._has_table(conn, "coordination_artifacts"):
+            conn.executescript(COORDINATION_DDL)
 
     def counts(self) -> dict:
         """The totals the report needs, derived from the records themselves.

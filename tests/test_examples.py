@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import evidence_state
 import examples
 from arbite.coordination import records as coordination_records
 from arbite.coordination.store import open_coordination_store
@@ -183,6 +184,49 @@ def test_ws2_workspace_with_nothing_active(ws2_project):
 
 def test_dr4_doctor_names_the_stores_coordination_backend(dr4_project):
     examples.assert_scenario(examples.scenario_block("DR4"), dr4_project)
+
+
+# --- EV1, EV6: the change receipts and net change views ---------------------
+
+
+@pytest.fixture
+def ev_project(tmp_path, kind):
+    """EV1's and EV6's world, on both sinks: five operations by one attempt on three paths."""
+    return evidence_state.ev_project(tmp_path, kind)
+
+
+def test_EV1_net_changes_for_a_ticket(ev_project, kind):
+    """The net view, per attempt, with the two operations behind one row named.
+
+    **One documented deviation.** EV1's three rows are hand-aligned in the document: its
+    operations column starts at column 91, 91 and 89, which no single padding rule produces
+    (the creation's path is longer than the path column the other two rows set). The command
+    pads each column to the widest cell of its own group, so the *facts* match and the layout
+    is three columns tighter; `assert_scenario_abridged` collapses whitespace and compares
+    line by line, and `test_change_evidence.py` asserts the exact rows the layout rule
+    produces. Everything else -- the header, the letters, the version pair, the delta, the
+    operation lists in log order, the revert note and the exit code -- is asserted as written.
+    """
+    scenario = examples.scenario_block("EV1")
+    stdout = examples.assert_scenario_abridged(scenario, ev_project, sink=kind)
+
+    assert "edit-then-revert: both operations remain in the log ('--all')" in stdout
+    assert scenario.exit_code == 0
+
+
+def test_EV6_one_receipt(ev_project, kind):
+    """One operation's evidence: `result: ok`, both versions with their shapes, and the image
+    the receipt keeps.
+
+    EV6's command names an operation id, which is the one fact a transcript cannot carry --
+    the fixture performs the operation, so the harness substitutes its id for the document's
+    placeholder exactly as it substitutes ticket ids. Everything else is compared byte for
+    byte, on both sinks."""
+    operation = evidence_state.base_operation(ev_project, kind)
+    scenario = examples.with_token(examples.scenario_block("EV6"), operation)
+
+    examples.assert_scenario(scenario, ev_project, sink=kind)
+    assert scenario.exit_code == 0
 
 
 # --- the harness itself ----------------------------------------------------

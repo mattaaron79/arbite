@@ -11,7 +11,8 @@ explainable to someone who opens the directory:
   observations/op-XXXX.json  read receipts (the tokens a write presents)
   receipts/op-XXXX.json   mutation receipts, including pending intent
   events/<cursor>-evt-XXXX.json  the append-only event stream
-  artifacts/<digest hex>  the bytes an artifact record describes
+  artifacts/<digest hex>  the bytes an artifact record describes (bounded by
+                          store.MAX_ARTIFACT_BYTES, refused before anything changes)
   artifacts/index/art-XXXX.json  the artifact records themselves
   revisions.json          per-record write counters (see `store.revision`)
   commit-journal.json     a commit in flight; replayed by the next write
@@ -53,14 +54,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..errors import Busy, CoordinationError, RecordError
+from ..errors import CoordinationError, RecordError
 from ..sinks.base import Problem
 from ..sinks.file import TMP_PREFIX, write_atomic
+from .locking import LOCK_POLL_SECONDS, LOCK_TIMEOUT, StoreLock
 from .records import (
     RECEIPT_PENDING,
     Event,
@@ -76,6 +76,7 @@ from .store import (
     CoordinationStore,
     CoordinationTransaction,
     PendingWrite,
+    require_storable_artifact,
 )
 
 try:  # POSIX
@@ -122,9 +123,8 @@ REVISIONS_FILENAME = "revisions.json"
 #: store, so replaying it requires no judgement about the workspace's bytes.
 JOURNAL_FILENAME = "commit-journal.json"
 
-#: How long a writer waits for the store lock before refusing. Bounded because
-#: every command is one-shot: matching the SQLite backend's `busy_timeout`, and
-#: longer than any commit this design performs.
+#: How long a writer waits for the store lock before refusing. Read when the lock is
+#: taken (see `coordination.locking`), so it stays the seam a contention test patches.
 LOCK_TIMEOUT = 5.0
 
 #: How often the lock is retried while another process holds it.
@@ -237,15 +237,15 @@ class FileCoordinationStore(CoordinationStore):
 
     def __init__(self, root):
         self._root = Path(root)
-        #: Guards this instance's commit section against another thread in the same
-        #: process, so the file lock's holder is always exactly one thread.
-        self._mutex = threading.Lock()
-        #: How deep the current thread is inside the lock (0 = not held). An flock
-        #: is per open handle, so taking a second one in the same process would
-        #: block on itself; this counter makes the lock re-entrant for the code
-        #: paths that nest (a transaction inside a write path).
-        self._lock_depth = 0
-        self._lock_handle = None
+        #: The store's ephemeral mutex, shared with the SQLite backend
+        #: (`coordination.locking`): an advisory lock on `lock`, held for one commit or one
+        #: file operation. `limits` reads this module's timeouts when the lock is taken,
+        #: which is the seam the contention tests patch.
+        self._lock = StoreLock(
+            self._root / LOCK_FILENAME,
+            describe=self._root,
+            limits=lambda: (LOCK_TIMEOUT, LOCK_POLL_SECONDS),
+        )
 
     @property
     def root(self) -> str:
@@ -316,61 +316,17 @@ class FileCoordinationStore(CoordinationStore):
     def _exclusive(self):
         """Hold this store's commit lock for the length of one unit of work.
 
-        Two kinds of mutex exist in this design and they are never conflated: this
-        one is *ephemeral*, an advisory OS lock released when the process exits
-        however it exits, and it is held for one commit rather than for a ticket's
-        duration. A durable *claim* is the other kind, and only a lifecycle command
-        releases it. A caller that has to wait longer than `LOCK_TIMEOUT` is
-        refused with `Busy` -- a structured answer, with nothing written, rather
-        than a command that hangs."""
-        if self._lock_depth:
-            # Already inside a commit on this instance. Same critical section, same
-            # thread: nesting must not open a second handle, which would block on
-            # the lock this same process already holds.
-            self._lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lock_depth -= 1
-            return
-        if not self._mutex.acquire(timeout=LOCK_TIMEOUT):
-            raise Busy(
-                f"another thread in this process is committing to {self._root}; "
-                "nothing was written",
-                reason="store_locked",
-            )
-        try:
-            self._root.mkdir(parents=True, exist_ok=True)
-            handle = open(self._root / LOCK_FILENAME, "a+b")
-            if handle.tell() == 0:
-                handle.write(b"\n")  # a byte for a platform whose lock needs one
-                handle.flush()
-            try:
-                deadline = time.monotonic() + LOCK_TIMEOUT
-                while not _try_lock(handle):
-                    if time.monotonic() >= deadline:
-                        raise Busy(
-                            f"another arbite process is committing to {self._root}; "
-                            "nothing was written",
-                            reason="store_locked",
-                        )
-                    time.sleep(LOCK_POLL_SECONDS)
-            except BaseException:
-                handle.close()
-                raise
-            self._lock_depth = 1
-            self._lock_handle = handle
-            try:
-                yield
-            finally:
-                self._lock_depth = 0
-                self._lock_handle = None
-                try:
-                    _release_lock(handle)
-                finally:
-                    handle.close()
-        finally:
-            self._mutex.release()
+        Two kinds of mutex exist in this design and they are never conflated: this one is
+        *ephemeral*, an advisory OS lock released when the process exits however it exits, and
+        it is held for one commit rather than for a ticket's duration. A durable *claim* is the
+        other kind, and only a lifecycle command releases it. A caller that has to wait longer
+        than `LOCK_TIMEOUT` is refused with `Busy` -- a structured answer, with nothing written,
+        rather than a command that hangs.
+
+        The mechanism is `coordination.locking`, because the SQLite backend takes the same lock
+        for the same reason; what is here is this store's lock file and its timeouts."""
+        with self._lock.hold():
+            yield
 
     def operation_lock(self):
         """The store's own commit mutex, held across a file operation's check and apply.
@@ -713,9 +669,10 @@ class FileCoordinationStore(CoordinationStore):
 
         The bytes file *is* the content address, so an artifact record and its
         content cannot drift apart, and a crash leaves a visible temp file rather
-        than half an artifact. Proving that a stored artifact still verifies against
-        its digest -- and the size limits that make "store it" a decision rather
-        than a default -- is the change-receipt slice's job (tic-7c42)."""
+        than half an artifact. The size limit (`store.MAX_ARTIFACT_BYTES`) is checked
+        first and in the same words on both backends, so "may this version be recorded"
+        is a property of the proxy rather than of the sink holding it."""
+        require_storable_artifact(digest, data)
         path = self.artifact_path(digest)
         if path.is_file():
             return path

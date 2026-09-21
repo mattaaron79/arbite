@@ -42,22 +42,15 @@ HOLDER = state.HOLDER
 HOLDER_TICKET = state.HOLDER_TICKET
 RIVAL = state.RIVAL
 
-#: The refusal the SQLite coordination backend gives a mutation: artifact content has no home
-#: there yet, and `tic-7c42`/C11 decides how one stores it. Named once, because two tests talk
-#: about it and a second copy of the sentence would be a second thing to keep true.
-EVIDENCE_UNAVAILABLE = "does not store artifact content"
+@pytest.fixture(params=("file", "sqlite"))
+def project_kind(request) -> str:
+    """The sink a *successful* mutation runs on: both of them.
 
-
-
-@pytest.fixture
-def project_kind() -> str:
-    """The sink a *successful* mutation runs on: the file sink, which stores artifact content.
-
-    The SQLite coordination backend has no artifact store yet -- how content lives in a
-    database is tic-7c42's decision -- so a mutation there is refused *before* any byte
-    changes. That refusal is asserted on its own below rather than skipped, and every test
-    that does not depend on a recorded mutation still runs on both sinks through `kind`."""
-    return "file"
+    Every successful mutation keeps its evidence, so both coordination backends store artifact
+    content (tic-7c42 decided how: a file named by the digest, or a BLOB in the database), and
+    every guarantee here is asserted twice -- including that the evidence round-trips through
+    the store byte for byte."""
+    return request.param
 
 
 def write(project, path, token, payload="base.py", kind="file", *extra):
@@ -739,17 +732,18 @@ def test_help_text_names_only_commands_that_exist():
 
     The second list is the same rule in the other direction, and it is why the check is worth
     having: a slice that has not landed must not be named by anything output today. tic-74e2
-    landed `file remove` and `file rename`, tic-95c0 landed `scratch list|clear`, so they
-    moved to the first list; the receipt and change views (tic-7c42) are still ahead."""
+    landed `file remove` and `file rename`, tic-95c0 landed `scratch list|clear`, and tic-7c42
+    landed `receipt` and `changes` -- the two commands every hint here that promises "the
+    evidence is kept" now points at."""
     from arbite import cli
 
     for path in (
         "file read", "file claim", "file write", "file edit", "file remove", "file rename",
-        "scratch list", "scratch clear", "reopen", "close",
+        "scratch list", "scratch clear", "receipt", "changes", "reopen", "close",
     ):
         assert cli.knows_command(path), path
-    for path in ("receipt", "changes"):
-        assert not cli.knows_command(path), f"{path} is another slice's"
+    assert not cli.knows_command("cmd"), "passthrough (tic-faae) has not landed"
+    assert not cli.knows_command("scratch prune"), "retention (tic-008f) has not landed"
 
 
 def test_the_schema_revision_was_raised_for_the_spent_token_field():
@@ -773,29 +767,25 @@ def test_the_schema_revision_was_raised_for_the_spent_token_field():
     assert "schema revision 1" in str(refusal.value)
 
 
-def test_the_sqlite_backend_refuses_a_mutation_before_changing_bytes(tmp_path):
-    """The sink-side half of "fail before modifying bytes", on the sink that has the limit.
+def test_a_sqlite_mutation_records_the_same_evidence_as_the_file_sink(tmp_path):
+    """What the SQLite backend used to refuse, now that content lives in its own database.
 
-    A receipt whose before and after bytes cannot be stored is not a receipt: the engine
-    refuses the operation by name (and names the ticket that decides how a database holds
-    content) *before* it stages anything, so the file is untouched and no receipt is written.
-    This is the deliberate state of the SQLite coordination backend, not a failure of the
-    write command -- and it is asserted, because "refuses honestly" is the property this
-    slice must preserve on both sinks."""
+    Both versions are in the store and hash to the digests the receipt records -- the property
+    a successful mutation on *any* sink has to have, and the one the change views
+    (tic-7c42's `arbite receipt`/`arbite changes`) are read from."""
     kind = "sqlite"
     project = state.write_project(tmp_path, kind)
     token = state.token_for_write(project, kind)
-    before = (project / BASE_PY).read_bytes()
 
     proc = write(project, BASE_PY, token, kind=kind)
 
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert EVIDENCE_UNAVAILABLE in proc.stderr and "tic-7c42" in proc.stderr
-    assert "nothing was changed" in proc.stderr
-    assert (project / BASE_PY).read_bytes() == before
-    assert state.receipt_count(project, kind) == 0
-    assert state.spent_by(project, token, kind) is None
-    assert (project / ".arbite" / "scratch" / "base.py").exists(), "the payload is still there"
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    before, after = state.recorded_versions(project, kind)
+    assert state.artifact_bytes(project, before[BASE_PY], kind) == state.base_text().encode()
+    assert state.artifact_bytes(project, after[BASE_PY], kind) == state.base_text(
+        append=state.APPENDED_LINES
+    ).encode()
+    assert state.spent_by(project, token, kind) == state.newest_receipt(project, kind).id
 
 
 def test_a_refusal_never_leaves_a_staged_copy_behind(tmp_path, kind):

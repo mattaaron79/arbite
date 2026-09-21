@@ -18,10 +18,11 @@ import json
 import pytest
 
 from arbite.coordination import records as coordination_records
+from arbite.coordination import store as coordination_store
 from arbite.coordination.file_backend import FileCoordinationStore
 from arbite.coordination.sqlite_backend import SqliteCoordinationStore
 from arbite.coordination.store import CoordinationStore, open_coordination_store
-from arbite.errors import CoordinationError, RecordError
+from arbite.errors import CoordinationError, EvidenceRefused, RecordError
 from arbite.sinks import SinkSpec, build_sink
 
 BACKENDS = ("file", "sqlite")
@@ -492,19 +493,38 @@ def test_stored_documents_are_the_same_document_on_both_backends(store):
         assert document == expected.to_dict()
 
 
-def test_the_sqlite_backend_refuses_artifact_content_by_name(store):
-    """How artifact *content* is stored in a database is the change-receipt slice's
-    decision (a BLOB column or a sidecar file), so this backend refuses it with the
-    ticket that decides, rather than inventing an answer or raising AttributeError."""
-    if isinstance(store, FileCoordinationStore):
-        pytest.skip("the file backend stores artifact content: see the test above it")
+def test_both_backends_store_artifact_content_once_by_digest(store):
+    """A mutation's evidence is not optional, so every backend stores it: the file backend as
+    a file named by the digest, SQLite as a BLOB beside its records.
 
-    with pytest.raises(NotImplementedError) as failure:
-        store.put_artifact_bytes("sha256:" + "0" * 64, b"content")
+    Storing it *once* is the shared rule rather than each backend's temperament: the second
+    write of the same digest changes nothing, which is what lets an edit-then-revert keep both
+    versions once each and two receipts share one copy."""
+    digest = coordination_records.digest_bytes(b"the same bytes")
 
-    assert "tic-7c42" in str(failure.value)
-    with pytest.raises(NotImplementedError):
-        store.get_artifact_bytes("sha256:" + "0" * 64)
+    store.put_artifact_bytes(digest, b"the same bytes")
+    store.put_artifact_bytes(digest, b"the same bytes")
+
+    assert store.get_artifact_bytes(digest) == b"the same bytes"
+    assert store.verify_artifact(digest) == b"the same bytes"
+    with pytest.raises(CoordinationError):
+        store.get_artifact_bytes(coordination_records.digest_bytes(b"missing"))
+
+
+def test_artifact_content_over_the_size_limit_is_refused_on_both_backends(store, monkeypatch):
+    """The size limit is one explicit number for the whole proxy (`store.MAX_ARTIFACT_BYTES`),
+    checked before anything is stored -- on both backends, in the same words."""
+    digest = coordination_records.digest_bytes(b"too much")
+    monkeypatch.setattr(coordination_store, "MAX_ARTIFACT_BYTES", 4)
+
+    with pytest.raises(EvidenceRefused) as failure:
+        store.put_artifact_bytes(digest, b"too much")
+
+    assert "over the 4-byte limit" in str(failure.value)
+    assert "nothing was changed" in str(failure.value)
+    assert failure.value.next_actions == (coordination_store.SIZE_LIMIT_HINT,)
+    with pytest.raises(CoordinationError):
+        store.get_artifact_bytes(digest)  # nothing was stored
 
 
 def test_the_file_backend_stores_artifact_bytes_by_digest(tmp_path):

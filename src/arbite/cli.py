@@ -30,6 +30,7 @@ from . import __version__, config, docs, graph, schema
 from .coordination import app as coordination_app
 from .coordination import claims as coordination_claims
 from .coordination import discovery as coordination_discovery
+from .coordination import evidence as coordination_evidence
 from .coordination import lifecycle as coordination_lifecycle
 from .coordination import moves as coordination_moves
 from .coordination import reads as coordination_reads
@@ -303,6 +304,16 @@ def _moves(args, sink):
     return coordination_moves.FileMoves(sink, _lifecycle(args, sink))
 
 
+def _evidence(args, sink):
+    """The change-receipt and net-change views for this command's sink and store.
+
+    Both read what the engine already recorded -- one operation's evidence, or what a
+    ticket's operations net to -- and neither writes anything. The rules that make a
+    receipt reproducible and a net view honest (artifact verification, the ordered log
+    behind a collapsed pair of operations) live in `coordination.evidence`."""
+    return coordination_evidence.ChangeViews(sink, _lifecycle(args, sink))
+
+
 def _mutation_context(args):
     """The ticket and the attempt every mutation must name, or the refusal that says so.
 
@@ -351,11 +362,10 @@ def known_commands() -> set:
     """Every command path this parser defines, as `('command', 'command subcommand', ...)`.
 
     Output may only name commands that exist: `doctor --fix` tells a human what to run next,
-    and the receipt and change views it points at are tic-7c42's -- a slice that has not
-    landed must not be named by anything printed today. Asking the parser, rather than
-    keeping a list here, is what keeps those sentences true in the build they are printed
-    from: the scratch guidance appeared by itself when tic-95c0 landed `scratch clear`, and
-    the receipt sentences will do the same."""
+    and a slice that has not landed must not be named by anything printed today. Asking the
+    parser, rather than keeping a list here, is what keeps those sentences true in the build
+    they are printed from -- the scratch guidance and the receipt and change views appeared by
+    themselves as their slices landed (tic-95c0, tic-7c42)."""
     global _KNOWN_COMMANDS
     if _KNOWN_COMMANDS is None:
         _, choices = build_parser()
@@ -667,6 +677,38 @@ def cmd_workspace_show(args):
         _print_json(result.to_json())
     else:
         print(result.to_text())
+
+
+def cmd_receipt(args):
+    """Print one operation's recorded evidence, reproduced rather than summarised.
+
+    The receipt is what makes a change checkable after the fact: the version it replaced, the
+    version it wrote, and where those bytes are kept. Both versions are read back out of the
+    store and proved against the digests the receipt records before anything is printed, so a
+    digest in this report is a claim arbite checked; a receipt whose evidence is no longer
+    there is refused with nothing changed, because that is drift and not a missing report.
+    Nothing is summarised and nothing is uploaded: agent prose about a change belongs in a
+    ticket note, and this command reports bytes."""
+    sink = _require_sink(args)
+    result = _evidence(args, sink).receipt(args.operation)
+    _emit_result(result, args.json)
+
+
+def cmd_changes(args):
+    """Report what a ticket changed, per attempt, and the ordered log behind it.
+
+    The net view is what a reader wants -- one row per path, from the version the first
+    operation found to the version the last one left, with the operations that made it named
+    in the row. `--all` adds the ordered operation log, one row per operation-path, which is
+    where a change that was reverted stays visible as an operation rather than only as a net
+    of zero. Nothing here writes, waits or guesses: an operation whose evidence has gone
+    missing degrades its own column and does not hide the rest of the log.
+    """
+    sink = _require_sink(args)
+    result = _evidence(args, sink).changes(args.ticket, include_all=args.all)
+    _emit_result(result, args.json)
+    if result.exit_code:
+        sys.exit(result.exit_code)
 
 
 def cmd_events(args):
@@ -3274,6 +3316,41 @@ def build_parser():
     )
     _sink_flag(p_scratch_clear)
     p_scratch_clear.set_defaults(func=cmd_scratch_clear)
+
+    p_receipt = sub.add_parser(
+        "receipt",
+        help="print one operation's receipt: both versions and the evidence kept",
+        description="Print one operation's recorded evidence: what it was, who did it, the "
+        "paths it named, both versions with the size or line count each one has, and the "
+        "artifact that holds them. Every version is read back out of the store and checked "
+        "against the digest the receipt records before anything is printed, so a digest here "
+        "is one arbite verified. Nothing is summarised: use 'arbite changes <ticket>' for what "
+        "a ticket's operations add up to.",
+    )
+    p_receipt.add_argument("operation", metavar="OP", help="the operation id, e.g. op-2b8d17")
+    _json_flag(p_receipt)
+    _sink_flag(p_receipt)
+    p_receipt.set_defaults(func=cmd_receipt)
+
+    p_changes = sub.add_parser(
+        "changes",
+        help="show what a ticket changed: the net per attempt, and the ordered log",
+        description="Show what a ticket's operations did to the files it held: one row per path "
+        "with the version the first operation found and the version the last one left, the "
+        "operations that produced that, and the paths whose net is a creation or a removal. A "
+        "path that ended where it started says 'no net change' and names the ordered view. "
+        "With --all, print that ordered log: one row per operation, in the order they "
+        "happened, which is where a change that was reverted stays visible as an operation.",
+    )
+    p_changes.add_argument("ticket", metavar="T", help="the ticket whose operations to report")
+    p_changes.add_argument(
+        "--all",
+        action="store_true",
+        help="print the ordered operation log, one row per operation, instead of the net view",
+    )
+    _json_flag(p_changes)
+    _sink_flag(p_changes)
+    p_changes.set_defaults(func=cmd_changes)
 
     p_events = sub.add_parser(
         "events",

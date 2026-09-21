@@ -102,11 +102,22 @@ class LifecycleRequired(ArbiteError):
 
 class CoordinationError(ArbiteError):
     """The coordination layer failed: a record that cannot be stored or read, a
-    store whose backend cannot be reached.
+    store whose backend cannot be reached, or a refusal computed from the store's
+    own state.
 
     A separate branch from `SinkError` because coordination state is a different
     storage domain from tickets (local runtime state versus the git-tracked
-    development record); a failure here must not read as one in the ticket store."""
+    development record); a failure here must not read as one in the ticket store.
+
+    A raise site that knows the repair may carry `next_actions` and the `text_hint`
+    they read as -- "this operation id names a read observation", "this receipt's
+    evidence is gone, look at it by hand" -- exactly as `PathRefused` does, so the
+    sentence is built where the state is known rather than guessed at the CLI."""
+
+    def __init__(self, message: str, next_actions=(), text_hint: Optional[str] = None):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+        self.text_hint = text_hint
 
 
 class RecordError(CoordinationError):
@@ -232,6 +243,25 @@ class NotOwner(ArbiteError):
     def __init__(self, message: str, next_actions=()):
         super().__init__(message)
         self.next_actions = tuple(next_actions)
+
+
+class EvidenceRefused(ArbiteError):
+    """An operation's evidence cannot be stored, so the operation did not happen.
+
+    An error (exit 1), because the caller has to change what it is doing rather than
+    re-read: a version this proxy will not keep -- larger than the size limit one
+    stored version may have -- cannot be recorded, and a mutation whose evidence has
+    nowhere to live is refused **before** any byte of the project changes. The message
+    and the `next:` line are built where the rule lives (the store interface), so both
+    backends and every mutation kind refuse in exactly the same words.
+    """
+
+    reason = "evidence_refused"
+
+    def __init__(self, message: str, next_actions=(), text_hint: Optional[str] = None):
+        super().__init__(message)
+        self.next_actions = tuple(next_actions)
+        self.text_hint = text_hint
 
 
 class PathRefused(ArbiteError):

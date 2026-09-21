@@ -15,9 +15,10 @@ One operation is five steps, and the order is the whole design:
    refused" from "it may have written half a file" will re-apply blindly.
 2. **Persist the intent and the evidence.** The before and after bytes are archived by
    digest, and the receipt -- kind, paths, both versions, the artifacts, the claim
-   generation -- is committed as `pending`. A backend that cannot store artifact content
-   refuses here, by name, *before* any byte of the project changes (tic-7c42 decides how
-   content lives in a database).
+   generation -- is committed as `pending`. Every version is judged *before* any of them
+   is stored -- the bytes have to be there, and they have to be a size this proxy will
+   keep (`store.MAX_ARTIFACT_BYTES`) -- so a version that cannot be written as evidence
+   refuses the operation here, by name, **before** any byte of the project changes.
 3. **Stage the new content** in the target's own directory, under a name carrying the
    operation id, so the replacement is one atomic `os.replace` and a crash leaves a
    recognisable leftover rather than a half-written target.
@@ -46,6 +47,7 @@ from typing import Callable, Optional
 from ..errors import Busy, CoordinationError, NoClaim, Stale
 from . import recovery
 from .paths import modified_clock, probe
+from .store import require_storable_artifact
 from .records import (
     ABSENT,
     RECEIPT_KINDS,
@@ -570,30 +572,37 @@ class FileMutations:
     def _archive_evidence(self, receipt: OperationReceipt, data: dict) -> list:
         """Store the before and after bytes, and return the artifact ids for the receipt.
 
-        Content-addressed, so two receipts that share a version share the bytes. A backend
-        that cannot store content refuses **here**, by name, before any byte of the
-        project has changed: recording a mutation whose evidence has nowhere to live is
-        exactly the failure mode the durability rules say to fail early on."""
-        artifacts = []
-        existing = {artifact.digest: artifact for artifact in self.store.records("artifact")}
-        for digest in sorted({*receipt.before.values(), *receipt.after.values()}):
-            if digest == ABSENT_VERSION:
-                continue
+        Content-addressed, so two receipts that share a version share the bytes. Two things
+        are judged for the **whole operation** before any of it is stored: every version the
+        receipt names has bytes supplied for it (recording intent without evidence is what
+        would leave a change nobody can reproduce), and every one of those versions is a size
+        this proxy keeps (`store.require_storable_artifact`). So a version that cannot be
+        written refuses the operation here, by name, before any byte of the project -- and
+        before any partial evidence of its own -- has changed."""
+        wanted = sorted(
+            {
+                digest
+                for digest in (*receipt.before.values(), *receipt.after.values())
+                if digest != ABSENT_VERSION
+            }
+        )
+        for digest in wanted:
             if digest not in data:
-                # A version the receipt names with no bytes behind it: recording the intent
-                # without the evidence is what would leave a change nobody can reproduce.
                 raise CoordinationError(
                     f"no bytes were supplied for version {digest}, which this operation "
                     "records, so its evidence cannot be written; nothing was changed"
                 )
+            require_storable_artifact(digest, data[digest])
+
+        artifacts = []
+        existing = {artifact.digest: artifact for artifact in self.store.records("artifact")}
+        for digest in wanted:
             try:
                 self.store.put_artifact_bytes(digest, data[digest])
             except NotImplementedError as e:
                 raise CoordinationError(
-                    f"this operation cannot be recorded: the '{self.store.kind}' "
-                    f"coordination backend does not store artifact content yet, so the "
-                    f"evidence a mutation must keep cannot be written ({e}); nothing was "
-                    "changed"
+                    f"this operation cannot be recorded: {e}, so the evidence a mutation "
+                    "must keep cannot be written; nothing was changed"
                 )
             artifact = existing.get(digest)
             if artifact is None:

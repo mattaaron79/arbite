@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
-from ..errors import PathRefused, RecordError, Stale
+from ..errors import EvidenceRefused, PathRefused, RecordError, Stale
 from ..sinks.base import Problem
 from .paths import probe
 from .records import (
@@ -407,11 +407,12 @@ def archive_evidence(store, outcome: OperationJudgement) -> Optional[str]:
     """Keep the bytes a drifted operation found on disk, and return their digest.
 
     Content-addressed, so two findings about one version share the bytes. Deliberately
-    best-effort: a backend that cannot store artifact content (SQLite, until tic-7c42
-    decides how content lives in a database) leaves the bytes exactly where they are --
-    arbite never changes a drifted file, so the evidence survives anyway, and the digests
-    the finding prints are what a human compares. Nothing is claimed about a store that
-    could not archive: the caller sees `preserved=None`."""
+    best-effort: a store that cannot store the bytes -- one that refuses them because the
+    version is over the size limit every backend shares (`store.MAX_ARTIFACT_BYTES`), or a
+    backend that stores no content at all -- leaves them exactly where they are. That loses
+    nothing: arbite never changes a drifted file, so the evidence survives anyway, and the
+    digests the finding prints are what a human compares. Nothing is claimed about a store
+    that could not archive: the caller sees `preserved=None`."""
     root = workspace_root(store)
     if root is None:
         return None
@@ -427,7 +428,7 @@ def archive_evidence(store, outcome: OperationJudgement) -> Optional[str]:
             continue
         try:
             store.put_artifact_bytes(observed, data)
-        except NotImplementedError:
+        except (NotImplementedError, EvidenceRefused):
             return None
         _record_artifact(store, observed, len(data), outcome.receipt)
         return observed

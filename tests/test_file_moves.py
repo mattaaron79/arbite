@@ -22,11 +22,10 @@ can be asserted: by reading the tree and the store before and after.
   destination whose parent does not exist is refused rather than `mkdir`ed, and a race between
   two renames of one source moves the bytes exactly once.
 
-The `project_kind` fixture is the file sink, which stores artifact content; the SQLite
-coordination backend has no artifact store yet (tic-7c42 decides how content lives in a
-database), so a mutation there is refused *before* any byte changes. That refusal is asserted
-on its own below, and every rule that does not depend on a recorded mutation still runs on both
-sinks through `kind`.
+Both sinks store artifact content (tic-7c42: the file backend as a file named by the digest,
+SQLite as a BLOB in its own database), so `project_kind` is both of them: a removal and a
+rename round-trip through their receipts on either store, and every rule that does not depend
+on a recorded mutation also runs on both through `kind`.
 """
 
 from __future__ import annotations
@@ -49,9 +48,6 @@ RIVAL_TICKET = moves.RIVAL_TICKET
 HOLDER = moves.HOLDER
 HOLDER_TICKET = moves.HOLDER_TICKET
 
-#: The refusal the SQLite coordination backend gives a mutation (see the module docstring).
-EVIDENCE_UNAVAILABLE = "does not store artifact content"
-
 #: Two directories, so a move across them is a real move rather than a rename in place.
 SOURCE_DIR = "src/arbite"
 DEST_DIR = "docs/notes"
@@ -60,10 +56,10 @@ ACROSS_DEST = f"{DEST_DIR}/renamed.py"
 OTHER_DEST = f"{DEST_DIR}/other.py"
 
 
-@pytest.fixture
-def project_kind() -> str:
-    """The sink a *successful* mutation runs on: the file sink, which stores artifact content."""
-    return "file"
+@pytest.fixture(params=("file", "sqlite"))
+def project_kind(request) -> str:
+    """The sink a *successful* mutation runs on: both of them (see the module docstring)."""
+    return request.param
 
 
 def rename(project, source, dest, token, kind="file", *extra):
@@ -182,30 +178,22 @@ def test_a_rename_moves_the_bytes_and_the_ownership_across_directories(tmp_path,
 # --- both sinks ---------------------------------------------------------------
 
 
-def test_both_sinks_answer_a_remove_and_a_rename_honestly(tmp_path, kind):
-    """The file sink performs the move; SQLite refuses it before any byte changes.
-
-    Not papered over: the SQLite coordination backend cannot store artifact content yet, and a
-    mutation whose evidence has no home is refused by name with nothing changed (tic-7c42 owns
-    how content lives in a database). What must hold on *both* is the honesty: the tree is
-    untouched and no receipt is written."""
+def test_both_sinks_perform_a_rename_and_keep_its_evidence(tmp_path, kind):
+    """The same move on either store: the bytes arrive, one receipt says so, and the moved
+    version is in the artifact store byte for byte -- the evidence a receipt has to be able to
+    reproduce, and the reason both backends had to store content (tic-7c42)."""
     project = create_tree(tmp_path, kind, ACROSS_SOURCE, absent=(ACROSS_DEST,))
     token = read_token(project, ACROSS_SOURCE, kind)
     before = (project / ACROSS_SOURCE).read_bytes()
 
     proc = rename(project, ACROSS_SOURCE, ACROSS_DEST, token, kind)
 
-    if kind == "file":
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert (project / ACROSS_DEST).read_bytes() == before
-        assert len(receipts(project, kind)) == 1
-    else:
-        assert proc.returncode == 1, proc.stdout + proc.stderr
-        assert EVIDENCE_UNAVAILABLE in proc.stderr, proc.stderr
-        assert "nothing was changed" in proc.stderr, proc.stderr
-        assert (project / ACROSS_SOURCE).read_bytes() == before, "the source is untouched"
-        assert not (project / ACROSS_DEST).exists(), "and nothing arrived"
-        assert receipts(project, kind) == []
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (project / ACROSS_DEST).read_bytes() == before
+    assert not (project / ACROSS_SOURCE).exists(), "the bytes left the source"
+    recorded = receipts(project, kind)
+    assert len(recorded) == 1
+    assert moves.artifact(project, recorded[0].before[ACROSS_SOURCE], kind) == before
 
 
 # --- the claim rules a rename has to satisfy ----------------------------------
@@ -616,7 +604,7 @@ def test_two_processes_racing_one_rename_move_the_bytes_once(tmp_path, project_k
 
     finished = receipts(project, kind)
     assert [receipt.kind for receipt in finished] == ["rename"], "one move, one receipt"
-    released = moves.released_claim(project, ACROSS_SOURCE)
+    released = moves.released_claim(project, ACROSS_SOURCE, kind)
     assert released is not None and released.release_reason == f"renamed to {landed[0]}"
     assert sorted(
         claim.path for claim in moves.store_for(project, kind).active_claims()

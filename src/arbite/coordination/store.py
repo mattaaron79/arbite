@@ -43,7 +43,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from ..errors import CoordinationError, RecordError, Stale
+from ..errors import CoordinationError, EvidenceRefused, RecordError, Stale
 from .records import (
     ATTEMPT_ACTIVE,
     CLAIM_ACTIVE,
@@ -53,10 +53,13 @@ from .records import (
     Event,
     Record,
     Workspace,
+    digest_bytes,
     new_id,
     record_type_of,
+    short_digest,
     utc_now,
 )
+from .results import register_next_actions
 
 #: The commit boundaries a fault-injection hook can be told about, in order. A
 #: process killed at `COMMIT_STAGED` has recorded the unit of work but applied
@@ -66,6 +69,46 @@ from .records import (
 #: check.
 COMMIT_STAGED = "commit_staged"
 COMMIT_APPLIED = "commit_applied"
+
+#: The largest single version arbite keeps as evidence: 64 MiB, whole, not a range.
+#:
+#: An explicit number rather than an implementation accident, because "store the bytes
+#: this operation replaced" is a decision about a local, git-ignored, per-machine store:
+#: without a stated bound, one enormous file would decide for every later view how much
+#: has to be read and verified. It is a bound on *one stored version*, not on the store
+#: (a store accumulates versions; retention and pruning are tic-008f's), and it is the
+#: same number on both sinks, so "the file sink is more permissive" cannot become a
+#: reason to move a project. Nothing here deletes anything: a version already stored
+#: stays readable even under a later, smaller limit.
+MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+
+#: Which versions arbite will not keep. A refusal rather than a truncation or a summary:
+#: an operation whose evidence cannot be written **must not happen**, so the caller is
+#: told to change the file outside the proxy instead of getting an unrecorded write.
+SIZE_LIMIT_HINT = "keep files larger than the limit outside managed source paths"
+SIZE_LIMIT_REASON = "evidence_too_large"
+
+register_next_actions(SIZE_LIMIT_REASON, [SIZE_LIMIT_HINT])
+
+
+def require_storable_artifact(digest: str, data: bytes) -> None:
+    """Refuse a version this proxy will not keep, naming the size, the limit and the digest.
+
+    Called by every backend's `put_artifact_bytes` (so a direct caller -- an import, a
+    recovery pass, a test -- cannot store what the limit refuses) and by the mutation
+    engine *before* it stores anything at all (so a refused operation leaves no partial
+    evidence either). The rule is one function rather than one per sink because the
+    answer to "may this be recorded" must not depend on where the bytes would go.
+    """
+    size = len(data)
+    if size > MAX_ARTIFACT_BYTES:
+        raise EvidenceRefused(
+            f"the evidence for {short_digest(digest)} is {size} bytes, over the "
+            f"{MAX_ARTIFACT_BYTES}-byte limit one stored version may have;\n"
+            "nothing was changed",
+            [SIZE_LIMIT_HINT],
+            text_hint=f"next: {SIZE_LIMIT_HINT}",
+        )
 
 
 @dataclass(frozen=True)
@@ -777,24 +820,44 @@ class CoordinationStore(ABC):
         """Store `data` as the content `digest` names, and return where it went.
 
         Content is stored once by digest, so two receipts that share a version share
-        the bytes and an edit-then-revert keeps both versions once. Implemented by
-        the file backend (a file named by the digest, beside the artifact records);
-        the SQLite backend refuses it for now rather than inventing a second answer
-        -- whether content lives in a BLOB column or a sidecar file is a storage
-        decision the change-receipt slice makes once, with verification
-        (tic-7c42)."""
+        the bytes and an edit-then-revert keeps both versions once. Every backend
+        implements this, because a mutation's evidence is not optional: the file
+        backend writes a file named by the digest beside the artifact records, and the
+        SQLite backend keeps the bytes in a BLOB column of its own database. Both call
+        `require_storable_artifact` first, so the size limit is one rule rather than a
+        per-sink temperament.
+
+        A backend that could not store content refuses here, by name, and a mutation
+        that reaches this refusal has not changed a byte of the project yet."""
         raise NotImplementedError(
-            f"the '{self.kind}' coordination backend does not store artifact content yet "
-            "(tic-7c42 decides how and verifies it)"
+            f"the '{self.kind}' coordination backend does not store artifact content, so "
+            "the evidence this operation must keep cannot be written"
         )
 
     def get_artifact_bytes(self, digest: str) -> bytes:
         """The stored content for `digest`. Missing content is an error naming the
         digest: an artifact record whose bytes are gone is drift, not an empty file."""
         raise NotImplementedError(
-            f"the '{self.kind}' coordination backend does not read artifact content yet "
-            "(tic-7c42)"
+            f"the '{self.kind}' coordination backend does not read artifact content"
         )
+
+    def verify_artifact(self, digest: str) -> bytes:
+        """Read `digest`'s content back and prove it *is* that content.
+
+        Implemented once, here, because "the evidence still says what it said" has to
+        mean the same thing whichever store holds it -- and because the check is a
+        digest recomputation, not a backend trick. A mismatch is drift: the bytes are
+        named by their digest, so content that hashes to something else is either
+        corruption or somebody else's file, and neither may be served as the version a
+        receipt recorded."""
+        data = self.get_artifact_bytes(digest)
+        actual = digest_bytes(data)
+        if actual != digest:
+            raise CoordinationError(
+                f"artifact {digest} holds bytes with digest {short_digest(actual)}, so the "
+                "stored evidence is not the version the receipt recorded"
+            )
+        return data
 
     # ------------------------------------------------------------------
     # Interfaces for later slices -- defined here, not implemented here
