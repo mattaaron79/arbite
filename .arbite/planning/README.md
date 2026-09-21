@@ -14,7 +14,12 @@ required. Agents are started manually and may use different providers/runtimes.
 Implement now through the two ticket epics:
 
 1. [Shared-directory coordination](shared-directory-coordination.md), including
-   file proxy, claims, attempts, automatic change evidence, and recovery.
+   file proxy, claims, attempts, scratch payload transport, automatic change
+   evidence, recovery, and agent command passthrough. Its agent-facing surface is
+   frozen command by command in
+   [interaction-examples.md](interaction-examples.md), which is normative: those
+   transcripts are the acceptance targets. The ticket cut is in
+   [ticket-index.md](ticket-index.md).
 2. [Multi-provider job board](multi-provider-job-board.md), including passive
    worker profiles, reservations, offers, continuity packages, and event queries.
 
@@ -32,8 +37,11 @@ first-class epic implementation is presumed.
 
 ## Shared design rules
 
-- The current ticket store remains authoritative. Use the configured sink;
-  this checkout currently uses SQLite. Existing unrelated tickets are untouched.
+- The configured sink remains authoritative. `.arbite/project.yaml` selects the
+  `file` sink in this checkout, and `.arbite/` is tracked in git, so tickets are
+  version-controlled documents; the previously indexed tickets were never
+  materialized here and the SQLite store that briefly held them is gone. Existing
+  closed tickets are untouched.
 - File and SQLite sinks must implement the same coordination semantics. A file
   sink may use process locks and a journal; it must not secretly require SQLite.
 - Add a storage-neutral application layer for operations that span tickets,
@@ -69,6 +77,10 @@ do not pretend these capabilities already exist. Existing commands should remain
 usable unless their behavior violated newly documented safety rules. Migration
 tests and refusal messages must cover those deliberate restrictions.
 
-The .arbite directory is currently gitignored. These plans and SQLite tickets
-are local artifacts; creating them does not commit or publish them. Back up the
-store and plans together before moving this roadmap elsewhere.
+Everything under `.arbite/` is tracked in git except runtime coordination state:
+`.arbite/coordination/` and `.arbite/scratch/` are ignored. Tickets, plan
+documents and agent scratchpads are committed and are the development record;
+claims, receipts, events and staged payloads are local and are not. Evidence
+therefore dies with the machine unless the owner keeps it, so generate any devlog
+from the tickets plus a receipt summary taken before pruning. Back up the plans
+and tickets together before moving this roadmap elsewhere.

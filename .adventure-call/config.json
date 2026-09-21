@@ -1,0 +1,15 @@
+{
+  "adventure_call": "0.1.0",
+  "options": {
+    "strip_prefix": "",
+    "module_prefix": null,
+    "exclude": [],
+    "exclude_dir": [],
+    "max_file_bytes": 1048576,
+    "no_source": false,
+    "no_heuristic": false,
+    "module_calls": true,
+    "contains_edges": false,
+    "external_imports": false
+  }
+}
