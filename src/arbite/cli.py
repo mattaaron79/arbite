@@ -722,23 +722,35 @@ def cmd_receipt(args):
 
 
 def cmd_cmd(args):
-    """Run a command and record what it is *observed* to change.
+    """Run a command and record what it is *observed* -- or *holds* -- to change.
 
     Passthrough exists so an agent can keep its habits: `grep`, `sed` and `mv` are what a
     model already uses well, and wrapping the invocation means the change is captured
-    anyway. It is deliberately the lowest-fidelity path in the proxy, and the report says
-    so: a digest manifest of the managed paths is taken before and after, the paths that
-    differ get a receipt and a `passthrough.changed` event, the run itself is one
-    `passthrough.exec` event carrying the tool, the argv hash, the exit code and the
-    duration -- and *no exclusivity is claimed*, because nothing was acquired. The rules
-    -- what may run at all, what a manifest covers, what is recorded -- live in
-    `coordination.passthrough`.
+    anyway. By default it is deliberately the lowest-fidelity path in the proxy, and the
+    report says so: a digest manifest of the managed paths is taken before and after, the
+    paths that differ get a receipt and a `passthrough.changed` event, the run itself is
+    one `passthrough.exec` event carrying the tool, the argv hash, the exit code and the
+    duration -- and *no exclusivity is claimed*, because nothing was acquired.
+
+    `--claim PATH...` is guarded mode instead, and it is a different mode rather than a
+    stronger observation: those paths are acquired all-or-nothing *before* the command
+    starts, so the report can say which claim generation the change happened under; a busy
+    path refuses the whole run with the holder named and nothing started; every change is
+    verified against the claimed set afterwards; a change outside it is reported as
+    `unclaimed_write` and left exactly where the tool put it, because arbite does not roll
+    back a command it did not perform; and the claims are released when the run ends,
+    including when the tool fails.
+
+    The rules -- what may run at all, what a manifest covers, what is recorded, what a
+    claim covers -- live in `coordination.passthrough`.
 
     The wrapped command's own exit code is what this returns, because a tool's result has
-    to survive untouched (0-5 are all reachable that way). Only arbite's own refusals use
-    125 (refused before running), 126 (an invocation arbite does not support) and 127 (the
-    tool is not on PATH), every one of them is decided before any process starts, and each
-    says the command did not run.
+    to survive untouched (0-5 are all reachable that way). Two exceptions are deliberate.
+    Arbite's own refusals use 125 (refused before running), 126 (an invocation arbite does
+    not support) and 127 (the tool is not on PATH), every one of them decided before any
+    process starts, and each says the command did not run. And a guarded run whose
+    verification finds a change outside the claimed set returns 1, with the tool's own code
+    still on the `exit:` line and in `exit_code`.
     """
     sink = _require_sink(args)
     runs = coordination_passthrough.PassthroughRuns(sink, _lifecycle(args, sink))
@@ -3527,13 +3539,21 @@ def build_parser():
         "The command runs as argv (no shell), so pass the program and its arguments after "
         "'--'; '--shell' opts into 'sh -c \"<line>\"', where redirections and other shell "
         "syntax happen in the shell and become visible only after the fact. Observation claims "
-        "no exclusivity: another writer can interleave, and the report says so. Commands that "
+        "no exclusivity: another writer can interleave, and the report says so. "
+        "'--claim PATH...' runs it in guarded mode instead: the declared paths are claimed "
+        "all-or-nothing before the command starts (a path another attempt holds refuses with "
+        "nothing claimed and nothing run), every change is verified against the claimed set "
+        "afterwards, a change outside it is reported as 'unclaimed_write' and left in place "
+        "rather than undone, and the claims are released when the run ends. Commands that "
         "cannot be observed honestly are refused *before* they run -- shell syntax without "
         "'--shell', interactive tools, watchers, background jobs, a tool that is not on PATH, "
-        "an attempt that is no longer current, a project with no coordination store -- and "
+        "an attempt that is no longer current, a project with no coordination store, a "
+        "declared path another attempt holds -- and "
         "every refusal says the command did not run. The wrapped command's own exit code is "
-        "returned untouched; arbite's refusals use 125, 126 and 127. Output capture is "
-        "bounded and the command's output is not stored: arbite records versions, not prose.",
+        "returned untouched, except that a guarded run returns 1 when its verification finds "
+        "a change outside the claimed set; arbite's refusals use 125, 126 and 127. Output "
+        "capture is bounded and the command's output is not stored: arbite records versions, "
+        "not prose.",
     )
     p_cmd.add_argument(
         "--ticket",
@@ -3550,8 +3570,11 @@ def build_parser():
         nargs="+",
         metavar="PATH",
         default=None,
-        help="guarded mode: the paths the command may touch. Not implemented yet (refused "
-        "with exit 125), so this run is always observed rather than exclusive",
+        help="guarded mode: the paths this command may touch. They are claimed "
+        "all-or-nothing before it runs -- a path another attempt holds refuses the whole "
+        "run (exit 125) with nothing claimed and nothing run -- every change is verified "
+        "against them afterwards, and they are released when the run ends. Requires "
+        "--ticket and --attempt",
     )
     p_cmd.add_argument(
         "--shell",

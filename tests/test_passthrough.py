@@ -145,12 +145,9 @@ def _refusals(project, kind="file"):
             ),
         ),
         (
-            "guarded mode (C14)",
+            "guarded busy (C14)",
             125,
-            lambda: state.run(
-                project, "cmd", "--ticket", HOLDER_TICKET, "--attempt", HOLDER,
-                "--claim", FILE_PY, "--", "true", sink_kind=kind, expect=125,
-            ),
+            lambda: _busy_declared_path(project, kind),
         ),
         (
             "no coordination store",
@@ -171,6 +168,21 @@ def _refusals(project, kind="file"):
             lambda: state.run(project, "cmd", sink_kind=kind, expect=126),
         ),
     ]
+
+
+def _busy_declared_path(project, kind):
+    """A declared path another attempt holds: guarded mode's own refusal (PC3).
+
+    The rival's claim is acquired through the real `file claim` first, so what the run
+    meets is a live claim record rather than a fixture's idea of one -- and the point of
+    the refusal is that the command it would have run (a sed on the path it could not
+    claim) never starts.
+    """
+    state.claim(project, FILE_PY, RIVAL_TICKET, RIVAL, sink_kind=kind)
+    return state.run(
+        project, "cmd", "--ticket", HOLDER_TICKET, "--attempt", HOLDER,
+        "--claim", FILE_PY, "--", "sed", "-i", O_EXCL, FILE_PY, sink_kind=kind, expect=125,
+    )
 
 
 def _run_without_a_store(parent, kind):
@@ -197,7 +209,10 @@ def test_every_refusal_says_the_command_did_not_run(tmp_path, kind):
         proc = run()
         assert proc.returncode == code, label
         assert proc.stdout == "", f"{label} wrote to stdout"
-        assert "error:" in proc.stderr, label
+        # The label is the outcome vocabulary's, which is why a refused *claim* prints
+        # `busy:` rather than `error:`: 125 is busy's meaning here even though the code
+        # cannot be 4, because 0-5 belong to the wrapped tool.
+        assert proc.stderr.startswith(("error: ", "busy: ", "stale_read: ")), label
         assert state.events(project, coordination_passthrough.EXEC_KIND, sink_kind=kind) == []
         assert state.receipts(project, sink_kind=kind) == []
     assert _manifest_texts(project) == before, "a refused command changed a file"
@@ -284,9 +299,10 @@ def test_the_json_report_carries_the_same_facts_as_the_text(tmp_path, kind):
     """Text is the primary interface and JSON is the branchable form of the same facts.
 
     The one fact the text states as a promise is the exclusivity seam: the frozen PC1 hint
-    names `--claim` as the way to get exclusivity, so the JSON says out loud that guarded
-    mode is not available yet (`exclusivity.available: false`) rather than letting a
-    consumer read the hint as something arbite already does.
+    names `--claim` as the way to get exclusivity, so the JSON says whether that flag
+    exists at all (`exclusivity.available`, true now that guarded mode has landed) and what
+    *this* run actually held (`claimed: []`, because an observation acquires nothing). The
+    hint can therefore be read as a command that works.
     """
     as_text = tmp_path / "text"
     as_text.mkdir()
@@ -316,9 +332,9 @@ def test_the_json_report_carries_the_same_facts_as_the_text(tmp_path, kind):
     assert payload["ran"] is True
     assert payload["exclusivity"] == {
         "claimed": [],
-        "available": False,
+        "available": True,
         "hint": f"arbite cmd --claim {FILE_PY} -- <command>",
-        "reason": coordination_passthrough.REASON_GUARDED,
+        "reason": None,
     }
 
 

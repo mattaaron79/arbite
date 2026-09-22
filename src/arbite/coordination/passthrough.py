@@ -10,7 +10,7 @@ tools agents actually reach for, how often a change lands outside a claimed set,
 how often a claim would have blocked real work.
 
 It is deliberately the lowest-fidelity path in the proxy, and its output says so.
-Three rules shape it:
+Four rules shape it:
 
 - **Observation is not exclusivity.** Nothing is claimed, so another writer can
   interleave; the report prints `observed (no exclusivity claimed)` and each receipt
@@ -25,10 +25,18 @@ Three rules shape it:
   to branch.
 - **The wrapped tool's exit code survives untouched**, including the codes 0-5 the rest
   of arbite reserves (a tool really can exit 4). Only arbite's own pre-run refusals use
-  125, 126 and 127.
+  125, 126 and 127. Guarded mode's escape report is the one place arbite answers with a
+  code of its own for a command that really ran -- 1, for a finding the caller has to act
+  on -- and even there `exit:` and `exit_code` carry the tool's own code.
+- **Guarded mode is a different mode, not a stronger observation.** `--claim PATH...`
+  acquires the declared paths all-or-nothing *before* the command starts, refuses (125,
+  nothing claimed and nothing run) when one of them is busy, verifies every change against
+  the set it holds, reports an escape as `unclaimed_write` and leaves those bytes exactly
+  where the tool put them, and releases the claims when the run ends -- including when the
+  tool failed.
 
-What arbite cannot do is stated rather than implied, and it is the reason the report is
-short on claims:
+What arbite cannot do is stated rather than implied, and it is the reason an *observed*
+report is short on claims:
 
 - It cannot know which files a program *read*, so a read-only run is an execution event
   and nothing else.
@@ -41,9 +49,11 @@ short on claims:
   coordination tree, the store files, scratch, the project config) and the generated or
   build output it refuses to record a proxy write for are not managed paths.
 
-Guarded mode (`--claim PATH...`) is the *next* slice (tic-42d2, C14) and is deliberately
-not implemented here: the flag is parsed, so the shape later tickets need already
-exists, and any use of it today is refused by name.
+Guarded mode adds ownership rather than fidelity: it cannot make a `sed` visible to the
+manifest any better than observation can, and it does not try. What it adds is the claim,
+and with it the two things observation cannot say -- that the declared paths were held
+while the command ran, and that a change outside the declaration escaped rather than
+merely happened.
 """
 
 from __future__ import annotations
@@ -56,11 +66,13 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
 from ..errors import ArbiteError
+from .claims import CLAIM_COLUMN_GAP, FileClaims
+from .lifecycle import local_time
 from .paths import (
     STATE_CONFIG,
     STATE_COORDINATION,
@@ -81,9 +93,12 @@ from .records import (
     utc_now,
 )
 from .results import (
+    BUSY,
+    EXIT_ERROR,
     EXIT_PASSTHROUGH_NOT_FOUND,
     EXIT_PASSTHROUGH_REFUSED,
     EXIT_PASSTHROUGH_UNSUPPORTED,
+    OUTCOME_LABELS,
     render_next_line,
     text_hint_of,
 )
@@ -111,11 +126,15 @@ REASON_INTERACTIVE = "interactive"
 REASON_LONG_RUNNING = "long_running"
 REASON_BACKGROUND = "background"
 REASON_NOT_FOUND = "tool_not_found"
-REASON_GUARDED = "guarded_not_implemented"
 REASON_NO_STORE = "no_coordination_store"
 REASON_ATTEMPT = "attempt_not_current"
 REASON_NO_COMMAND = "no_command"
 REASON_ATTEMPT_PAIR = "attempt_pair"
+#: Guarded mode's refusals. A busy declared path uses the claim layer's own reason
+#: (`file_busy`), so a consumer branching on it reads the same key `file claim` publishes.
+REASON_CLAIM_BUSY = "file_busy"
+REASON_CLAIM_REFUSED = "claim_refused"
+REASON_CLAIM_ATTEMPT = "claim_needs_attempt"
 
 #: The refusals whose sentence is frozen: PC6 prints these three literally, so the
 #: words live here rather than at the call site.
@@ -180,15 +199,58 @@ BACKGROUND_HINT = (
     "the change is unattributed"
 )
 
-#: The guarded-mode seam. C14 replaces the refusal with the acquisition, the busy
-#: refusal and the verification; today the flag exists so the caller-facing shape does.
-GUARDED_MESSAGE = (
-    "guarded mode ('--claim') is not implemented yet, so this run would claim no "
-    "exclusivity"
+#: A declaration with nobody to own it. Claiming a path is claiming it *for an attempt*,
+#: so `--claim` without the pair is an invocation arbite cannot carry out rather than a
+#: policy refusal.
+CLAIM_ATTEMPT_MESSAGE = (
+    "guarded mode claims paths for one attempt, so '--claim' needs both '--ticket' and "
+    "'--attempt'"
 )
-GUARDED_HINT = (
-    "next: 'arbite cmd -- <command>' to run it in observed mode, which records what it "
-    "changed without claiming anything"
+CLAIM_ATTEMPT_HINT = (
+    "next: name the ticket and its current attempt, or drop '--claim' to run the command "
+    "in observed mode"
+)
+
+#: The busy refusal (PC3): what happened, then the request as a table. The held rows name
+#: the holder, and the free ones say `free`, because the caller's next decision is which
+#: of the declared paths it can work on instead.
+CLAIM_BUSY_HEADING = (
+    "{held} of {total} declared {noun} {verb} held; nothing was claimed and the command "
+    "did not run"
+)
+CLAIM_BUSY_FREE = "free"
+CLAIM_BUSY_HELD = "held by {holder} ({actor}) since {since}, gen {generation}"
+
+#: What a finished guarded run says about its claims. The tool's own outcome is on the
+#: `exit:` line; these lines are about ownership, which does not outlive the run.
+RELEASE_REASON = "work complete for this command"
+RELEASED = "claims released (work complete for this command)"
+RELEASED_FAILED = "claims released (the command exited {code})"
+RELEASED_ESCAPED = "claims released (the run is over; the unclaimed write is left in place)"
+RELEASE_UNRECORDED = (
+    "note: the claims could not be released ({error}); 'arbite file claims' shows who "
+    "holds them now"
+)
+
+#: The escape report (PC4). The continuation is indented to the label's own width so the
+#: two lines read as one sentence, and the message is deliberately about *this run's*
+#: claim: an escape is a write arbite held no authorisation for, not a write nobody owns.
+ESCAPE_LABEL = "unclaimed_write:"
+ESCAPE_LINE = (
+    ESCAPE_LABEL
+    + " {path} was modified without being claimed; the bytes are recorded"
+)
+ESCAPE_TAIL = (
+    " " * (len(ESCAPE_LABEL) + 1)
+    + "and left as they are (arbite does not undo a command it did not perform)"
+)
+ESCAPE_HOLDER = (
+    " " * (len(ESCAPE_LABEL) + 1)
+    + "note: {holder} holds it at generation {generation}; this run had no claim of its own"
+)
+ESCAPE_HINT = (
+    "'arbite file claim {paths} --ticket {ticket} --attempt {attempt}' and re-read {them},\n"
+    "      or 'arbite changes {ticket}' and correct by hand"
 )
 
 #: What a version arbite cannot keep is reported as: the receipt still names the digest,
@@ -220,16 +282,25 @@ ATTEMPT_PAIR_HINT = (
 # The report's literals
 # ---------------------------------------------------------------------------
 
-#: How an observed run is labelled. `observed` is the honest word: another writer can
-#: interleave, and C14's guarded mode is what earns the word `exclusive`.
+#: How a run is labelled. `observed` is the honest word for a run that claimed nothing
+#: (another writer can interleave), and `guarded` is the honest word for one that held the
+#: paths it declared -- which is also why only that mode may say `exclusive`.
 MODE = "observed"
+MODE_GUARDED = "guarded"
 NO_EXCLUSIVITY = "(no exclusivity claimed)"
 MODE_OBSERVED = f"mode: {MODE}"
+MODE_GUARDED_LINE = f"mode: {MODE_GUARDED}"
+EXCLUSIVE = "(exclusive on {count} {noun})"
 SHELL_NOTE = "note: redirections happen in the shell and are visible only after the fact"
 
 ECHO_PREFIX = "arbite cmd: "
 EXIT_LINE = "exit: {code} ({ms} ms)  {mode}{tail}"
 CHANGED_HEADING = "changed {count} {noun}:"
+#: Guarded mode's headings. The aggregate is what a reader needs first, so the heading
+#: states it and the rows carry the per-path column only when the rows disagree (see
+#: `Change.row`): a run where nothing escaped says `all inside the claimed set`.
+CHANGED_GUARDED = "changed {count} {noun}, all inside the claimed set:"
+CHANGED_ESCAPED = "changed {count} {noun}, {escaped} OUTSIDE the claimed set:"
 
 #: The event line of the frozen PC1/PC5 blocks: the kind, the tool, the ticket and
 #: attempt it is attributed to, and the actor the store names for that attempt. The
@@ -246,6 +317,9 @@ NEXT_REVIEW = (
     "'arbite changes {ticket}' to review, or claim paths next time ('{claim}') for exclusivity"
 )
 NEXT_CLAIM_ONLY = "claim paths next time ('{claim}') for exclusivity"
+#: A guarded run that stayed inside its claim has nothing left to claim: the review is the
+#: only next step, and naming `--claim` again would be advice the caller has already taken.
+NEXT_GUARDED_REVIEW = "'arbite changes {ticket}' to review"
 NEXT_FAILED = "'arbite changes {ticket}' to review what the failed command left behind"
 NEXT_FAILED_NO_TICKET = "'arbite receipt {operation}' to read the change it left behind"
 
@@ -262,6 +336,14 @@ DETAIL_DELTA = "+{added} -{removed}"
 DETAIL_BINARY = "{before} -> {after} bytes (binary)"
 
 ROW = "  {status} {path}  {before} -> {after}  {detail}  ({operation})"
+#: The same row with the claimed-set column (PC4), between the detail and the operation id.
+ROW_WITH_CLAIM = "  {status} {path}  {before} -> {after}  {detail}  {claim}  ({operation})"
+CLAIM_INSIDE = "claimed"
+CLAIM_OUTSIDE = "NOT claimed"
+#: What a guarded run answers when its own verification found a change outside the set it
+#: holds. It is arbite's own outcome, so it is arbite's own error code -- and it is the one
+#: code this command produces that is not the wrapped tool's.
+ESCAPE_EXIT = EXIT_ERROR
 
 #: The odd names the receipts' `result` field can have. An observed change is recorded,
 #: not performed, and `succeeded` is the store's word for "this receipt is final"; the
@@ -319,6 +401,12 @@ class Refusal:
     an event. `confirmation` is the sentence the frozen blocks print for the refusals
     that name it; JSON always carries `ran: false`, so the fact is not lost where the
     text is pinned by a transcript.
+
+    `label` is the word the text puts in front of the message -- `error` for a policy
+    refusal, `busy` for one the exit-code vocabulary calls busy (a claimed path is held) --
+    and `rows` are the lines that continue it, which is how the busy table reaches a
+    template whose first line is pinned. `data` adds the structured half JSON carries and
+    the sentence cannot.
     """
 
     message: str
@@ -327,9 +415,13 @@ class Refusal:
     text_hint: str = ""
     confirmation: str = ""
     actions: tuple = ()
+    label: str = OUTCOME_LABELS["error"]
+    mode: str = MODE
+    rows: tuple = ()
+    data: dict = field(default_factory=dict)
 
     def to_text(self) -> str:
-        lines = [f"error: {self.message}"]
+        lines = [f"{self.label}: {self.message}", *self.rows]
         if self.confirmation:
             lines.append(self.confirmation)
         if self.text_hint:
@@ -337,14 +429,18 @@ class Refusal:
         return "\n".join(lines)
 
     def to_json(self) -> dict:
-        return {
-            "error": self.message,
-            "reason": self.reason,
-            "exit_code": self.exit_code,
-            "ran": False,
-            "mode": MODE,
-            "next_actions": list(self.actions),
-        }
+        payload = dict(self.data)
+        payload.update(
+            {
+                "error": self.message,
+                "reason": self.reason,
+                "exit_code": self.exit_code,
+                "ran": False,
+                "mode": self.mode,
+                "next_actions": list(self.actions),
+            }
+        )
+        return payload
 
 
 def _refused(message: str, reason: str, hint: str = "", actions=()) -> Refusal:
@@ -357,6 +453,22 @@ def _refused(message: str, reason: str, hint: str = "", actions=()) -> Refusal:
         confirmation=NO_RUN,
         actions=tuple(actions),
     )
+
+
+@dataclass(frozen=True)
+class Claimed:
+    """What a guarded run acquired, before its command starts (tic-42d2 / C14).
+
+    The paths are the canonical ones the claim layer recorded, so "inside the claimed set"
+    is a fact about ownership rather than about the spelling the caller typed. `lines` is
+    the acquisition as `arbite file claim` prints it -- the heading, a row per path, and
+    the note a re-acquisition carries -- because the run reports the claim it holds in the
+    words the claim command already uses.
+    """
+
+    paths: tuple
+    generation: int
+    lines: tuple
 
 
 def _unsupported(message: str, reason: str, hint: str, confirmation: bool = False) -> Refusal:
@@ -415,6 +527,9 @@ class Change:
     after: Optional[ManifestEntry]
     operation: str
     claim: Optional[dict] = None
+    #: Whether this change falls inside the set the run claimed, set by guarded mode's
+    #: verification; None in observed mode, where there is no declared set to compare with.
+    part_of_claim: Optional[bool] = None
 
     @property
     def before_digest(self) -> str:
@@ -448,16 +563,24 @@ class Change:
             return DETAIL_DELTA.format(added=added, removed=removed)
         return DETAIL_BINARY.format(before=self.before.size, after=self.after.size)
 
-    def row(self) -> str:
-        # TODO(tic-42d2 / C14): guarded mode inserts its `claimed` / `NOT claimed` column
-        # between the detail and the operation id (PC4) once every change is verified
-        # against the claimed set; observed mode has no set to compare against.
-        return ROW.format(
+    def row(self, width: int = 0, show_claim: bool = False) -> str:
+        """The row as the report prints it, with the claimed-set column when it is needed.
+
+        `show_claim` is on only for a guarded run that had an escape: there the rows
+        disagree with each other, and a reader has to see which side of the claim each one
+        fell on (PC4). A guarded run whose changes are all inside the set says so in the
+        heading, and printing `claimed` on every row of it would be a word repeated rather
+        than a fact told (PC2). `width` pads the path column so a multi-row block lines its
+        digests up; a single row is unaffected by it.
+        """
+        template = ROW_WITH_CLAIM if show_claim else ROW
+        return template.format(
             status=self.status,
-            path=self.path,
+            path=self.path.ljust(width),
             before=short_digest(self.before_digest),
             after=short_digest(self.after_digest),
             detail=self.detail,
+            claim=CLAIM_INSIDE if self.part_of_claim else CLAIM_OUTSIDE,
             operation=self.operation,
         )
 
@@ -471,7 +594,13 @@ class Change:
             "after_digest": self.after_digest,
             "detail": self.detail,
             "operation": self.operation,
-            "claimed": bool(self.claim and self.claim.get("mine")),
+            # Guarded mode answers the question its own row asks -- was this inside the
+            # declared set -- so text and JSON cannot disagree about the same run.
+            "claimed": (
+                self.part_of_claim
+                if self.part_of_claim is not None
+                else bool(self.claim and self.claim.get("mine"))
+            ),
             "held_by": (
                 None if not self.claim or self.claim.get("mine") else self.claim.get("holder")
             ),
@@ -576,16 +705,37 @@ class PassthroughRun:
     ticket_id: Optional[str] = None
     attempt_id: Optional[str] = None
     actor: Optional[str] = None
-    #: The paths a guarded run would hold (C14). Empty by construction here: `plan`
-    #: refuses `--claim` before a run exists, so no observed run can carry one.
+    #: The canonical paths this run holds, empty for an observed run. Non-empty is what
+    #: makes the run guarded: it was acquired by `plan` before the command could start, and
+    #: the release at the end goes back through the same claim layer.
     claim_paths: tuple = ()
+    claim_generation: int = 0
+    #: The acquisition as `arbite file claim` prints it, which the report repeats so the
+    #: caller can see what was held before it sees what the command did with it.
+    claims_lines: tuple = ()
+    #: The claim layer the acquisition and the release go through. None for an observed run,
+    #: which holds nothing and therefore has nothing to release.
+    claims: Optional[object] = None
+
+    @property
+    def guarded(self) -> bool:
+        """Whether this run holds declared paths. One word for one question, so no caller
+        has to re-derive "guarded" from a list that happens to be empty."""
+        return bool(self.claim_paths)
 
     # ------------------------------------------------------------------
     # Running
     # ------------------------------------------------------------------
 
     def execute(self) -> Report:
-        """Run the command, diff the manifest, record what changed and report it."""
+        """Run the command, diff the manifest, verify it, record it and report it.
+
+        The order is the whole of guarded mode's honesty: the changes are read out of the
+        manifest while the claim is still held (so each receipt can say which generation it
+        happened under), the run is recorded, and only then are the claims released -- after
+        the evidence that they were held, because a release rewrites the claim records the
+        receipts were read against.
+        """
         before = _manifest(self.project_root)
         started = time.monotonic()
         process, stdout, stderr = self._run()
@@ -593,8 +743,14 @@ class PassthroughRun:
         code = _exit_code(process.returncode)
         after = _manifest(self.project_root)
         changes = self._changes(before, after)
-        recorded = self._record(changes, code, duration_ms, stdout, stderr)
-        return self._report(changes, code, duration_ms, stdout, stderr, recorded)
+        escaped = ()
+        if self.guarded:
+            changes, escaped = self._verify(changes)
+        recorded = self._record(changes, escaped, code, duration_ms, stdout, stderr)
+        release = self._release() if self.guarded else None
+        return self._report(
+            changes, code, duration_ms, stdout, stderr, recorded, escaped, release
+        )
 
     def command_line(self) -> str:
         if self.shell:
@@ -687,10 +843,54 @@ class PassthroughRun:
         }
 
     # ------------------------------------------------------------------
+    # Verification and release
+    # ------------------------------------------------------------------
+
+    def _verify(self, changes) -> tuple:
+        """Every change against the claimed set: which are inside, and which escaped.
+
+        The set is what the acquisition holds -- the declared paths, canonicalised by the
+        claim layer -- so "inside" is a fact about ownership rather than about what happens
+        to be on disk now. Each change is stamped with its answer, which is what the row's
+        column and the JSON's `claimed` both read, and the escaped paths come back in
+        canonical order for the report and the next actions to name.
+
+        Nothing is undone here, and that is the point rather than an omission: arbite did
+        not perform the write, cannot know what the tool meant by it, and rolling back
+        bytes it never held would destroy work it was asked only to run.
+        """
+        claimed = set(self.claim_paths)
+        verified = []
+        escaped = []
+        for change in changes:
+            inside = change.path in claimed
+            if not inside:
+                escaped.append(change.path)
+            verified.append(replace(change, part_of_claim=inside))
+        return verified, tuple(escaped)
+
+    def _release(self) -> tuple:
+        """Release this run's claims, and answer honestly whether it worked.
+
+        The command has already run, so a failure here cannot become a refusal: the claim
+        keeps whatever the store says about it, the report names the problem instead of
+        pretending the path is free, and `doctor --fix` is what releases a claim whose
+        attempt is over. Release is what keeps a guarded run's ownership from outliving the
+        run itself.
+        """
+        try:
+            self.claims.release(
+                self.ticket_id, self.attempt_id, list(self.claim_paths), RELEASE_REASON
+            )
+        except ArbiteError as failed:
+            return False, str(failed)
+        return True, None
+
+    # ------------------------------------------------------------------
     # Recording
     # ------------------------------------------------------------------
 
-    def _record(self, changes, code: int, duration_ms: int, stdout, stderr) -> dict:
+    def _record(self, changes, escaped, code: int, duration_ms: int, stdout, stderr) -> dict:
         """Persist the evidence: one receipt per changed path, then the run's event.
 
         Everything commits in one transaction, so a run cannot be half recorded. The
@@ -699,6 +899,12 @@ class PassthroughRun:
         has no artifact store -- does not fail the recording, because the tool already
         ran and a receipt naming the digest is still true. `artifacts` says which
         versions have an image behind them.
+
+        A guarded run's escape is recorded on the change's own event (the `claimed` flag)
+        and on the run's (`unclaimed_write`, with the claimed set beside it) rather than as
+        a receipt kind of its own: the evidence is the same passthrough receipt either way,
+        and the question "did this change fall inside the claim" is a fact about the run,
+        which is where the stream asks it.
         """
         artifacts: dict = {}
         notes: list = []
@@ -732,8 +938,8 @@ class PassthroughRun:
             "argv": list(self.argv),
             "argv_hash": digest_bytes(_argv_bytes(self.argv, self.shell)),
             "shell": self.shell,
-            "mode": MODE,
-            "exclusive": False,
+            "mode": MODE_GUARDED if self.guarded else MODE,
+            "exclusive": self.guarded,
             "exit_code": code,
             "duration_ms": duration_ms,
             "changed": [change.path for change in changes],
@@ -745,11 +951,12 @@ class PassthroughRun:
             "stdout_bytes": stdout.bytes,
             "stderr_bytes": stderr.bytes,
         }
+        if self.guarded:
+            payload["claim_paths"] = list(self.claim_paths)
+            payload["claim_generation"] = self.claim_generation
+            payload["unclaimed_write"] = list(escaped)
         with self.store.transaction() as txn:
             for change in changes:
-                # TODO(tic-42d2 / C14): a guarded run verifies every change against the
-                # claimed set here and records an unclaimed write as `unclaimed_write`
-                # instead of the plain observed receipt this slice writes.
                 txn.put_record(
                     OperationReceipt(
                         id=change.operation,
@@ -783,6 +990,9 @@ class PassthroughRun:
                         "before": change.before_digest,
                         "after": change.after_digest,
                         "generation": change.generation,
+                        # Only a guarded run had a set to be inside or outside of; an
+                        # observed run's null would be a question it never asked.
+                        **({"claimed": change.part_of_claim} if self.guarded else {}),
                     },
                 )
             txn.append_event(
@@ -829,26 +1039,32 @@ class PassthroughRun:
     # Reporting
     # ------------------------------------------------------------------
 
-    def _report(self, changes, code: int, duration_ms: int, stdout, stderr, recorded) -> Report:
-        """The report: what ran, what it cost, what changed, and what is *not* claimed."""
-        lines = [ECHO_PREFIX + self.command_line()]
+    def _report(
+        self, changes, code, duration_ms, stdout, stderr, recorded, escaped, release
+    ) -> Report:
+        """The report: the claim it held, what ran, what changed, and what escaped.
+
+        A guarded run opens with the acquisition -- so the caller sees what was held
+        before it sees what the command did with it -- states an escape once instead of
+        once per row, and closes by saying what happened to the claims. Observed mode's
+        lines are unchanged: the two modes differ in what they can honestly say, not in
+        the shape of the report.
+        """
+        lines = list(self.claims_lines) if self.guarded else []
+        lines.append(ECHO_PREFIX + self.command_line())
         lines.extend(_captured_lines(stdout))
         lines.append(
             EXIT_LINE.format(
-                code=code,
-                ms=duration_ms,
-                mode=MODE_OBSERVED,
-                tail=f"  {SHELL_NOTE}" if self.shell else f" {NO_EXCLUSIVITY}",
+                code=code, ms=duration_ms, mode=self._mode_line(), tail=self._mode_tail()
             )
         )
         if changes:
-            lines.append(
-                CHANGED_HEADING.format(
-                    count=len(changes), noun="path" if len(changes) == 1 else "paths"
-                )
-            )
-            lines.extend(change.row() for change in changes)
+            lines.append(self._change_heading(changes, escaped))
+            lines.extend(self._change_rows(changes, escaped))
         lines.append(self._event_line())
+        lines.extend(self._escape_lines(escaped, changes))
+        if self.guarded:
+            lines.append(self._release_line(code, escaped, release))
         for note in recorded["notes"]:
             lines.append(note)
         for name, stream in (("stdout", stdout), ("stderr", stderr)):
@@ -857,15 +1073,97 @@ class PassthroughRun:
             if stream.truncated:
                 lines.append(stream.note(name))
 
-        actions, text_hint = self._next(changes, code)
+        actions, text_hint = self._next(changes, code, escaped)
+        # An escape is arbite's own finding, so it is arbite's own code -- the one outcome
+        # this command answers for itself. The tool's code is still what `exit:` and the
+        # JSON's `exit_code` carry, so nothing about the wrapped command is rewritten.
+        exit_code = ESCAPE_EXIT if escaped else code
         return Report(
-            exit_code=code,
+            exit_code=exit_code,
             lines=lines,
-            data=self._facts(changes, code, duration_ms, stdout, stderr, recorded),
+            data=self._facts(
+                changes, code, exit_code, duration_ms, stdout, stderr, recorded, escaped, release
+            ),
             next_actions=actions,
             text_hint=text_hint,
             stderr_text=stderr.text,
         )
+
+    def _mode_line(self) -> str:
+        """The mode the `exit:` line names: what this run could claim, in one phrase."""
+        if not self.guarded:
+            return MODE_OBSERVED
+        count = len(self.claim_paths)
+        noun = "path" if count == 1 else "paths"
+        return f"{MODE_GUARDED_LINE} {EXCLUSIVE.format(count=count, noun=noun)}"
+
+    def _mode_tail(self) -> str:
+        """The note the exit line adds.
+
+        Observed mode has to say what it did *not* claim, which is the only honest thing
+        it can say about ownership; guarded mode has nothing to disclaim. A shell run says
+        where its redirections went in either mode, because that stays true either way.
+        """
+        if self.shell:
+            return f"  {SHELL_NOTE}"
+        return "" if self.guarded else f" {NO_EXCLUSIVITY}"
+
+    def _change_heading(self, changes, escaped) -> str:
+        """What changed, and whether the claimed set covered it."""
+        count = len(changes)
+        noun = "path" if count == 1 else "paths"
+        if not self.guarded:
+            return CHANGED_HEADING.format(count=count, noun=noun)
+        if not escaped:
+            return CHANGED_GUARDED.format(count=count, noun=noun)
+        return CHANGED_ESCAPED.format(count=count, noun=noun, escaped=len(escaped))
+
+    @staticmethod
+    def _change_rows(changes, escaped) -> list:
+        """The changed rows, with the path column padded so a multi-row block lines up.
+
+        The claimed column is printed only when the rows disagree with each other (see
+        `Change.row`), which is the difference between PC2's block and PC4's.
+        """
+        width = max(len(change.path) for change in changes)
+        return [change.row(width, show_claim=bool(escaped)) for change in changes]
+
+    @staticmethod
+    def _escape_lines(escaped, changes) -> list:
+        """The `unclaimed_write` block: one entry per escaped path, in canonical order.
+
+        Each says what escaped and that its bytes were kept, and -- when somebody *else*
+        holds the path -- who, because "without being claimed" must not read as "nobody
+        has a claim on it" when a claim record says otherwise.
+        """
+        if not escaped:
+            return []
+        by_path = {change.path: change for change in changes}
+        lines = []
+        for path in escaped:
+            lines.append(ESCAPE_LINE.format(path=path))
+            lines.append(ESCAPE_TAIL)
+            claim = by_path[path].claim
+            if claim and not claim["mine"]:
+                lines.append(
+                    ESCAPE_HOLDER.format(holder=claim["holder"], generation=claim["generation"])
+                )
+        return lines
+
+    @staticmethod
+    def _release_line(code, escaped, release) -> str:
+        """What happened to the claims, said rather than assumed.
+
+        The release runs whether the tool succeeded, failed or escaped, so the line says
+        which of the three it was. A release that could not be recorded is reported with
+        the command that follows it named, never as a silent success.
+        """
+        released, error = release
+        if not released:
+            return RELEASE_UNRECORDED.format(error=error)
+        if escaped:
+            return RELEASED_ESCAPED
+        return RELEASED if code == 0 else RELEASED_FAILED.format(code=code)
 
     def _event_line(self) -> str:
         line = EVENT_PREFIX + EVENT_TOOL.format(tool=self.tool)
@@ -875,16 +1173,37 @@ class PassthroughRun:
             line += EVENT_ACTOR.format(actor=self.actor)
         return line
 
-    def _next(self, changes, code) -> tuple:
+    def _next(self, changes, code, escaped) -> tuple:
         """The next actions, and the sentence they print as.
 
         The hint is computed from the state at the end of the run and names only tokens
         this command printed: the ticket, the paths that changed, and the receipts. A
         run that changed nothing has no next step (the frozen PC5 block prints none),
         which is the honest answer -- there is nothing to review.
+
+        An escape comes first because it is the only outcome here that leaves a decision
+        for the caller: the path has to be claimed properly (and re-read, since a
+        pre-claim read authorises nothing) or corrected by hand, and the review is offered
+        beside it because arbite will not decide which. A guarded run that stayed inside
+        its claim has already taken the only step observed mode's hint suggests, so its
+        hint names the review alone.
         """
         if not changes:
             return (), ""
+        if escaped:
+            paths = " ".join(escaped)
+            claim = (
+                f"arbite file claim {paths} --ticket {self.ticket_id} "
+                f"--attempt {self.attempt_id}"
+            )
+            review = f"arbite changes {self.ticket_id}"
+            text = ESCAPE_HINT.format(
+                paths=paths,
+                ticket=self.ticket_id,
+                attempt=self.attempt_id,
+                them="it" if len(escaped) == 1 else "them",
+            )
+            return (claim, review), f"next: {text}"
         if code != 0:
             first = changes[0].operation
             if self.ticket_id:
@@ -894,38 +1213,39 @@ class PassthroughRun:
                 action = f"arbite receipt {first}"
                 text = f"next: {NEXT_FAILED_NO_TICKET.format(operation=first)}"
             return (action,), text
+        if self.guarded:
+            review = f"arbite changes {self.ticket_id}"
+            return (review,), f"next: {NEXT_GUARDED_REVIEW.format(ticket=self.ticket_id)}"
         claim = "--claim " + " ".join(change.path for change in changes)
         if not self.ticket_id:
             return (), f"next: {NEXT_CLAIM_ONLY.format(claim=claim)}"
         review = f"arbite changes {self.ticket_id}"
         return (review,), f"next: {NEXT_REVIEW.format(ticket=self.ticket_id, claim=claim)}"
 
-    def _facts(self, changes, code, duration_ms, stdout, stderr, recorded) -> dict:
+    def _facts(
+        self, changes, code, exit_code, duration_ms, stdout, stderr, recorded, escaped, release
+    ) -> dict:
         """The JSON form: the same facts as the text, plus the branchable ones.
 
-        `exclusive` is False and stays False in this slice; `exclusivity` names the seam
-        (the `--claim` flag) *and* says it is not available yet, so a machine consumer
-        cannot read the frozen hint as a promise arbite does not keep.
+        `exclusive` is what this run actually held -- False for an observation, True for a
+        guarded run that acquired its declared paths -- while `exclusivity` describes the
+        seam itself: `available` is True now, so an observed report's hint may be read as
+        something arbite really does.
+
+        A guarded report adds `claims` (what it held, and whether the release worked),
+        `unclaimed_write` (the paths that escaped), `escaped` and `arbite_exit_code`. That
+        last one is the honest split `exit_code` cannot carry alone: `exit_code` is always
+        the wrapped tool's own, and `arbite_exit_code` is what this process returns, which
+        is 1 when the verification found an escape.
         """
-        return {
+        facts = {
             "command": list(self.argv),
             "tool": self.tool,
             "cmdline": self.command_line(),
             "shell": self.shell,
-            "mode": MODE,
-            "exclusive": False,
-            "exclusivity": {
-                "claimed": [],
-                "available": False,
-                "hint": (
-                    None
-                    if not changes
-                    else "arbite cmd --claim "
-                    + " ".join(change.path for change in changes)
-                    + " -- <command>"
-                ),
-                "reason": REASON_GUARDED,
-            },
+            "mode": MODE_GUARDED if self.guarded else MODE,
+            "exclusive": self.guarded,
+            "exclusivity": self._exclusivity(changes),
             "argv_hash": recorded["argv_hash"],
             "exit_code": code,
             "duration_ms": duration_ms,
@@ -937,6 +1257,43 @@ class PassthroughRun:
             "actor": self.actor,
             "receipts": [change.operation for change in changes],
             "ran": True,
+        }
+        if self.guarded:
+            released, error = release
+            facts["claims"] = {
+                "paths": list(self.claim_paths),
+                "generation": self.claim_generation,
+                "released": released,
+                "release_reason": RELEASE_REASON if released else None,
+            }
+            if error:
+                facts["claims"]["release_error"] = error
+            facts["unclaimed_write"] = list(escaped)
+            facts["escaped"] = bool(escaped)
+            facts["arbite_exit_code"] = exit_code
+        return facts
+
+    def _exclusivity(self, changes) -> dict:
+        """The `--claim` seam as a fact rather than as a promise.
+
+        The same four keys in both modes: what *this* run held (`claimed`), whether the flag
+        exists at all (`available`), the suggestion an observed run can still be given, and
+        an exception to `available` if one ever applies (None today). An observed run's hint
+        is a command that now works, which is exactly why `available` had to stop saying
+        otherwise the moment guarded mode landed.
+        """
+        hint = None
+        if not self.guarded and changes:
+            hint = (
+                "arbite cmd --claim "
+                + " ".join(change.path for change in changes)
+                + " -- <command>"
+            )
+        return {
+            "claimed": list(self.claim_paths),
+            "available": True,
+            "hint": hint,
+            "reason": None,
         }
 
 
@@ -954,6 +1311,10 @@ class PassthroughRuns:
         self.app = lifecycle.app
         self.store = lifecycle.store
         self.project_root = Path(self.app.project_root)
+        #: The claim layer. Guarded mode goes through exactly the operation `arbite file
+        #: claim` presents, which is what makes "passthrough cannot bypass ownership" a
+        #: property of the shared rules rather than of a second implementation of them.
+        self.claims = FileClaims(sink, lifecycle)
 
     def plan(
         self,
@@ -966,23 +1327,26 @@ class PassthroughRuns:
     ):
         """Everything that can refuse, before anything can run: a `Refusal` or a run.
 
-        The order is the order a caller can act on it: what was asked for at all, then
-        the seam that is not implemented, then the invocation's shape, then the tool,
-        then the state that has to hold for the run to be recorded and attributed. Every
-        one of them returns a value, so there is no path from this function to a started
-        process that skipped a check.
+        The order is the order a caller can act on it: what was asked for at all, the
+        pair that attributes a run, the declaration that needs one, the invocation's
+        shape, the tool, the state that has to hold for the run to be recorded and
+        attributed, and -- last, and only for a guarded run -- the acquisition itself.
+        Every one of them returns a value, so there is no path from this function to a
+        started process that skipped a check.
+
+        Acquisition is last on purpose: it is the only step here that *changes* state, so
+        every refusal that could have been made without it has already been made, and a
+        refused invocation never leaves a claim behind it.
         """
         argv = tuple(arg for arg in argv if arg is not None)
         if not argv:
             return _unsupported(NO_COMMAND_MESSAGE, REASON_NO_COMMAND, NO_COMMAND_HINT)
-        if claim_paths:
-            # TODO(tic-42d2 / C14): guarded mode replaces this refusal with the
-            # all-or-nothing claim, its busy refusal, and the verification of every
-            # observed change against the claimed set. The flag is parsed here so the
-            # caller-facing shape that slice extends already exists.
-            return _refused(GUARDED_MESSAGE, REASON_GUARDED, GUARDED_HINT)
         if bool(ticket_id) != bool(attempt_id):
             return _unsupported(ATTEMPT_PAIR_MESSAGE, REASON_ATTEMPT_PAIR, ATTEMPT_PAIR_HINT)
+        if claim_paths and not (ticket_id and attempt_id):
+            return _unsupported(
+                CLAIM_ATTEMPT_MESSAGE, REASON_CLAIM_ATTEMPT, CLAIM_ATTEMPT_HINT
+            )
 
         tool = "sh" if shell else _tool_name(argv[0])
         if shell:
@@ -1022,6 +1386,13 @@ class PassthroughRuns:
         if workspace is None:
             return _refused(NO_STORE_MESSAGE, REASON_NO_STORE, NO_STORE_HINT)
 
+        claimed = None
+        if claim_paths:
+            outcome = self._acquire(claim_paths, ticket_id, attempt_id, actor)
+            if isinstance(outcome, Refusal):
+                return outcome
+            claimed = outcome
+
         return PassthroughRun(
             store=self.store,
             project_root=self.project_root,
@@ -1031,8 +1402,121 @@ class PassthroughRuns:
             ticket_id=ticket_id,
             attempt_id=attempt_id,
             actor=actor,
-            claim_paths=tuple(claim_paths),
+            claim_paths=claimed.paths if claimed else (),
+            claim_generation=claimed.generation if claimed else 0,
+            claims_lines=claimed.lines if claimed else (),
+            claims=self.claims if claimed else None,
         )
+
+    # ------------------------------------------------------------------
+    # Guarded mode: the acquisition a run starts with
+    # ------------------------------------------------------------------
+
+    def _acquire(self, raw_paths, ticket_id, attempt_id, actor):
+        """The all-or-nothing acquisition a guarded run begins with (PC2).
+
+        It is the claim layer's own operation, so a guarded run cannot hold anything a
+        plain `arbite file claim` would refuse, and the two acquire in the same canonical
+        order with the same generation numbering. A path another attempt holds comes back
+        as the claim layer's `file_busy` outcome with the *whole* request listed, and that
+        becomes a refusal: nothing is claimed, and the command has not started.
+        """
+        try:
+            result = self.claims.claim(ticket_id, attempt_id, raw_paths)
+        except ArbiteError as refused:
+            return Refusal(
+                message=str(refused),
+                reason=REASON_CLAIM_REFUSED,
+                exit_code=REFUSED,
+                text_hint=text_hint_of(refused),
+                confirmation=NO_RUN,
+                actions=tuple(getattr(refused, "next_actions", ()) or ()),
+                mode=MODE_GUARDED,
+            )
+        if result.kind == BUSY:
+            return self._busy_refusal(result, ticket_id, attempt_id, actor)
+        lines = list(result.lines)
+        if result.data.get("note"):
+            # A re-acquisition's note ("this is a new claim generation (N); any token
+            # from generation M is dead") is part of what the caller needs to see before
+            # the command runs, exactly as it is for a plain claim (FC8).
+            lines.append(result.data["note"])
+        return Claimed(
+            paths=tuple(result.data["canonical_order"]),
+            generation=int(result.data["generation"]),
+            lines=tuple(lines),
+        )
+
+    def _busy_refusal(self, result, ticket_id, attempt_id, actor) -> Refusal:
+        """PC3: a declared path is held, so nothing is claimed and nothing runs.
+
+        The rows are the shape `file claim` prints for its own refusal -- the held paths
+        with their holder, the free ones as `free` -- because the caller's next decision is
+        the same one, and the *free* ones matter here more than they do there: they are the
+        paths this run would have had. The code is 125 rather than 4, because 0-5 belong to
+        the wrapped tool in this command; the refusal is still arbite's own, it says the
+        command did not run, and JSON carries `ran: false` plus the same structured table.
+        """
+        held = {entry["path"]: entry for entry in result.data["held"]}
+        free = list(result.data["free"])
+        paths = sorted([*held, *free])
+        width = max(len(path) for path in paths) + CLAIM_COLUMN_GAP
+        rows = []
+        for path in paths:
+            entry = held.get(path)
+            if entry is None:
+                rows.append(f"  {path.ljust(width)}{CLAIM_BUSY_FREE}")
+                continue
+            rows.append(
+                f"  {path.ljust(width)}"
+                + CLAIM_BUSY_HELD.format(
+                    holder=f"{entry['ticket']} / {entry['attempt']}",
+                    actor=self._holder_actor(entry["attempt"]),
+                    since=local_time(entry["since"]),
+                    generation=entry["generation"],
+                )
+            )
+        total = len(paths)
+        noun = "path" if total == 1 else "paths"
+        verb = "is" if len(held) == 1 else "are"
+        holder = result.data["held"][0]
+        actions = (
+            f"arbite list next --claim {actor}",
+            f"arbite changes {holder['ticket']}",
+        )
+        spoken = (
+            f"work a different ticket ('{actions[0]}')",
+            f"'{actions[1]}' to see whether the holder has finished",
+        )
+        return Refusal(
+            message=CLAIM_BUSY_HEADING.format(held=len(held), total=total, noun=noun, verb=verb),
+            reason=REASON_CLAIM_BUSY,
+            exit_code=REFUSED,
+            rows=tuple(rows),
+            confirmation=NO_RUN,
+            # The joining word goes at the end of the previous hint, the way the frozen
+            # claim refusals print it (FC3), not at the start of the next line.
+            text_hint="next: " + ", or\n      ".join(spoken),
+            actions=actions,
+            label=OUTCOME_LABELS[BUSY],
+            mode=MODE_GUARDED,
+            data={
+                "held": result.data["held"],
+                "free": free,
+                "claimed": [],
+                "ticket": ticket_id,
+                "attempt": attempt_id,
+            },
+        )
+
+    def _holder_actor(self, attempt_id: str) -> str:
+        """The worker the holding attempt belongs to, as the busy rows name it.
+
+        Read from the attempt rather than carried on the claim, for the same reason the
+        claim report does it: a worker id is attribution, and a second copy is a second
+        thing that can disagree."""
+        attempt = self.store.get_attempt(attempt_id)
+        return attempt.worker_id if attempt is not None else "(unknown worker)"
 
 
 def _not_found(tool: str) -> Refusal:
@@ -1334,6 +1818,7 @@ __all__ = [
     "NO_RUN",
     "Change",
     "Captured",
+    "Claimed",
     "ManifestEntry",
     "PassthroughRun",
     "PassthroughRuns",
