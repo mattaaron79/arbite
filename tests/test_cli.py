@@ -306,6 +306,54 @@ def test_the_guide_is_rewritten_identically_when_nothing_changed(cli, tmp_projec
     assert _without_generated_stamp(second) == _without_generated_stamp(first)
 
 
+def test_BY3_and_BY1_the_guide_says_what_arbite_does_not_enforce(cli, tmp_project):
+    """BY3's target, and the prose half of BY1: the generated guide states plainly that
+    agents are told to use the proxy, that a shell or an editor can bypass it, that a
+    direct write is *observed drift* the next read reports, and that arbite cannot prove
+    who made it. The claim is about what arbite enforces, not what it wishes were true.
+
+    The file-proxy section is generated, so it must also be true of the sink in use: both
+    real sinks have a coordination backend, each with its own evidence location and doctor
+    findings named. A sink kind with no coordination backend gets a paragraph saying the
+    proxy commands refuse -- never a section describing commands it cannot honour."""
+    cli("init")
+    file_guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    assert "## The file proxy" in file_guide
+    assert "Prefer the proxy for file changes" in file_guide
+    assert "keeps evidence beside the tickets" in file_guide
+    for fragment in (
+        "A shell can bypass it",
+        "reported by the next read as an external edit attributable to no ticket",
+        "arbite cannot prove who wrote a file",
+        "Observation is not exclusivity",
+        "No daemon, no launcher, no automatic recovery",
+        "Evidence is never pruned",
+        "`arbite receipt --summary`",
+    ):
+        assert fragment in file_guide, fragment
+
+    (tmp_project / ".arbite" / "project.yaml").write_text("sink: sqlite\n")
+    cli("init")
+    sqlite_guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    assert "## The file proxy" in sqlite_guide
+    assert "Prefer the proxy for file changes" in sqlite_guide
+    assert "keeps evidence in the database" in sqlite_guide
+
+    from arbite.sinks.base import SinkInfo
+
+    parser, subparsers_by_name = arbite_cli.build_parser()
+    unavailable = docs.render(
+        parser,
+        subparsers_by_name,
+        SinkInfo(kind="memory", root="/tmp/memory", status_is_location=False,
+                 supports_buckets=False),
+    )
+    assert "## The file proxy" in unavailable
+    assert "has no coordination backend" in unavailable
+    assert "A shell can bypass it" not in unavailable
+    assert "Prefer the proxy for file changes" not in unavailable
+
+
 def test_the_installed_instructions_block_matches_the_example():
     """`init --agents-doc`/`--claude-doc` install a block carried in the package, and
     `docs.py` promises `AGENTS_EXAMPLE.md` holds it byte-for-byte. This is the check
@@ -320,18 +368,14 @@ def test_the_installed_instructions_block_matches_the_example():
         assert fragment in docs.ARBITE_INSTRUCTIONS_BLOCK, fragment
 
 
-#: Commands this build has and the README does not yet describe, each with the slice
-#: that writes the section. The sweep below is a guard against drift, so the exception
-#: is a *named* entry rather than a weakened loop: the README's passthrough section is
-#: the documentation slice's work (C15, which follows guarded mode), and it removes this
-#: entry together with the paragraph it adds.
-README_PENDING = {"cmd": "passthrough observation (tic-faae / C13) is documented by C15"}
-
-
 def test_the_readme_documents_every_command_and_the_new_model():
     """The README is the long-form half of the same sweep: every command in
     `arbite --help` must be documented here, the status vocabulary must be the
     schema's, and both breaking changes must be called out.
+
+    C15 removed the one named exception this loop used to carry (`cmd`, whose section
+    the documentation slice owned): the README now describes every command the parser
+    defines, with no allowance.
 
     Unlike the guide, the README deliberately *records* the old `arbite.yaml` in its
     upgrade note, so this checks the live names it carries rather than asserting the
@@ -339,8 +383,6 @@ def test_the_readme_documents_every_command_and_the_new_model():
     readme = (REPO_ROOT / "README.md").read_text()
     _, subparsers_by_name = arbite_cli.build_parser()
     for name in subparsers_by_name:
-        if name in README_PENDING:
-            continue
         assert f"`{name}`" in readme, f"command not documented in the README: {name}"
     assert " | ".join(schema.STATUSES) in readme
     assert ".arbite/project.yaml" in readme

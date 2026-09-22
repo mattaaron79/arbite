@@ -315,6 +315,14 @@ Three things worth being explicit about, because all are easy to assume wrongly:
   one-off, an unfinished migration — commands warn on stderr, and the generated
   `.arbite/AGENTS.md` carries a bold warning naming that store and its ticket count,
   because the wrong store looks exactly like an empty one.
+- **Coordination records travel with the tickets.** `migrate` copies the coordination
+  state too — attempts, claims, receipts, artifacts and event cursors — keeping record
+  revisions, claim generations, actors and operation ids, as one unit of work, and it
+  refuses (`busy:`, exit 4, holders named) while *either* store holds a live claim or
+  attempt, because ownership recorded in one store while the work sits in another is
+  exactly the state the proxy exists to prevent. `--prune` still retires tickets only:
+  coordination state is never deleted anywhere, because no retention policy has been
+  designed yet.
 - **`--prune` retires the old store** once the copy is verified: after migrating, it
   deletes the source tickets, so `arbite migrate --to sqlite --prune` followed by
   `sink: sqlite` leaves exactly one store. It refuses outright if any ticket was
@@ -384,7 +392,8 @@ The package exposes the console script `arbite`, providing:
 | Workspace | `workspace` — `show` reports the derived workspace, the store in use and the coordination backend's counts |
 | Payloads | `scratch` — `list` shows what `file write --input` / `file edit --edits` would read, `clear NAME...` and `clear --all` delete it |
 | Events | `events` — the coordination event stream, one line per event (`--after` / `--tail`, `--include-reads`); `--follow` is refused |
-| Evidence | `receipt <OP>` — one operation's receipt (`receipt`), both versions and the artifacts that hold them, verified before printing; `changes <T> [--all]` — what a ticket changed per attempt (`changes`), or the ordered operation log with `--all` |
+| Evidence | `receipt <OP>` — one operation's receipt (`receipt`), both versions and the artifacts that hold them, verified before printing, plus `receipt --summary` for the pre-pruning devlog export; `changes <T> [--all]` — what a ticket changed per attempt (`changes`), or the ordered operation log with `--all` |
+| Passthrough | `cmd` — run a tool and record what it changed: observed by default, `--claim PATH...` claims the declared paths before the run (guarded); `--shell` opts into `sh -c`, `--json` gives the branchable form |
 | Integrity | `doctor [--fix]` |
 | Destruction | `delete <id> --force` |
 
@@ -394,9 +403,11 @@ Key behaviours worth calling out:
   the located `.arbite/` directory plus the resolved sink, the project root, which
   store is in use and where that selection came from, the coordination backend's
   location and what it currently holds (active claims, events, receipts), and the
-  scratch payload area's size. It is read-only and always exits 0, and there is
-  deliberately no `bind`: a relocated root or a repointed store is a new workspace,
-  not a mutation, so there is no conflict path to resolve.
+  scratch payload area's size. It is read-only and exits 0 whenever there is a
+  workspace to describe (it exits 1 outside a project, with no `.arbite/` directory
+  to derive one from), and there is deliberately no `bind`: a relocated root or a
+  repointed store is a new workspace, not a mutation, so there is no conflict path
+  to resolve.
 - **Coordination state is part built.** The versioned records the file proxy needs —
   workspace, work attempt, file claim, read observation, operation receipt, artifact
   and event — exist, are validated, and are stored beside the tickets
@@ -418,10 +429,20 @@ Key behaviours worth calling out:
   rather than guessing at. The **file proxy is live** as well: `arbite file
   list|search|read|claim|release|claims|write|edit|remove|rename` are commands today
   (tic-1c4f, tic-60c7, tic-74e2), and the payloads a write or an edit reads are managed
-  by `arbite scratch list|clear` (tic-95c0). What does **not** exist yet is migrations
-  and export (tic-008f) and `arbite cmd` passthrough (tic-faae, tic-42d2). `arbite
-  doctor --json` names the coordination backend and its counts.
-- **`arbite receipt` and `arbite changes`** are the evidence views. `receipt OP` prints one
+  by `arbite scratch list|clear` (tic-95c0). **Coordination migrations are live** too:
+  `arbite migrate --to <sink>` carries attempts, claims, receipts, artifacts and event
+  cursors along with the tickets, and refuses while either store holds a live claim or
+  attempt (`busy:`, exit 4, holders named) so ownership can never be left in one store
+  and the work in another. **Passthrough is live** as well (`arbite cmd`, below).
+  `arbite doctor` and `arbite doctor --json` name the coordination backend, its counts
+  and its findings — shared where they mean the same thing on both sinks, plus the
+  file sink's pending commit journal and orphan revision counters, or the database's
+  orphaned revision rows.
+- **`arbite receipt` and `arbite changes`** are the evidence views. `receipt --summary`
+  prints the whole operation log as a devlog export — one row per operation-path with its
+  time, result, actor, ticket/attempt, both versions and the store's evidence totals, and
+  the sentence that arbite never prunes evidence — which is the record to take *before*
+  any retention policy exists. `receipt OP` prints one
   operation: what it was, who did it, the paths it named, both versions with the line count
   or byte size each one has, and the artifact that keeps them. Every version is read back out
   of the store and hashed again before anything is printed, so a digest here is one arbite
@@ -469,6 +490,42 @@ Key behaviours worth calling out:
   write or edit consumes its payload because the bytes now live in the receipt, `--keep`
   opts out, and a refusal that stopped on the bytes keeps the payload and says so, so a
   recoverable error never forces a model to re-emit a file.
+- **`arbite cmd [--ticket T --attempt A] [--shell] -- CMD...`** is passthrough: it runs a
+  familiar tool and records what that run *changed*, so an agent keeps its habits (`sed -i`,
+  a formatter, a linter with `--fix`) and still leaves evidence. A digest manifest of the
+  managed paths is taken before and after, and every path whose bytes differ gets a receipt
+  of kind `passthrough` plus a `passthrough.changed` event, while one `passthrough.exec`
+  event records the tool, its argv, the exit code and the duration. The wrapped command's
+  own exit code is returned untouched — it really can be 0–5 — so arbite's own pre-run
+  refusals are `125` (busy or policy), `126` (an invocation it does not support: no
+  command, shell syntax without `--shell`, an interactive tool, a watcher, a background
+  job) and `127` (not on `PATH`), and a refusal never runs the command. `--shell` opts into
+  `sh -c`, and only then do redirections and pipelines mean anything: without it a `>` or a
+  `|` is just another argument, which the refusal says. Observed mode is plain about what it
+  is — *observed, not exclusive* — and `--claim PATH...` is the guarded form: the declared
+  paths are claimed all-or-nothing *before* the command starts (a busy one refuses with
+  `125`, names the holder and runs nothing), every observed change is checked against that
+  claim, a change outside it is reported as `unclaimed_write` and **left exactly where the
+  tool put it** (arbite does not roll back a command it did not perform), and the claims are
+  released when the run ends, whichever way it ended.
+- **Honest limits of the proxy.** None of this intercepts the filesystem: a shell write
+  (`sed -i`, `> file`, an editor) changes bytes with arbite never seeing it, and the next
+  `arbite file read` reports those bytes as an *external edit* attributable to no ticket.
+  That is deliberate — there is **no daemon, no agent launcher, no automatic stale recovery,
+  no worktree workflow, no central database, no factory and no dashboard** — and it means
+  **arbite cannot prove who wrote a file**: what it records is attribution (the agent id a
+  command carried, the actor on an event), never authentication. Claims are durable records,
+  not locks, so they stop a *proxy* write from racing another; they do not stop a shell.
+  `arbite cmd` observed mode claims no exclusivity at all, guarded mode checks before and
+  after the run rather than during it, and a killed guarded run leaves its claim for
+  `arbite doctor` (or `--fix`) to release once the attempt is over. Reads are not isolated
+  either: a read can observe a commit in flight, which the file sink reports as a
+  `pending_commit` finding rather than hiding. Evidence is never pruned — there is no
+  retention policy yet, so the store grows with the work and `receipt --summary` is the
+  pre-pruning record — and `arbite cmd`'s manifest walks the tree twice per run and cannot
+  bound a command's runtime: arbite waits for what it started. **Prefer the proxy** for any
+  file another agent could touch, and read `arbite file` / `arbite cmd` help before assuming
+  more exclusivity than either claims.
 - **`arbite events [--after CURSOR | --tail N] [--include-reads]`** reads the event
   stream in cursor order, one line per event: the cursor, kind, subject, operation,
   ticket/attempt, actor, local time and outcome, then the cursor to resume from. It

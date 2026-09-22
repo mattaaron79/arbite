@@ -224,6 +224,8 @@ def test_an_open_ticket_with_an_active_attempt_is_busy_rather_than_claimable(tmp
     direct = examples.run_cli(project, "claim", "tic-cf9f", "--agent", "claude.haiku.003", sink=kind)
     assert direct.returncode == 4, direct.stderr
     assert "already has an active attempt att-beef" in direct.stderr
+    assert "generation 1);" in direct.stderr, "the holder's generation is named, not a placeholder"
+    assert "{holder" not in direct.stderr
     assert "nothing" not in direct.stdout
 
     offered = examples.run_cli(
@@ -710,14 +712,25 @@ def test_promote_with_an_agent_records_the_attempt(tmp_path, kind):
 
 def test_RC1_two_workers_claiming_one_ticket_produce_one_winner(tmp_path):
     """RC1's target, with four real processes: exactly one winner, the losers told why
-    in one line, and no partial state -- one attempt, one claimant, one claim event."""
+    in one line, and no partial state -- one attempt, one claimant, one claim event.
+
+    A loser can meet one of three *documented* answers, because the ticket snapshot it
+    read is older than the winner's two writes (a ticket write and an attempt write, two
+    storage domains, one commit each) and `claim` reads the attempt after that snapshot:
+    the CL3 lost-race refusal (exit 1, "attempt held by: att-XXXX"), the exit-4
+    `attempt_held` refusal for an attempt that appeared while the snapshot still looked
+    claimable, or -- on the file sink -- the "no ticket found" read that lands inside the
+    winner's relocation. All three write nothing, so what this test pins is the invariant
+    (one winner, one attempt, one event, no loser side effects) rather than which honest
+    refusal a loser happens to meet. C15 reproduced the second answer under load (~1 run
+    in 10) and fixed the message bug it exposed."""
     project = state.initialise(tmp_path)
     state.claimable(project)
     agents = ["claude.opus.001", "claude.haiku.003", "claude.sonnet.002", "claude.haiku.004"]
 
     results = race_claims(project, "tic-cf9f", agents)
     codes = sorted(result[2] for result in results)
-    assert codes == [0, 1, 1, 1], [result[0] for result in results]
+    assert codes in ([0, 1, 1, 1], [0, 1, 1, 4]), [result[0] for result in results]
 
     winners = [agent for agent, result in zip(agents, results) if result[2] == 0]
     assert len(winners) == 1
@@ -728,6 +741,13 @@ def test_RC1_two_workers_claiming_one_ticket_produce_one_winner(tmp_path):
         if "is not in the expected state" in stderr:
             assert "attempt held by: att-" in stderr, stderr
             assert f"({winners[0]})" in stderr, "the loser is told which attempt holds it"
+            assert f"'arbite list next --claim {agent}'" in stderr
+        elif "already has an active attempt" in stderr:
+            # The same race, answered from the attempt side: outcome 4 (the vocabulary's
+            # "pick other work, nothing changed" answer), still naming the holder and
+            # still offering `list next --claim`.
+            assert f"({winners[0]}," in stderr, stderr
+            assert "generation " in stderr and "{holder" not in stderr
             assert f"'arbite list next --claim {agent}'" in stderr
         else:
             # A read that lands inside the winner's relocation sees a ticket that is

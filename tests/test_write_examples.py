@@ -6,36 +6,30 @@ code, stream and rows -- with ids, times, paths and digests normalised on both s
 `base.py` the edit blocks quote by line number, the claim at generation 2 the reports name,
 the 1024-byte image WR6 replaces, and a real read token for every command that presents one.
 
-**Two deviations, both forced by the document, and each stated where it happens.**
-
-- **WR6, ED2 and ED3 are compared per line** (`examples.assert_scenario_abridged`). The
-  document fixes three report shapes and its blocks for these three show fewer lines than the
-  same command prints: WR6 shows the two lines that describe a *binary* replacement and omits
-  the payload and spent-token lines WR1 shows for a whole-file write; ED3 shows the stdin
-  notice, the delta and the receipt, and omits the per-replacement rows ED1 shows for the same
-  command; ED2 shows the refusal and its hints, and omits the `payload: ... kept` line a
-  stopped mutation prints because the payload it read is still there. Every line the blocks
-  *do* show is asserted, in order, on the stream the outcome puts it on.
-- **ED1's diff columns.** The block prints `+4 -1` for a batch whose second edit changes one
-  line *in place*: a one-line replacement is a removal and an insertion in any line diff, so
-  two replacements cannot produce `+4 -1` (`+5 -2` here, and `+2 -2` if the first edit had been
-  in place too). The line counts that block prints (`570 -> 573`) *are* reproduced, and both
-  delta numbers are asserted against a diff recomputed from the bytes the receipt recorded --
-  so the fact is checked, and only the document's arithmetic is not copied.
+Every block is asserted byte for byte: the command, its exit code, the stream the body
+belongs to, and every line -- with ids, times, paths and digests normalised on both sides
+(`examples.py`). `writes_state.py` builds the world each block starts from: the 570-line
+`base.py` the edit blocks quote by line number, the claim at generation 2 the reports name,
+the 1024-byte image WR6 replaces, and a real read token for every command that presents one.
 
 WR2 and WR3 are asserted as the *targets* the ticket's acceptance names rather than as frozen
 blocks (WR2's transcript is also SC2, which tic-95c0 owns): "a stale token changes no bytes"
 and "one token authorises one mutation", which are checked against the store and the bytes.
+
+C15 made WR6, ED1, ED2 and ED3 byte-exact. The document had abridged three of them (showing
+fewer lines than the report prints) and mis-stated ED1's diff columns; it now shows every
+line, and ED1's `+5 -2` is the corrected arithmetic -- a one-line replacement is a removal
+and an insertion, so the block's old `+4 -1` was impossible. Each delta is still recomputed
+from the receipt's recorded bytes in the test below, so the transcript is not the only
+witness.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 
 import examples
 import writes_state as state
-from arbite.coordination import edits as edit_batches
 from arbite.coordination import records as coordination_records
 from arbite.coordination.writes import line_delta
 
@@ -206,9 +200,7 @@ def test_WR6_write_a_binary_file(tmp_path):
     project = state.binary_project(tmp_path)
     token = state.token_for_binary(project)
 
-    examples.assert_scenario_abridged(
-        with_token(examples.scenario_block("WR6"), token), project
-    )
+    examples.assert_scenario(with_token(examples.scenario_block("WR6"), token), project)
 
     written = (project / state.ICON_PNG).read_bytes()
     assert written == state.icon_bytes(state.ICON_WRITTEN_BYTES), "the bytes are the payload"
@@ -235,20 +227,17 @@ def test_WR7_a_mutation_with_no_attempt(tmp_path):
 def test_ED1_edit_batch(tmp_path):
     """Two exact replacements, reported by the line each was found on.
 
-    The block's line counts are asserted as written. Its diff columns are not -- they are the
-    document's arithmetic for a batch whose second edit changes a line in place (see the
-    module docstring) -- so the columns are asserted against the diff of the bytes the receipt
-    recorded, which is the fact the number stands for."""
+    Byte for byte, including the `+5 -2` delta. The block's own `+4 -1` was impossible for a
+    batch whose second edit changes a line in place, so C15 corrected the block; the delta is
+    recomputed here from the bytes the receipt recorded, which is the fact the number stands
+    for, so the transcript is not the only witness."""
     project = state.edits_project(tmp_path)
     token = state.token_for_edits(project)
     scenario = with_token(examples.scenario_block("ED1"), token)
-    added, removed = _ed1_delta()
-    assert (added, removed) == (5, 2), "the fixture's own diff, recomputed from its edits"
-    scenario = replace(scenario, stdout=scenario.stdout.replace("+4 -1", f"+{added} -{removed}"))
 
     output = examples.assert_scenario(scenario, project)
 
-    assert "570 -> 573 lines" in output
+    assert "570 -> 573 lines  +5 -2" in output
     assert output.splitlines()[1].endswith(
         f'replace at line {state.IN_PLACE_LINE}: "{state.IN_PLACE_OLD}" -> "{state.IN_PLACE_NEW}"'
     )
@@ -260,19 +249,8 @@ def test_ED1_edit_batch(tmp_path):
     assert line_delta(
         state.artifact_bytes(project, before[BASE_PY]),
         state.artifact_bytes(project, after[BASE_PY]),
-    ) == (added, removed), "the report's columns are the diff of the recorded bytes"
+    ) == (5, 2), "the report's columns are the diff of the recorded bytes"
     assert not (project / ".arbite" / "scratch" / "edits.json").exists(), "success consumes it"
-
-
-def _ed1_delta() -> tuple:
-    """ED1's delta, computed from the fixture's batch and its file -- not from the report."""
-    batch = edit_batches.apply_batch(
-        state.base_text(),
-        edit_batches.parse_batch(json.dumps(state.ed1_batch()).encode("utf-8")),
-        BASE_PY,
-        f"arbite file read {BASE_PY} --ticket {HOLDER_TICKET} --attempt {HOLDER}",
-    )
-    return line_delta(state.base_text().encode("utf-8"), batch.text.encode("utf-8"))
 
 
 # --- ED2 --------------------------------------------------------------------
@@ -284,9 +262,7 @@ def test_ED2_an_ambiguous_edit_changes_nothing(tmp_path):
     token = state.token_for_edits(project)
     before = (project / BASE_PY).read_bytes()
 
-    output = examples.assert_scenario_abridged(
-        with_token(examples.scenario_block("ED2"), token), project
-    )
+    output = examples.assert_scenario(with_token(examples.scenario_block("ED2"), token), project)
 
     assert "occurs 3 times (lines 85, 229, 366)" in output
     assert (project / BASE_PY).read_bytes() == before, "an ambiguous batch changed nothing"
@@ -303,7 +279,7 @@ def test_ED3_edit_from_stdin(tmp_path):
     token = state.token_for_schema(project)
     scenario = with_token(examples.scenario_block("ED3"), token)
 
-    output = examples.assert_scenario_abridged(
+    output = examples.assert_scenario(
         scenario, project, stdin=state.ed3_stdin_batch().decode("utf-8")
     )
 

@@ -30,9 +30,10 @@ block that shows its facts is still asserted on the facts rather than skipped:
   may be sampled rather than complete: a whole-file read prints hundreds of lines and
   the document shows the gutter format, not the file.
 
-A block that needs neither is compared byte for byte, and a block the document
-visibly abridges in other ways (a dropped parenthetical, a hand-aligned column) is
-asserted with `assert_scenario_abridged`, which says so out loud at the call site.
+A block that needs neither is compared byte for byte. C15 removed the last helper for
+blocks abridged *beyond* those two shapes -- a dropped parenthetical, a hand-aligned
+column -- by correcting the document instead, so every transcript in the catalogue is
+now asserted against its own bytes.
 
 Which stream a transcript's body belongs to is a fact about the outcome, not a
 choice a test makes:
@@ -519,80 +520,3 @@ def _find_sample(actual_lines: list, start: int, sample) -> Optional[int]:
     return None
 
 
-def assert_scenario_abridged(
-    scenario: Scenario,
-    cwd,
-    sink: Optional[str] = None,
-    stream: Optional[str] = None,
-    stdin: Optional[str] = None,
-) -> str:
-    """Assert an *abridged* transcript: every line's facts, not its exact layout.
-
-    The document abridges a handful of blocks in ways no single implementation can
-    reproduce: it drops a parenthetical the JSON carries, writes `142 KiB` for
-    `142.0 KiB`, and aligns a note column by hand. For those blocks the comparison is
-    per line with whitespace collapsed, and each expected line must be a *prefix* of
-    an actual line, in order. It is deliberately weaker than `assert_scenario`, so it
-    is used only where the block itself is visibly abridged -- and the test that calls
-    it says which abridgement it is accepting."""
-    proc = run_scenario(scenario, cwd, sink=sink, stdin=stdin)
-    where = f"scenario {scenario.id} ('arbite {' '.join(scenario.command)}')"
-    assert proc.returncode == scenario.exit_code, (
-        f"{where} exited {proc.returncode}, expected {scenario.exit_code}\n"
-        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-    )
-    on_stderr = scenario.on_stderr if stream is None else stream == "stderr"
-    actual_text, expected_text = proc.stdout, scenario.stdout
-    if on_stderr:
-        assert proc.stdout == "", f"{where} also wrote to stdout:\n{proc.stdout}"
-        actual_text = proc.stderr
-    else:
-        assert proc.stderr == "", f"{where} wrote to stderr:\n{proc.stderr}"
-    assert_facts(where, actual_text, expected_text, cwd)
-    return actual_text
-
-
-def assert_facts(where: str, actual_text: str, expected_text: str, cwd=None, ordered: bool = True) -> None:
-    """Each expected line must be a prefix of an actual line, in order (see
-    `assert_scenario_abridged` for when that is the right question).
-
-    `ordered=False` asks for the same facts in *any* order. That is for a block whose
-    document lists its rows in an order the display rules do not produce (LS5 names
-    `project.yaml` before an agent scratchpad, which canonical path order does not), so
-    the transcript's *contents* are the assertion and its sequence is not. Every fact
-    still has to be present, and each actual line accounts for one expectation at
-    most, so a listing cannot pass by repeating one row."""
-    actual = [_collapse(_whole_units(line)) for line in normalise(actual_text, cwd).splitlines()]
-    expected = [
-        _collapse(_whole_units(line))
-        for line in normalise(expected_text, cwd).splitlines()
-        if line.strip()
-    ]
-    next_position = 0
-    for line in expected:
-        search = range(next_position, len(actual)) if ordered else range(len(actual))
-        found = next(
-            (position for position in search if actual[position].startswith(line)), None
-        )
-        assert found is not None, (
-            f"{where}: no line starts with {line!r}\n--- actual ---\n"
-            + "\n".join(actual)
-            + "\n--- expected ---\n"
-            + "\n".join(expected)
-        )
-        next_position = found + 1
-        if not ordered:
-            # Claim the line, so no second fact can be satisfied by the same row.
-            actual[found] = "\0"
-
-
-def _collapse(text: str) -> str:
-    """`text` with every whitespace run collapsed to one space.
-
-    Column padding and line wrapping are the document's layout, not its facts."""
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _whole_units(text: str) -> str:
-    """`142.0 KiB` and `142 KiB` are the same number, and the document writes both."""
-    return re.sub(r"(\d)\.0 (?=[KMG]iB)", r"\1 ", text)

@@ -6,17 +6,15 @@ sides (`examples.py`). `discovery_state.py` builds the world each block starts f
 570-line `base.py` RD1 reads, the 3015-line `cli.py` RD3 ranges over, and the claim on
 `file.py` at generation 3 that RD2's banner names.
 
-Two blocks are visibly abridged by the document, and each test says which abridgement it
-accepts (`examples.assert_scenario_abridged`):
+Every block is byte for byte, with the samples and elisions the document itself marks
+understood by the harness: RD3 shows two of the seven lines its range asked for, and RD4
+shows two of the 588 lines the external edit left, each named by its line number. The
+drift note's wording is checked against the store as well, because "the last version
+arbite observed" is a stored fact.
 
-- RD3's header prints `142 KiB` for a size the report renders as `142.0 KiB`, and its
-  body shows two of the seven lines it asked for. The facts -- the whole-file digest,
-  the range, the token, the two sampled lines -- are asserted.
-- RD4 drops the claim parenthetical and the token's that RD1 prints in full. The facts
-  -- including the drift note's wording -- are asserted, and the note is checked against
-  the store as well, because "the last version arbite observed" is a stored fact.
-
-Everything else is byte for byte: RD1, RD2 (both halves) and RD5.
+C15 corrected two things in these blocks: RD3's `142 KiB` (the report renders `142.0 KiB`)
+and RD4's dropped parentheticals (`(readable by anyone)   workspace: ws-XXXX` and the
+token's `(spent after one mutation of this path)`), which RD1 prints in full.
 """
 
 from __future__ import annotations
@@ -115,7 +113,7 @@ def test_RD3_ranged_read_keeps_the_whole_file_digest(tmp_path):
     the file and against the observation the command stored."""
     project = state.read_project(tmp_path)
 
-    examples.assert_scenario_abridged(examples.scenario_block("RD3"), project)
+    examples.assert_scenario(examples.scenario_block("RD3"), project)
 
     observation = state.store_for(project).records("observation")[0]
     assert observation.line_start == 1254 and observation.line_end == 1260
@@ -133,11 +131,11 @@ def test_RD4_read_after_an_unattributed_external_edit(tmp_path):
     prints it, and against the store -- the digest it names is the version the earlier
     read recorded, and the digest the report prints is what is on disk now."""
     project = state.read_project(tmp_path)
-    examples.assert_scenario_abridged(examples.scenario_block("RD1"), project)
+    examples.assert_scenario(examples.scenario_block("RD1"), project)
     first = state.store_for(project).records("observation")
     state.edited_base(project)
 
-    report = examples.assert_scenario_abridged(examples.scenario_block("RD4"), project)
+    report = examples.assert_scenario(examples.scenario_block("RD4"), project)
 
     assert "note: on-disk bytes differ from the last version arbite observed" in report
     assert "an external edit is attributable to no ticket" in report

@@ -198,20 +198,17 @@ def ev_project(tmp_path, kind):
 def test_EV1_net_changes_for_a_ticket(ev_project, kind):
     """The net view, per attempt, with the two operations behind one row named.
 
-    **One documented deviation.** EV1's three rows are hand-aligned in the document: its
-    operations column starts at column 91, 91 and 89, which no single padding rule produces
-    (the creation's path is longer than the path column the other two rows set). The command
-    pads each column to the widest cell of its own group, so the *facts* match and the layout
-    is three columns tighter; `assert_scenario_abridged` collapses whitespace and compares
-    line by line, and `test_change_evidence.py` asserts the exact rows the layout rule
-    produces. Everything else -- the header, the letters, the version pair, the delta, the
-    operation lists in log order, the revert note and the exit code -- is asserted as written.
+    Byte for byte on both sinks: the header, each row's letters, version pair and delta, the
+    operation lists in log order, the revert note and the exit code. C15 corrected the
+    document's hand-aligned rows (its operation column started at 91, 91 and 89, which no
+    padding rule produces); the command pads each column to the widest cell of its group, and
+    `test_change_evidence.py` asserts the same rows against the layout rule directly.
     """
-    scenario = examples.scenario_block("EV1")
-    stdout = examples.assert_scenario_abridged(scenario, ev_project, sink=kind)
+    stdout = examples.assert_scenario(
+        examples.scenario_block("EV1"), ev_project, sink=kind
+    )
 
     assert "edit-then-revert: both operations remain in the log ('--all')" in stdout
-    assert scenario.exit_code == 0
 
 
 def test_EV6_one_receipt(ev_project, kind):

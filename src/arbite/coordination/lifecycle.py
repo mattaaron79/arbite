@@ -1027,7 +1027,7 @@ class TicketLifecycle:
         other work, and nothing changed."""
         failure = Busy(
             f"{ticket.id} already has an active attempt {holder.id} ({holder.worker_id}, "
-            "generation {holder.generation}); one active attempt per ticket, so it cannot "
+            f"generation {holder.generation}); one active attempt per ticket, so it cannot "
             "be claimed again",
             reason="attempt_held",
         )

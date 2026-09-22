@@ -12,7 +12,11 @@ what it says, so it may only claim what is true of the store in use. With a file
 sink "a ticket's folder is the source of truth" is the central rule and belongs
 front and centre; with a database sink that sentence would be a lie, so the
 status/location prose switches on the sink's own capabilities instead of being
-hard-coded.
+hard-coded. The same rule governs the file-proxy section: it is rendered only for a
+sink kind `open_coordination_store` accepts (asked, not assumed), it states the
+honest limits -- a shell can bypass the proxy, observation is not exclusivity,
+nothing recovers work automatically, and evidence is never pruned -- and a sink
+with no coordination backend gets one paragraph saying so instead.
 
 Written terse on purpose: this file is read into an agent's context at the start
 of every task, so it is optimised for facts-per-token rather than for prose.
@@ -348,6 +352,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     stale_root = getattr(stale_info, "root", None)
     stale_count = getattr(stale_info, "ticket_count", 0)
     mismatch = active_info is not None and stale_info is not None
+    # The proxy sections describe a capability a sink may not have, so the question is
+    # asked of the authority that builds the store (`open_coordination_store`) rather
+    # than answered here with a second list of kinds.
+    from .coordination.store import has_coordination_backend
+
+    has_proxy = sink_kind is not None and has_coordination_backend(sink_kind)
 
     lines: list[str] = []
     add = lines.append
@@ -540,6 +550,94 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     )
     add("")
 
+    # -- The file proxy ----------------------------------------------------
+    if has_proxy:
+        add("## The file proxy (claims, reads, writes, receipts)")
+        add("")
+        add(
+            "`arbite file` is the proxy for changing a file another agent may also touch: it records "
+            "which work attempt owns a path, serves bytes with a version token, changes bytes only "
+            "under that token, and keeps the before and after bytes as evidence. **Prefer it to a "
+            "shell write** for any file in this workspace -- only the proxy records the change "
+            "against a ticket and an attempt, and `arbite changes <id>` / `arbite receipt <op>` read "
+            "that record back."
+        )
+        add("")
+        add("- claim before you write: `arbite file claim PATH... --ticket T --attempt A` is "
+            "all-or-nothing in canonical path order, so two agents can never hold half of a pair; a "
+            "path another attempt holds refuses the whole request with exit 4 and names the holder")
+        add("- read for a token: `arbite file read PATH --ticket T --attempt A` serves the bytes and "
+            "records a token (`op-XXXX`); one token authorises exactly one mutation")
+        add("- mutate: `arbite file write` (whole file, from `--input NAME` in `.arbite/scratch/` or "
+            "stdin), `arbite file edit` (exact substitutions, all-or-nothing), `arbite file remove`, "
+            "`arbite file rename` (both paths at one generation). A stale token, moved bytes, a "
+            "revoked generation or a closed ticket exits 5 and changes no bytes")
+        add("- inspect: `arbite file list` / `file search` (bounded, canonical order, never authorise "
+            "a write), `arbite file claims [--all]`, `arbite workspace show`, `arbite events`, "
+            "`arbite receipt [--summary]`, `arbite changes`, `arbite attempt adopt`")
+        add("- keep your habits: `arbite cmd [--ticket T --attempt A] [--shell] -- CMD...` runs a "
+            "familiar tool and records what it observed it change (observed mode); `--claim PATH...` "
+            "claims the declared paths before the run and verifies the run against them afterwards "
+            "(guarded mode)")
+        add("")
+        add("**Honest limits -- read these before relying on the proxy.**")
+        add("")
+        add(
+            "- **A shell can bypass it.** arbite does not intercept the filesystem: `sed -i`, `> "
+            "file`, or an editor writes bytes arbite never sees. Those bytes are *drift*, reported by "
+            "the next read as an external edit attributable to no ticket, and **arbite cannot prove "
+            "who wrote a file** -- it records attribution (the agent id a command carried, the actor "
+            "in an event), never authentication"
+        )
+        add(
+            "- **Observation is not exclusivity.** `arbite cmd` observed mode claims nothing; guarded "
+            "mode claims before the run and verifies after it, but cannot stop a write *during* it, so "
+            "a takeover mid-run or a foreign writer is reported rather than prevented"
+        )
+        add(
+            "- **Reads are not isolated.** A read can observe a commit in flight; the file sink "
+            "reports that as a `pending_commit` finding instead of hiding it"
+        )
+        add(
+            "- **No daemon, no launcher, no automatic recovery.** Nothing runs in the background, a "
+            "lock dies with its process, a killed guarded run leaves its claim for `arbite doctor` (or "
+            "`--fix`) to release once the attempt is over, and there is no worktree workflow, no "
+            "central database, no factory and no dashboard"
+        )
+        add(
+            "- **Evidence is never pruned.** There is no retention policy or garbage collection yet, "
+            "so the store grows with the work (each version is kept once, by digest, and one version "
+            "may be at most 64 MiB); `arbite receipt --summary` prints the pre-pruning export a devlog "
+            "wants. `arbite cmd`'s manifest walks the tree before and after each run, and arbite waits "
+            "for the command it started"
+        )
+        if sink_kind == "sqlite":
+            add(
+                "- **This sink keeps evidence in the database.** The `sqlite` store holds the "
+                "coordination records *and* the artifact bytes in the ticket database, so the database "
+                "is one thing to back up but grows with every mutation; `doctor` adds its "
+                "storage-specific findings (orphaned revision rows) to the shared ones"
+            )
+        else:
+            add(
+                "- **This sink keeps evidence beside the tickets.** The file sink holds coordination "
+                "state in `.arbite/coordination/` and artifact bytes as files under it (both ignored "
+                "by git), so evidence is local to this checkout; `doctor` adds its storage-specific "
+                "findings (a pending commit journal, orphan revision counters) to the shared ones"
+            )
+        add("")
+    elif sink_kind:
+        add("## The file proxy (claims, reads, writes, receipts)")
+        add("")
+        add(
+            f"**Not available in this project:** the active `{sink_kind}` sink has no coordination "
+            "backend, so `arbite file ...`, `arbite cmd`, `arbite receipt`, `arbite changes`, "
+            "`arbite events`, `arbite workspace` and `arbite attempt` refuse rather than pretend "
+            "(exit 1, naming the sink). Everything outside the proxy -- tickets, statuses, the "
+            "workflow above -- works normally."
+        )
+        add("")
+
     # -- Fields ------------------------------------------------------------
     add("## Ticket fields (YAML frontmatter)")
     add("")
@@ -682,6 +780,19 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "field is whatever the sink calls a ticket's location."
     )
     add("")
+    if has_proxy:
+        add(
+            "**Prefer the proxy for file changes.** Before changing a file another agent could touch "
+            "-- with `sed`, `>`, or an editor -- use `arbite file write` / `file edit` / `file "
+            "remove` / `file rename` (see The file proxy) instead: the proxy records the claim, the "
+            "attempt, the version you read and the receipt holding both versions, so `arbite changes "
+            "<ticket>` can show what you did. A shell write is not blocked -- arbite cannot intercept "
+            "the filesystem -- but it is unattributed drift that the next read reports as an external "
+            "edit, and arbite cannot prove who wrote a file. `arbite cmd` is the compromise when a "
+            "familiar tool is the only sane option: it runs the tool and records what it observed it "
+            "change, claiming no exclusivity unless you pass `--claim`."
+        )
+        add("")
     add(
         "**Claim in one step.** `arbite list next --claim <agent_id>` selects the most urgent workable "
         "ticket *and* claims it in the same write, and a plain `arbite claim <id> --agent <agent_id>` "

@@ -988,16 +988,25 @@ class CoordinationStore(ABC):
         return recovery.reconcile(self, root=root)
 
 
+def has_coordination_backend(kind) -> bool:
+    """Whether `open_coordination_store` can build a store for this sink kind.
+
+    The single authority for the answer: `docs.py` asks this rather than keeping its
+    own list of kinds, so the generated guide and the commands cannot disagree about
+    which sinks have claims, attempts and receipts."""
+    return kind in ("file", "sqlite")
+
+
 def open_coordination_store(sink) -> CoordinationStore:
     """The coordination store for a resolved ticket sink.
 
     Coordination state lives with the *store*, not with the project, so everyone
     holding the same store sees the same claims: the file sink keeps it in a
     `coordination/` directory beside its tickets (`.arbite/coordination/` for the
-    default root), the SQLite sink keeps it in its own database. A sink kind with
-    no coordination backend is refused by name -- the guide is meant to be trimmed
-    for such a sink rather than to describe capabilities it does not have (see
-    tic-6015).
+    default root), the SQLite sink keeps it -- records *and* artifact bytes -- in its
+    own database. A sink kind with no coordination backend is refused by name, and
+    `docs.py` renders the proxy section only for a kind this function accepts, so the
+    guide never describes capabilities the active sink lacks.
 
     Imported lazily to keep this module free of a cycle with the backends, which
     import the interface above."""

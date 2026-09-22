@@ -14,11 +14,19 @@ done while the transcript it owns still differs.
 
 Two rules make the examples checkable rather than decorative:
 
-- **Verifiable against this repo.** Every path, line number and literal token in
-  a block is taken from the actual source tree, so a reader can run the command
-  and get the block back. `O_CREAT` in `LS3` is the flag at
-  `src/arbite/sinks/file.py:141`, letter O, not a zero. When a block and the code
-  disagree, the block is wrong until proven otherwise.
+- **Verifiable against a revision of this repo.** Every path, line number and
+  literal token in a block is taken from the source tree as it stood when the
+  block was written, so a reader who checks out that revision can run the command
+  and get the block back. The tree has moved since -- this checkout's
+  `src/arbite/sinks/file.py` is 579 lines, not the 412 the blocks print, and its
+  `src/arbite/cli.py` is 4604 lines, not the 3015 RD3 ranges over -- and a digest
+  or a size is a fact about bytes that no fixture can reproduce while also keeping
+  those line counts. So the harness normalises digests, and the fixtures build the
+  line counts, paths and dates each block asserts. `O_CREAT` in `LS3` is the flag
+  spelled at `src/arbite/sinks/file.py:141` when the block was written, letter O,
+  not a zero. When a block and the code disagree, the block is wrong until proven
+  otherwise -- and where a block was provably wrong, C15 corrected the block
+  rather than the code, with the contradiction recorded on the ticket.
 - **Text is primary; JSON is the same facts.** Language agents read the text, so
   the text carries the whole story in one screen: what happened, what it cost,
   and what to do next. `--json` is the branchable form (field names match
@@ -50,7 +58,11 @@ harness substitutes every id before comparing output.
 tool's own exit code must survive untouched and 0–5 are all reachable that way:
 it returns the wrapped command's code for a command that ran, and `125` refused
 before running (busy, policy), `126` unsupported invocation, `127` tool not
-found. Every one of those three prints `command did not run`.
+found. A refusal never runs the command and says which invocation was refused:
+`125` and `127` also print `command did not run`, while the `126` refusals state
+that the invocation is unsupported. The `127` refusal is the one non-zero
+outcome in this catalogue that prints no `next:` line -- no arbite command can
+put a missing tool on `PATH`.
 
 ### The `next:` line
 
@@ -308,10 +320,10 @@ truncated: 499 more matches in 11 files; narrow with 'arbite file search "def " 
 
 ```sh
 $ arbite file list .arbite
-.arbite/AGENTS.md                (generated, not a ticket)
+.arbite/AGENTS.md                  (generated, not a ticket)
+.arbite/agents/claude.opus.001.md     1 lines   0.0 KiB  unclaimed
 .arbite/project.yaml
-.arbite/agents/claude.opus.001.md
-.arbite/scratch/                 (transport, 1 file -- not listed as a file, never claimable)
+.arbite/scratch/                   (transport, 1 file -- not listed as a file, never claimable)
 4 entries (no truncation)
 
 $ arbite file search "base.py" .arbite/scratch
@@ -382,7 +394,7 @@ token-saving refusal when the caller knows it cannot use the bytes.
 
 ```sh
 $ arbite file read src/arbite/cli.py --ticket tic-cf9f --attempt att-91bd --lines 1254:1260
-src/arbite/cli.py  sha256:9a1c40de77b2  3015 lines  142 KiB
+src/arbite/cli.py  sha256:9a1c40de77b2  3015 lines  142.0 KiB
 claim: none   lines 1254-1260 of 3015   read token: op-88ba
 ---
 1254 | def cmd_claim(args):
@@ -397,10 +409,13 @@ authorize a range-scoped lie.
 ```sh
 $ arbite file read src/arbite/sinks/base.py --ticket tic-cf9f --attempt att-91bd
 src/arbite/sinks/base.py  sha256:c19d7be0a4f5  588 lines  27.1 KiB
-claim: none
+claim: none (readable by anyone)   workspace: ws-7c41
 note: on-disk bytes differ from the last version arbite observed (sha256:77c0ab19d3f1);
       an external edit is attributable to no ticket
-read token: op-c201
+read token: op-c201 (spent after one mutation of this path)
+---
+ 144 | class TicketSink(ABC):
+ 145 |     """A ticket store. Implementations: `FileSink`, `SqliteSink`.
 ```
 
 ## RD5 · read a path that does not exist
@@ -692,7 +707,7 @@ next: 'arbite claim tic-cf9f --agent <your-id>' to start one
 
 ```sh
 $ arbite file edit src/arbite/sinks/base.py --ticket tic-cf9f --attempt att-91bd --read-token op-4f19 --edits edits.json
-edited src/arbite/sinks/base.py  sha256:aa10f7b2c4e9  570 -> 573 lines  +4 -1
+edited src/arbite/sinks/base.py  sha256:aa10f7b2c4e9  570 -> 573 lines  +5 -2
   1/2 replace at line 222: "The one write path" -> "The single write path"
   2/2 replace at line 229: "Raises Conflict" -> "Raises Conflict or StaleRead"
 receipt: op-2b8d17 · claim gen 2 · payload .arbite/scratch/edits.json consumed and cleared
@@ -716,6 +731,8 @@ next: read those lines ('arbite file read src/arbite/sinks/base.py --ticket tic-
 $ arbite file edit src/arbite/schema.py --ticket tic-cf9f --attempt att-91bd --read-token op-88ba --edits -
 (payload read from stdin: 2 edits)
 edited src/arbite/schema.py  sha256:b7710e4cc9aa  657 -> 660 lines  +3 -0
+  1/2 replace at line 2: "import os" -> "import os"
+  2/2 replace at line 1: "from __future__ import annotations" -> "from __future__ import annotations"
 receipt: op-4d17 · claim gen 3
 # exit 0
 ```
@@ -769,9 +786,9 @@ next: remove the files individually ('arbite file list src/arbite/legacy'), then
 ```sh
 $ arbite changes tic-cf9f
 tic-cf9f · attempt att-91bd (claude.opus.001) · 5 operations
-M src/arbite/sinks/base.py   sha256:77c0ab19d3f1 -> sha256:aa10f7b2c4e9  +18 -0            (op-2b8d17)
-A src/arbite/coordination/records.py                                        created        (op-3f02)
-M src/arbite/schema.py       sha256:1f3a9c04b2d8 -> sha256:1f3a9c04b2d8  no net change   (op-51bb, op-6cd2)
+M src/arbite/sinks/base.py  sha256:77c0ab19d3f1 -> sha256:aa10f7b2c4e9  +18 -0         (op-2b8d17)
+A src/arbite/coordination/records.py                                            created        (op-3f02)
+M src/arbite/schema.py      sha256:1f3a9c04b2d8 -> sha256:1f3a9c04b2d8  no net change  (op-51bb, op-6cd2)
       edit-then-revert: both operations remain in the log ('--all')
 # exit 0
 ```
@@ -890,12 +907,14 @@ an event. Observed mode does not claim exclusivity, and says so.
 ```sh
 $ arbite cmd --ticket tic-cf9f --attempt att-91bd --claim src/arbite/sinks/file.py -- sed -i 's/O_EXCL/O_EXCL|O_NOFOLLOW/' src/arbite/sinks/file.py
 claimed 1 path for tic-cf9f / att-91bd (generation 4):
-  src/arbite/sinks/file.py  sha256:4b8a1f0c9d2e  412 lines
-arbite cmd: sed -i ... src/arbite/sinks/file.py
+  src/arbite/sinks/file.py   sha256:4b8a1f0c9d2e  412 lines
+arbite cmd: sed -i s/O_EXCL/O_EXCL|O_NOFOLLOW/ src/arbite/sinks/file.py
 exit: 0 (14 ms)  mode: guarded (exclusive on 1 path)
 changed 1 path, all inside the claimed set:
   M src/arbite/sinks/file.py  sha256:4b8a1f0c9d2e -> sha256:9c2e40a71b88  +1 -1  (op-8a31)
+event: passthrough.exec   tool: sed   ticket: tic-cf9f / att-91bd  actor: claude.opus.001
 claims released (work complete for this command)
+next: 'arbite changes tic-cf9f' to review
 # exit 0
 ```
 
@@ -919,14 +938,17 @@ the wrapped tool's own result.
 
 ```sh
 $ arbite cmd --ticket tic-cf9f --attempt att-91bd --claim src/arbite/schema.py -- sed -i 's/x/y/' src/arbite/schema.py src/arbite/query.py
-claimed 1 path for tic-cf9f / att-91bd (generation 3): src/arbite/schema.py
-arbite cmd: sed -i ...
+claimed 1 path for tic-cf9f / att-91bd (generation 1):
+  src/arbite/schema.py   sha256:1f3a9c04b2d8  40 lines
+arbite cmd: sed -i s/x/y/ src/arbite/schema.py src/arbite/query.py
 exit: 0 (11 ms)  mode: guarded (exclusive on 1 path)
 changed 2 paths, 1 OUTSIDE the claimed set:
-  M src/arbite/schema.py  sha256:1f3a9c04b2d8 -> sha256:9d0b7c11a4e2  +1 -1  claimed  (op-8a31)
   M src/arbite/query.py   sha256:aa9c31f0be77 -> sha256:bb02d1c93e10  +1 -1  NOT claimed  (op-8a32)
+  M src/arbite/schema.py  sha256:1f3a9c04b2d8 -> sha256:9d0b7c11a4e2  +1 -1  claimed  (op-8a31)
+event: passthrough.exec   tool: sed   ticket: tic-cf9f / att-91bd  actor: claude.opus.001
 unclaimed_write: src/arbite/query.py was modified without being claimed; the bytes are recorded
                  and left as they are (arbite does not undo a command it did not perform)
+claims released (the run is over; the unclaimed write is left in place)
 next: 'arbite file claim src/arbite/query.py --ticket tic-cf9f --attempt att-91bd' and re-read it,
       or 'arbite changes tic-cf9f' and correct by hand
 # exit 1
@@ -941,14 +963,14 @@ silently rolled back.
 $ arbite cmd --ticket tic-cf9f --attempt att-91bd --shell -- 'grep -c def src/arbite/cli.py > .arbite/scratch/count.txt'
 arbite cmd: sh -c 'grep -c def src/arbite/cli.py > .arbite/scratch/count.txt'
 exit: 0 (9 ms)  mode: observed  note: redirections happen in the shell and are visible only after the fact
-event: passthrough.exec   tool: sh   ticket: tic-cf9f / att-91bd
+event: passthrough.exec   tool: sh   ticket: tic-cf9f / att-91bd  actor: claude.opus.001
 # exit 0
 ```
 
 ## PC6 · refusals
 
 ```sh
-$ arbite cmd --ticket tic-cf9f --attempt att-91bd -- sed -i 's/a/b/' src/arbite/cli.py
+$ arbite cmd --ticket tic-cf9f --attempt att-91bd -- sed -i 's/a/b/' src/arbite/cli.py > /tmp/sed.out
 error: '>' style shell syntax needs '--shell'; without it arbite executes argv directly
 next: re-run with '--shell -- "<command>"', or pass arguments without shell syntax
 # exit 126

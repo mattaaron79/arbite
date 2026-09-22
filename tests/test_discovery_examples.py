@@ -7,18 +7,19 @@ each block starts from, to the counts and shapes the block prints, so "the trans
 passes" means the real command printed exactly what the document says about a project
 in the state it describes.
 
-Three of the blocks need something said out loud, and each says it where it is used:
+Two of the blocks need something said out loud, and each says it where it is used:
 
 - LS2 and LS4 elide rows (`… 99 more files`). The harness asserts the *count* where the
   elision stands and compares every line around it byte for byte; the content of the
   elided rows is pinned by the property tests instead.
-- LS5 shows four facts in a listing whose note column the document hand-aligned (mine
-  separates a note from the widest path by two spaces) and whose scratchpad row carries
-  no version columns. Its first half is therefore asserted as facts, in order; its
-  second half -- the scratch search and its exit code -- is byte for byte.
 - LS6's two refusals are both frozen blocks, and both now go through the real commands:
   the escape through `file read` (which needs no `--ticket`, which is why the block has
   none) and the protected path through `file list`.
+
+LS5 is byte for byte on both halves. C15 corrected its listing, which had hand-aligned its
+note column and listed `project.yaml` before an agent scratchpad (canonical path order is
+`.arbite/AGENTS.md`, `.arbite/agents/...`, `.arbite/project.yaml`, `.arbite/scratch/`) and
+omitted the scratchpad row's version columns.
 """
 
 from __future__ import annotations
@@ -127,12 +128,12 @@ def test_LS4_the_after_token_continues_the_search(tmp_path):
 
 
 def test_LS5_scratch_is_invisible_to_discovery(tmp_path):
-    """Two answers about one area, and the abridgements this test accepts.
+    """Two answers about one area, both byte for byte.
 
-    The listing's facts are the four entries, in canonical order, with the scratch area
-    reported as one line of transport and the coordination tree absent entirely; the
-    document aligns its note column by hand and shows the scratchpad without version
-    columns, so the rows are compared as facts. The search transcript is exact.
+    The listing's four entries are asserted exactly -- canonical order, the generated
+    guide row, the scratchpad row with its own version columns, and the scratch area as
+    one line of transport -- and the coordination tree is absent entirely. The search
+    transcript is exact too, and its exit code 2 is the "matched nothing" answer.
     """
     project = state.arbite_dir_project(tmp_path)
     listing, search = _ls5_halves(examples.fenced_blocks("LS5")[0])
@@ -141,7 +142,9 @@ def test_LS5_scratch_is_invisible_to_discovery(tmp_path):
 
     assert listed.returncode == 0, listed.stderr
     assert listed.stderr == ""
-    examples.assert_facts("LS5's listing", listed.stdout, listing, project, ordered=False)
+    assert examples.normalise(listed.stdout, project).strip("\n") == examples.normalise(
+        listing, project
+    ).strip("\n")
     assert "coordination" not in listed.stdout, "the coordination tree is invisible"
 
     found = examples.run_cli(project, "file", "search", "base.py", ".arbite/scratch")
