@@ -1,6 +1,6 @@
 [project]
 name = "arbite"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pluggable ticket-sink system for git repos and AI agents (files by default, SQLite optional)"
 requires-python = ">=3.9"
 dependencies = [
