@@ -143,10 +143,14 @@ See AGENTS_EXAMPLE.md, which tells the agent to classify and work raw tickets wh
   overwritten.
 - **Machine-first interfaces.** JSON output for every read query, distinct exit
   codes for success / error / empty / integrity-problems.
-- **A self-describing command surface.** `arbite init` regenerates
-  [`docs.py`](src/arbite/docs.py)-rendered `.arbite/AGENTS.md` straight from
-  argparse's own `--help`, and words it for the sink actually in use, so the
-  agent-facing docs cannot drift from the CLI *or* lie about the storage.
+- **A self-describing command surface.** `arbite init` regenerates two
+  [`docs.py`](src/arbite/docs.py)-rendered documents straight from argparse's own
+  `--help` — `.arbite/AGENTS.md` (the workflow, the rules and a one-line index of
+  every command) and `.arbite/WORKSPACE.md` (the file-proxy and workspace-command
+  reference it points at) — and words both for the sink actually in use, so the
+  agent-facing docs cannot drift from the CLI *or* lie about the storage. Splitting
+  them keeps the guide that is read on every task small: the per-flag reference
+  lives in the file only the file-changing work reads.
 - **A dependency graph, not just a list.** Tickets can declare structural
   `depends_on` links, and `arbite list next` returns work in topological order.
 - **Recoverable history.** Plain files plus git; no proprietary format to migrate.
@@ -366,11 +370,12 @@ Three things worth being explicit about, because all are easy to assume wrongly:
   convenience of the first alphabetical match.
 - **Controlled vocabularies live in one place.** `STATUSES`, `TYPES`, `TIERS` and
   friends in [`schema.py`](src/arbite/schema.py) are validated by `set`, `create`
-  and every sink's `check`, and interpolated into `.arbite/AGENTS.md`, so the docs,
+  and every sink's `check`, and interpolated into the generated docs, so the docs,
   the CLI and the validator cannot drift apart.
-- **The docs must be true for the sink in use.** `.arbite/AGENTS.md` is rendered
-  from the sink's own capabilities, so a database-backed project is never told that
-  "the folder is the source of truth".
+- **The docs must be true for the sink in use.** Both `.arbite/AGENTS.md` and
+  `.arbite/WORKSPACE.md` are rendered from the sink's own capabilities, so a
+  database-backed project is never told that "the folder is the source of truth",
+  and a sink with no coordination backend is never handed a file-proxy contract.
 
 ---
 
@@ -754,7 +759,8 @@ stranded.
   agents/
     claude.haiku.001.md
     ...
-  AGENTS.md        generated command reference
+  AGENTS.md        generated guide: workflow, rules, command index
+  WORKSPACE.md     generated file-proxy and workspace-command reference
 ```
 
 - `raw/`, `open/`, `in_progress/`, `review/`, `blocked/`, `shelved/` are **status folders**.
@@ -774,12 +780,20 @@ stranded.
 - `agents/` holds one scratchpad file per known agent identity (no required schema),
   pre-created from the `agents:` list in `.arbite/project.yaml`. Scratchpads stay
   files whichever sink is active: they are harness-facing state, not tickets.
-- `AGENTS.md` is regenerated on every `arbite init`. It is **not auto-discovered** —
+- `AGENTS.md` and `WORKSPACE.md` are regenerated on every `arbite init`, from the
+  same parsers and the same sink information. `AGENTS.md` is the guide — what the
+  workflow is, the rules an agent must act on, the field vocabulary, the workflow
+  example and a one-line index of every command — and it is **not auto-discovered**:
   a project that wants agents to find arbite must point at it explicitly (e.g. a line
-  in its own `CLAUDE.md` like "read `.arbite/AGENTS.md`").
+  in its own `CLAUDE.md` like "read `.arbite/AGENTS.md`"). `WORKSPACE.md` is the
+  reference the guide points at: the file proxy's claim → read → mutate → receipt
+  contract, what arbite does *not* guarantee about it, and the flags of every
+  workspace command (`file`, `scratch`, `cmd`, `receipt`, `changes`, `events`,
+  `workspace`, `attempt`). Neither document is a ticket: both are skipped by name
+  when the file sink scans for one.
 
-A SQLite-sink project has the same `.arbite/agents/` directories and `AGENTS.md`,
-with `arbite.db` in place of the status folders.
+A SQLite-sink project has the same `.arbite/agents/` directories, `AGENTS.md` and
+`WORKSPACE.md`, with `arbite.db` in place of the status folders.
 
 ### Ticket format
 
@@ -875,7 +889,7 @@ The script refuses to run as root for exactly this reason.
 ## Quick start
 
 ```bash
-# 1. Create the directory structure and the generated AGENTS.md
+# 1. Create the directory structure and the generated AGENTS.md / WORKSPACE.md
 arbite init
 
 # 2. Capture a thought without classifying it yet
@@ -978,8 +992,9 @@ src/arbite/
     sqlite.py           the sqlite sink: normalized tables, SQL queries, note index
     __init__.py         the sink registry
   config.py             locating .arbite/ and resolving which sink to use
-  docs.py               renders .arbite/AGENTS.md from the real argparse output
-                        and the active sink's capabilities
+  docs.py               renders .arbite/AGENTS.md (the guide) and
+                        .arbite/WORKSPACE.md (the proxy reference) from the real
+                        argparse output and the active sink's capabilities
 tests/
   test_sink_conformance.py  one suite, run against every sink
   test_file_sink.py         file-specific: folders, drift, temp files, archives

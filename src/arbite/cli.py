@@ -587,24 +587,34 @@ def cmd_init(args):
 
     parser, subparsers_by_name = build_parser()
     agents_md = arbite_dir / "AGENTS.md"
+    workspace_md = arbite_dir / "WORKSPACE.md"
     # The guide is committed and read by processes other than this one, so it
     # describes the sink a *plain* command will use (committed config only, no
     # --sink, no environment) -- and names any other store here that holds tickets
     # but that nothing selects.
     active = build_sink(config.configured_sink_spec(project_root), arbite_dir)
+    active_info = _describe_safely(active)
+    stale_info = _find_stale_store(sink, active, arbite_dir)
+    # Two documents, one pass: the guide an agent reads at the start of every task,
+    # and the workspace reference it reads when it is about to change a file. Both
+    # come from these parsers and this sink info, so neither can claim anything the
+    # CLI or the active store would contradict.
     agents_md.write_text(
-        docs.render(
-            parser,
-            subparsers_by_name,
-            _describe_safely(active),
-            _find_stale_store(sink, active, arbite_dir),
-        ),
+        docs.render(parser, subparsers_by_name, active_info, stale_info),
+        encoding="utf-8",
+    )
+    workspace_md.write_text(
+        docs.render_workspace(parser, subparsers_by_name, active_info, stale_info),
         encoding="utf-8",
     )
     print(
         f"AGENTS.md refreshed at {agents_md} -- this is not auto-discovered, so point your "
         f"project's CLAUDE.md (or similar) at it explicitly, e.g. a line like "
         f"'read {config.ARBITE_DIRNAME}/AGENTS.md', if you want agents to find arbite"
+    )
+    print(
+        f"WORKSPACE.md refreshed at {workspace_md} -- the file-proxy and workspace-command "
+        f"reference the guide points at"
     )
 
     # --agents-doc / --claude-doc install the short instructions block into the
@@ -2850,9 +2860,10 @@ def _target_exists(target) -> bool:
 
 def build_parser():
     """Returns (parser, subparsers_by_name). The dict is used by `arbite init` to
-    render .arbite/AGENTS.md's command reference straight from these parsers
-    (every usage line and flag, compacted rather than dumped as --help text), so
-    that doc can't drift from the real CLI."""
+    render the two generated docs straight from these parsers: the one-line command
+    index in .arbite/AGENTS.md, and the per-flag reference in .arbite/WORKSPACE.md
+    (every usage line and flag, compacted rather than dumped as --help text). Both
+    are rendered rather than hand-kept, so neither can drift from the real CLI."""
     parser = argparse.ArgumentParser(prog="arbite", description="Ticket sink CLI")
     parser.add_argument("--version", action="version", version=f"arbite {__version__}")
     _sink_flag(parser, suppress=False)
@@ -2863,10 +2874,12 @@ def build_parser():
         help="create the arbite directory and initialise the selected sink",
         description="Create .arbite/ in the current directory (like 'git init'), initialise "
         "the selected sink (status folders and buckets for the file sink; the database and "
-        "its schema for the sqlite sink), write .arbite/AGENTS.md (the command reference, not "
-        "auto-discovered -- point your project's CLAUDE.md or similar at it explicitly if you "
-        "want agents to find arbite, or pass --agents-doc/--claude-doc to have the instructions "
-        "block installed into those files for you), and pre-create a scratchpad file under .arbite/agents/ "
+        "its schema for the sqlite sink), write .arbite/AGENTS.md (the guide: workflow, rules "
+        "and a one-line index of every command; not auto-discovered -- point your project's "
+        "CLAUDE.md or similar at it explicitly if you want agents to find arbite, or pass "
+        "--agents-doc/--claude-doc to have the instructions block installed into those files "
+        "for you) and .arbite/WORKSPACE.md (the file-proxy and workspace-command reference the "
+        "guide points at), and pre-create a scratchpad file under .arbite/agents/ "
         "for every id listed in an 'agents:' list in .arbite/project.yaml, if present. Which sink is "
         "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
         "in .arbite/project.yaml, then file. The store it creates then becomes the project default -- "

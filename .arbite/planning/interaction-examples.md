@@ -321,10 +321,11 @@ truncated: 499 more matches in 11 files; narrow with 'arbite file search "def " 
 ```sh
 $ arbite file list .arbite
 .arbite/AGENTS.md                  (generated, not a ticket)
+.arbite/WORKSPACE.md               (generated, not a ticket)
 .arbite/agents/claude.opus.001.md     1 lines   0.0 KiB  unclaimed
 .arbite/project.yaml
 .arbite/scratch/                   (transport, 1 file -- not listed as a file, never claimable)
-4 entries (no truncation)
+5 entries (no truncation)
 
 $ arbite file search "base.py" .arbite/scratch
 no matches (scratch is excluded from discovery: it is transport, not project content)

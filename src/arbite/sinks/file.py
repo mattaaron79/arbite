@@ -66,8 +66,9 @@ FLAT_STATUS_DIRS = tuple(s for s in STATUSES if s != CLOSED_DIR)
 RESERVED_DIRS = ("agents", "coordination", "scratch")
 DEFAULT_BUCKETS = ("wishlist", "plans")
 
-# Generated files that merely live under the root: never tickets.
-GENERATED_FILES = ("AGENTS.md",)
+# Generated files that merely live under the root: never tickets. `arbite init`
+# writes both (the guide, and the workspace reference it points at).
+GENERATED_FILES = ("AGENTS.md", "WORKSPACE.md")
 
 # The snapshot area: `raw/processed/`, nested under the raw status folder, holds
 # verbatim snapshots of raw captures that have since been promoted. A snapshot is

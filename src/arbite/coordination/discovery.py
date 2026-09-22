@@ -77,7 +77,7 @@ TRUNCATION_INDENT = " " * len("truncated: ")
 #: What a listing prints instead of version metadata. `GENERATED_FILES` is the file
 #: sink's list of documents arbite writes rather than finds
 #: (`sinks.file.GENERATED_FILES`); a test pins the two together so neither can drift.
-GENERATED_FILES = ("AGENTS.md",)
+GENERATED_FILES = ("AGENTS.md", "WORKSPACE.md")
 GENERATED_NOTE = "(generated, not a ticket)"
 SCRATCH_NOTE = "(transport, {files} -- not listed as a file, never claimable)"
 ENTRY_NOTE_GAP = 2

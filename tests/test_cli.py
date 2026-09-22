@@ -23,6 +23,7 @@ from arbite import cli as arbite_cli
 from arbite import docs, schema
 from arbite.errors import Conflict
 from arbite.sinks import Expect, SinkSpec, build_sink
+from arbite.sinks import file as file_sink
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
@@ -121,6 +122,12 @@ def test_init_creates_the_file_layout_and_a_folder_aware_guide(cli, tmp_project)
     guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
     assert "folder is the source of truth" in guide
     assert "## Where tickets live (the sink)" in guide
+    # One `init`, two documents: the guide points at the workspace reference, and the
+    # reference was written in the same pass.
+    assert ".arbite/WORKSPACE.md" in guide
+    assert "WORKSPACE.md refreshed at" in output
+    workspace = (tmp_project / ".arbite" / "WORKSPACE.md").read_text()
+    assert "## Claim, read, mutate, release" in workspace
 
 
 def test_init_leaves_agent_docs_alone_without_the_flags(cli, tmp_project):
@@ -295,32 +302,90 @@ def test_the_guide_names_only_the_current_vocabulary_and_commands(cli, tmp_proje
     assert "arbite.yaml" not in guide
     assert "planning" not in guide
 
+    # The same rule binds the document the guide points at: WORKSPACE.md is rendered
+    # from the same parsers, so it may only name workspace commands that exist -- and
+    # it carries a full block for each of them.
+    workspace = (tmp_project / ".arbite" / "WORKSPACE.md").read_text()
+    assert "## Commands" in workspace
+    for name in docs.WORKSPACE_COMMANDS:
+        assert f"**`arbite {name}`**" in workspace, name
+    assert "arbite.yaml" not in workspace
+    assert "planning" not in workspace
+
 
 def test_the_guide_is_rewritten_identically_when_nothing_changed(cli, tmp_project):
-    """`init` rewrites the guide on every run, so re-running it must be a no-op: a
-    committed guide should only ever show up as a diff when something real changed."""
+    """`init` rewrites both generated docs on every run, so re-running it must be a
+    no-op: a committed doc should only ever show up as a diff when something real
+    changed."""
     cli("init")
-    first = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    first = {
+        name: (tmp_project / ".arbite" / name).read_text()
+        for name in ("AGENTS.md", "WORKSPACE.md")
+    }
     cli("init")
-    second = (tmp_project / ".arbite" / "AGENTS.md").read_text()
-    assert _without_generated_stamp(second) == _without_generated_stamp(first)
+    second = {
+        name: (tmp_project / ".arbite" / name).read_text()
+        for name in ("AGENTS.md", "WORKSPACE.md")
+    }
+    for name in first:
+        assert _without_generated_stamp(second[name]) == _without_generated_stamp(first[name]), name
 
 
-def test_BY3_and_BY1_the_guide_says_what_arbite_does_not_enforce(cli, tmp_project):
-    """BY3's target, and the prose half of BY1: the generated guide states plainly that
-    agents are told to use the proxy, that a shell or an editor can bypass it, that a
-    direct write is *observed drift* the next read reports, and that arbite cannot prove
-    who made it. The claim is about what arbite enforces, not what it wishes were true.
+#: The guide's size budget. It is read into an agent's context at the start of every
+#: task, so how big it is is a design constraint rather than a preference: the per-flag
+#: reference and the honest limits live in WORKSPACE.md, and this is what keeps them
+#: from drifting back in. Sized with headroom over the file this split produced (about
+#: 200 lines and 24 KiB for a fresh file-sink project), so a real addition still fits;
+#: raising it is a deliberate decision, not a detail of one command's documentation.
+LEAN_GUIDE_LINES = 220
+LEAN_GUIDE_BYTES = 26_000
 
-    The file-proxy section is generated, so it must also be true of the sink in use: both
-    real sinks have a coordination backend, each with its own evidence location and doctor
-    findings named. A sink kind with no coordination backend gets a paragraph saying the
-    proxy commands refuse -- never a section describing commands it cannot honour."""
+
+def test_the_guide_stays_lean(cli, tmp_project):
+    """The always-read half of the split: the guide carries no per-flag reference, and
+    the document that does is one pointer away rather than in every task's context."""
+    cli("init")
+    guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
+    workspace = (tmp_project / ".arbite" / "WORKSPACE.md").read_text()
+
+    assert len(guide.splitlines()) <= LEAN_GUIDE_LINES, (
+        "the guide grew past its budget: move the detail into WORKSPACE.md"
+    )
+    assert len(guide.encode()) <= LEAN_GUIDE_BYTES
+
+    # The per-command flag blocks -- the bulk the split moved out -- are not in the
+    # guide, and what the guide says about them is where to find them.
+    assert "**`arbite file edit`**" not in guide
+    assert "--read-token TOKEN" not in guide
+    assert "--edits NAME" not in guide
+    assert ".arbite/WORKSPACE.md" in guide
+    # ...and they are in the file it names, so the split lost nothing.
+    assert "**`arbite file edit`**" in workspace
+    assert "--read-token TOKEN" in workspace
+    assert "--edits NAME" in workspace
+
+
+def test_BY3_and_BY1_the_guide_and_the_workspace_doc_say_what_arbite_does_not_enforce(
+    cli, tmp_project
+):
+    """BY3's target, and the prose half of BY1: arbite states plainly that agents are
+    told to use the proxy, that a shell or an editor can bypass it, that a direct write
+    is *observed drift* the next read reports, and that it cannot prove who made it. The
+    claim is about what arbite enforces, not what it wishes were true.
+
+    The split decides where each half of that statement lives, and both halves are
+    asserted: the guide (read on every task) carries the rule and the pointer, while the
+    limits themselves -- read when a file is about to change -- are in WORKSPACE.md. Both
+    documents are generated, so both must also be true of the sink in use: each real sink
+    names its own evidence location and doctor findings, and a sink kind with no
+    coordination backend gets a paragraph saying the proxy commands refuse -- never a
+    contract it cannot honour."""
     cli("init")
     file_guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
-    assert "## The file proxy" in file_guide
-    assert "Prefer the proxy for file changes" in file_guide
-    assert "keeps evidence beside the tickets" in file_guide
+    file_workspace = (tmp_project / ".arbite" / "WORKSPACE.md").read_text()
+
+    assert "Prefer it to a shell write" in file_guide
+    assert ".arbite/WORKSPACE.md" in file_guide
     for fragment in (
         "A shell can bypass it",
         "reported by the next read as an external edit attributable to no ticket",
@@ -329,29 +394,34 @@ def test_BY3_and_BY1_the_guide_says_what_arbite_does_not_enforce(cli, tmp_projec
         "No daemon, no launcher, no automatic recovery",
         "Evidence is never pruned",
         "`arbite receipt --summary`",
+        "keeps evidence beside the tickets",
     ):
-        assert fragment in file_guide, fragment
+        assert fragment in file_workspace, fragment
+    # The guide states the rule, not the essay: those limits are not duplicated there.
+    assert "Observation is not exclusivity" not in file_guide
+    assert "A shell can bypass it" not in file_guide
 
     (tmp_project / ".arbite" / "project.yaml").write_text("sink: sqlite\n")
     cli("init")
     sqlite_guide = (tmp_project / ".arbite" / "AGENTS.md").read_text()
-    assert "## The file proxy" in sqlite_guide
-    assert "Prefer the proxy for file changes" in sqlite_guide
-    assert "keeps evidence in the database" in sqlite_guide
+    sqlite_workspace = (tmp_project / ".arbite" / "WORKSPACE.md").read_text()
+    assert "Prefer it to a shell write" in sqlite_guide
+    assert "keeps evidence in the database" in sqlite_workspace
+    assert "also present, but not selected" not in sqlite_guide
+    assert "- active sink: `sqlite`" in sqlite_guide
 
     from arbite.sinks.base import SinkInfo
 
     parser, subparsers_by_name = arbite_cli.build_parser()
-    unavailable = docs.render(
-        parser,
-        subparsers_by_name,
-        SinkInfo(kind="memory", root="/tmp/memory", status_is_location=False,
-                 supports_buckets=False),
-    )
-    assert "## The file proxy" in unavailable
-    assert "has no coordination backend" in unavailable
-    assert "A shell can bypass it" not in unavailable
-    assert "Prefer the proxy for file changes" not in unavailable
+    memory = SinkInfo(kind="memory", root="/tmp/memory", status_is_location=False,
+                      supports_buckets=False)
+    unavailable = docs.render(parser, subparsers_by_name, memory)
+    unavailable_workspace = docs.render_workspace(parser, subparsers_by_name, memory)
+    for text in (unavailable, unavailable_workspace):
+        assert "has no coordination backend" in text
+        assert "A shell can bypass it" not in text
+        assert "Prefer it to a shell write" not in text
+    assert "## Claim, read, mutate, release" not in unavailable_workspace
 
 
 def test_the_installed_instructions_block_matches_the_example():
@@ -1211,10 +1281,13 @@ def test_migrate_round_trips_file_to_sqlite_and_back_byte_identically(project, c
         (plans / name).write_text("a plan\n")
 
     def snapshot() -> dict:
+        # The generated documents live under the root too, and `init` writes them: the
+        # comparison is about tickets, so they are skipped by the list arbite itself
+        # uses to tell a document it wrote from a file it found.
         return {
             str(path.relative_to(project)): path.read_bytes()
             for path in sorted((project / ".arbite").rglob("*.md"))
-            if path.name != "AGENTS.md" and "agents" not in path.parts
+            if path.name not in file_sink.GENERATED_FILES and "agents" not in path.parts
         }
 
     before = snapshot()
