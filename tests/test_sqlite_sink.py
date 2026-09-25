@@ -88,6 +88,48 @@ def test_an_older_schema_version_is_reported_not_migrated(sqlite_sink, db_path):
     assert sqlite_sink.schema_version() == 1, "no migration is written"
 
 
+def test_a_store_written_before_schema_v3_is_repaired_on_open(sqlite_sink, db_path):
+    """A v1/v2 store is an arbite store missing exactly one table --
+    `ticket_references` -- and every read names it, so without a repair the first
+    ticket read fails with "no such table" (which is what a migration out of such a
+    store, or any `list`, hits first). Opening it adds what is missing and nothing
+    else: the tickets are still there, and the *version row is untouched*, so
+    `doctor` goes on reporting the store as the old one it is rather than as current.
+    """
+    sqlite_sink.create(make_ticket("tic-a1b2"))
+    execute(db_path, "DROP TABLE ticket_references")
+    execute(db_path, "UPDATE schema_version SET version = 2")
+
+    reopened = SqliteSink(db_path)
+    assert reopened.ids() == ["tic-a1b2"], "the old store reads again"
+    assert reopened.read("tic-a1b2").references == [], "a table that was absent reads empty"
+    # The repair is the sink's own DDL, so the index declared alongside the table
+    # comes back with it -- a repair that left the table unindexed would be half a fix.
+    assert rows(db_path, "SELECT name FROM sqlite_master WHERE type='table' AND name='ticket_references'")
+    assert rows(db_path, "SELECT name FROM sqlite_master WHERE type='index' AND name='ticket_references_ref_idx'")
+    # Nothing else moved: same ticket, same recorded version.
+    assert reopened.schema_version() == 2
+    assert [r["id"] for r in rows(db_path, "SELECT id FROM tickets")] == ["tic-a1b2"]
+
+
+def test_a_repaired_store_is_writable_not_merely_readable(sqlite_sink, db_path):
+    """The repair has to leave the store *usable*, not just readable: every write
+    rewrites the child rows, so a reference written after the repair is what proves
+    the added table takes writes rather than only answering reads."""
+    sqlite_sink.create(make_ticket("tic-a1b2"))
+    execute(db_path, "DROP TABLE ticket_references")
+
+    reopened = SqliteSink(db_path)
+    ticket = reopened.read("tic-a1b2")
+    ticket.references = ["plans/review-workflow.md"]
+    reopened.update(ticket)
+
+    assert reopened.read("tic-a1b2").references == ["plans/review-workflow.md"]
+    assert [
+        r["ref_path"] for r in rows(db_path, "SELECT ref_path FROM ticket_references")
+    ] == ["plans/review-workflow.md"]
+
+
 def test_init_is_idempotent_and_keeps_data(sqlite_sink, db_path):
     sqlite_sink.create(make_ticket("tic-a1b2"))
     sqlite_sink.init()

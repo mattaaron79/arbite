@@ -520,8 +520,10 @@ def cmd_init(args):
     it creates then becomes the project default: `sink:` is written to
     .arbite/project.yaml (the directory and the file created if missing), so later
     commands -- including ones an agent runs with no flags -- read the same store.
-    An `ARBITE_SINK` selection is treated as this-process-only and reported rather
-    than written into committed config."""
+    That write happens even when the store it created *is* the default, so `init`
+    never leaves behind a project with no config file at all. An `ARBITE_SINK`
+    selection is treated as this-process-only and reported rather than written into
+    committed config, so that case is the one exception and writes no config."""
     spec, project_root = _cwd_sink(args)
     arbite_dir = project_root / config.ARBITE_DIRNAME
     arbite_dir.mkdir(parents=True, exist_ok=True)
@@ -558,22 +560,30 @@ def cmd_init(args):
     # project default, so no later command -- least of all one an agent runs with
     # no flags -- can read a different store by accident. A store that exists but
     # that nothing selects looks exactly like an empty one, and that is the one
-    # failure this project cannot leave silently available.
+    # failure this project cannot leave silently available -- which is why a
+    # selection is written even when the store created *is* the default: "nothing
+    # selects it" and "the default happens to be it" read identically from the
+    # outside, and only the committed line tells them apart.
     explicit = getattr(args, "sink", None)
     resolved = config.configured_sink_spec(project_root)
-    if resolved.kind != sink.kind:
-        if not explicit and os.environ.get(config.ENV_SINK):
-            # An environment override is one process's decision, not the project's.
-            print(
-                f"note: {config.ENV_SINK}={sink.kind} selected this store for this command "
-                f"only; run 'arbite init --sink {sink.kind}' to make it the project default"
-            )
-        else:
-            written = config.set_configured_sink(sink.kind, project_root)
-            print(
-                f"set 'sink: {sink.kind}' in {written.name} -- the store this command created "
-                "is now the project default, so plain 'arbite' commands read it"
-            )
+    env_override = not explicit and bool(os.environ.get(config.ENV_SINK))
+    if env_override and resolved.kind != sink.kind:
+        # An environment override is one process's decision, not the project's, so it
+        # is reported rather than written -- and it does not create a config either: a
+        # `sink:` line naming a store this command happened to use would answer "what
+        # does this project read?" with a store the project never chose, and would
+        # silence the warning that catches exactly that unused store (see
+        # `_warn_about_an_unused_database`).
+        print(
+            f"note: {config.ENV_SINK}={sink.kind} selected this store for this command "
+            f"only; run 'arbite init --sink {sink.kind}' to make it the project default"
+        )
+    elif config.config_path(project_root) is None or resolved.kind != sink.kind:
+        written = config.set_configured_sink(sink.kind, project_root)
+        print(
+            f"set 'sink: {sink.kind}' in {written.name} -- the store this command created "
+            "is now the project default, so plain 'arbite' commands read it"
+        )
 
     # Coordination state lives beside the tickets (a `coordination/` directory) or
     # in the same database, and the workspace binding is recorded exactly once, here

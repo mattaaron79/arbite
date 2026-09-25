@@ -55,8 +55,9 @@ from .base import Expect, Problem, TicketSink, enforce_expect
 #: 3: the `references` list field (root-relative plan paths under the arbite
 #: dir, see schema.FIELD_ORDER) joined the schema and needs its own normalized
 #: table, `ticket_references`. The `tickets` columns are unchanged, so no
-#: migration is written either: a v1/v2 store still opens and works, and `doctor`
-#: reports the version mismatch rather than pretending it is current.
+#: migration is written either: a v1/v2 store still opens and works -- `_connect`
+#: adds the table such a store is missing, because every read names it -- and
+#: `doctor` reports the version mismatch rather than pretending it is current.
 SCHEMA_VERSION = 3
 
 # Scalar columns, in the schema's own field order minus the list fields.
@@ -132,6 +133,13 @@ CREATE INDEX IF NOT EXISTS ticket_deps_dep_idx  ON ticket_deps(dep_id);
 CREATE INDEX IF NOT EXISTS ticket_references_ref_idx ON ticket_references(ref_path);
 """
 
+#: The tables a ticket read names besides `tickets` itself (`_row_to_ticket`), and so
+#: the ones a store has to have to be usable at all. `tickets` alone marks a database
+#: as an arbite store (`_is_initialised`); a store written by an older arbite can be
+#: missing one of these -- `ticket_references` only arrived with the `references` field
+#: in schema v3 -- which is what `_connect` repairs from the DDL above.
+NORMALIZED_TABLES = ("ticket_tags", "ticket_deps", "ticket_references", "ticket_notes")
+
 # Canonical ordering, expressed in SQL. These must place unset priorities last and
 # break ties on id exactly as `query.sort_key()` does -- the conformance suite
 # compares the two, because a database that sorted differently would be a bug
@@ -192,11 +200,20 @@ class SqliteSink(TicketSink):
         except sqlite3.Error as e:
             raise SinkError(f"could not initialise the SQLite sink at {self._path}: {e}")
 
-    def _is_initialised(self, conn) -> bool:
+    @staticmethod
+    def _has_table(conn, name: str) -> bool:
         row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tickets'"
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
         ).fetchone()
         return row is not None
+
+    def _is_initialised(self, conn) -> bool:
+        """Whether this database is an arbite store at all.
+
+        `tickets` is the marker, so a store written by an older arbite -- whose schema
+        is older but still arbite's -- is recognised rather than refused; which of its
+        tables are missing is `_connect`'s business."""
+        return self._has_table(conn, "tickets")
 
     @contextmanager
     def _connect(self, write: bool = False):
@@ -205,7 +222,11 @@ class SqliteSink(TicketSink):
         A connection per operation rather than a long-lived one, because arbite is
         a short-lived CLI process and sqlite is fast to open; `BEGIN IMMEDIATE`
         for writes takes the write lock up front so a compare-and-swap cannot
-        succeed on a snapshot that another writer was already changing."""
+        succeed on a snapshot that another writer was already changing.
+
+        Opening an older store also brings its schema up to what this build reads (see
+        the missing-table check below), because a store that cannot be read is not a
+        store a migration or a `doctor` run can say anything useful about."""
         if not self._path.exists():
             raise SinkNotInitialised(
                 f"no SQLite sink at {self._path} (run 'arbite init' to create it)"
@@ -225,6 +246,18 @@ class SqliteSink(TicketSink):
                 raise SinkNotInitialised(
                     f"{self._path} is not an arbite database (run 'arbite init')"
                 )
+            # A store written by an older arbite can lack a table this build reads --
+            # every read names `ticket_references`, and it only arrived with the
+            # `references` field in schema v3 -- so the store would fail on the first
+            # ticket it tried to read, with "no such table". This is the one repair that
+            # makes "an older store still opens and works" true rather than merely
+            # intended. The DDL is all `IF NOT EXISTS`, so it adds what is missing (the
+            # table, its index) and rewrites nothing; it runs *before* the write
+            # transaction, because `executescript` commits. The `schema_version` row is
+            # deliberately not touched: such a store really is old, and `doctor` should
+            # go on reporting it as a version mismatch rather than a current store.
+            if any(not self._has_table(conn, name) for name in NORMALIZED_TABLES):
+                conn.executescript(DDL)
             if write:
                 conn.execute("BEGIN IMMEDIATE")
             yield conn

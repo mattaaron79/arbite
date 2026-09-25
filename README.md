@@ -236,9 +236,14 @@ arbite list next --tier high     # ...so no flag is needed from here on
 arbite --sink file list          # a one-off against the other store still works
 ```
 
+That write is not skipped for the file default either — `init` never leaves behind a
+project with no `project.yaml` at all — so a plain project records `sink: file`
+rather than leaving the selection implicit.
+
 `arbite migrate` does the same for its destination, since that is where the tickets
 now live. An `ARBITE_SINK` selection is treated as this-process-only: it is reported
-rather than written to committed config.
+rather than written to committed config, and it is the one case `init` writes no
+config file at all.
 
 If the database file is used, add it to `.gitignore`: unlike the file sink, it is
 binary and won't produce a readable history.
@@ -289,7 +294,10 @@ reason, closed-date mismatches) and then the ones that don't:
   in the arbite root, temp files stranded by an interrupted write, a closed ticket
   archived in the wrong month, unreadable files;
 - **sqlite sink** — a note index that has drifted from the ticket body, orphaned
-  index rows, an unexpected schema version, structural database corruption;
+  index rows, an unexpected schema version (a store written by an older arbite also
+  has the table it is missing added when it is opened, so it stays readable — the
+  version report stands, because that store really is old), structural database
+  corruption;
 - **coordination store** — a claim whose attempt has ended or never existed, and an
   unfinished file operation judged against the bytes on disk: one whose bytes are
   exactly one of the two versions it recorded is repairable, while bytes matching

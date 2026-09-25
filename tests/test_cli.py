@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -78,6 +79,20 @@ def run_cli(cwd: Path, *args):
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
     return proc
+
+
+def execute_sql(path: Path, sql: str) -> None:
+    """Run one statement against a store directly, to build a state no command makes.
+
+    The case this exists for is a database written by an older arbite -- a missing
+    `ticket_references` table, an older `schema_version` -- which the current CLI can
+    no longer produce and so cannot be tested through."""
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute(sql)
+        connection.commit()
+    finally:
+        connection.close()
 
 
 @pytest.fixture
@@ -196,11 +211,14 @@ def test_init_makes_the_store_it_creates_the_default(cli, tmp_project):
     assert not (tmp_project / ".arbite" / "open").exists(), "nothing landed in files"
 
 
-def test_the_default_sink_writes_no_config(cli, tmp_project):
-    """A fresh file-based project stays config-free: nothing to explain, nothing to
-    keep in sync with the directory that is already there."""
-    cli("init")
-    assert not (tmp_project / ".arbite" / "project.yaml").exists()
+def test_init_records_the_default_sink_too(cli, tmp_project):
+    """Every project `init` sets up gets a committed selection, the file default
+    included: a store that nothing selects -- even one the default happens to resolve
+    to -- looks exactly like an empty backlog to a later command, so `init` leaves the
+    one answer that cannot be misread."""
+    output = cli("init").stdout
+    assert "set 'sink: file'" in output
+    assert (tmp_project / ".arbite" / "project.yaml").read_text().strip() == "sink: file"
 
 
 def test_setting_a_sink_preserves_the_rest_of_the_config(cli, tmp_project):
@@ -224,10 +242,15 @@ def test_setting_a_sink_preserves_the_rest_of_the_config(cli, tmp_project):
 
 
 def test_an_environment_choice_is_not_written_to_the_config(cli, tmp_project):
-    """ARBITE_SINK is one process's decision; committed config is the project's."""
+    """ARBITE_SINK is one process's decision; committed config is the project's.
+
+    It is also the one case `init` leaves no config behind, deliberately: a `sink:`
+    line naming a store this process happened to use would answer "what does this
+    project read?" with a store the project never chose, and would silence the warning
+    that catches an unselected database."""
     output = cli("init", sink="sqlite").stdout
-    assert not (tmp_project / ".arbite" / "project.yaml").exists()
     assert "--sink sqlite" in output
+    assert not (tmp_project / ".arbite" / "project.yaml").exists()
 
 
 def test_the_guide_names_the_store_a_plain_command_will_read(cli, tmp_project):
@@ -561,7 +584,7 @@ def test_the_old_root_level_config_is_ignored(cli, tmp_project):
     # The default (file) sink was used, so those files changed nothing...
     assert (tmp_project / ".arbite" / "open").is_dir()
     assert not (tmp_project / ".arbite" / "arbite.db").exists()
-    assert not (tmp_project / ".arbite" / "project.yaml").exists()
+    assert (tmp_project / ".arbite" / "project.yaml").read_text().strip() == "sink: file"
     # ...and they were left exactly where they were, untouched and unmigrated.
     assert (tmp_project / "arbite.yaml").read_text() == "sink: sqlite\n"
     assert (tmp_project / ".arbite.yaml").read_text() == "sink: sqlite\n"
@@ -1337,13 +1360,37 @@ def test_migrate_from_an_empty_store_exits_two(project, cli):
     cli("migrate", "--to", "sqlite", expect=2)
 
 
+def test_migrate_reads_a_store_written_before_the_references_table_existed(project, cli):
+    """A database from an older arbite has no `ticket_references` table (the field and
+    its table both arrived in schema v3) while every read names it, so a migration out
+    of such a store was the first command to fail on it: "no such table:
+    ticket_references". Opening the store adds the table, the tickets come across, and
+    the source is left standing -- old version stamp included."""
+    tid = create(cli, "written by an older arbite")
+    cli("migrate", "--to", "sqlite")
+    database = project / ".arbite" / "arbite.db"
+    execute_sql(database, "DROP TABLE ticket_references")  # the shape of an older store
+    execute_sql(database, "UPDATE schema_version SET version = 2")
+
+    out = cli("migrate", "--from", "sqlite", "--to", "file", "--overwrite").stdout
+    assert "migrated 1 ticket(s) from sqlite to file" in out
+    assert json.loads(cli("show", tid, "--json").stdout)["title"] == (
+        "written by an older arbite"
+    )
+    # A migration copies and the repair is not a migration: the source keeps its ticket
+    # and its version, so `doctor` still reports it as the old store it is.
+    assert json.loads(cli("show", tid, "--json", sink="sqlite").stdout)["id"] == tid
+    problems = json.loads(cli("doctor", "--json", sink="sqlite", expect=3).stdout)["problems"]
+    assert [p["kind"] for p in problems] == ["schema_version"]
+
+
 def test_migrate_prune_retires_the_source_after_a_verified_copy(project, cli):
     """The destructive half of a migration: for retiring a store once its contents
     are known to be in the other one."""
     open_ticket = create(cli, "moving to the database")
     wish = create(cli, "a filed wish")
     cli("move", wish, "/wishlist")
-    assert not (project / ".arbite" / "project.yaml").exists()
+    assert (project / ".arbite" / "project.yaml").read_text().strip() == "sink: file"
 
     dry = cli("migrate", "--to", "sqlite", "--prune", "--dry-run").stdout
     assert "would migrate 2 ticket(s)" in dry
@@ -1367,7 +1414,7 @@ def test_migrate_prune_retires_the_source_after_a_verified_copy(project, cli):
 
 def test_migrate_makes_the_destination_the_default(project, cli):
     tid = create(cli, "moving")
-    assert not (project / ".arbite" / "project.yaml").exists()
+    assert (project / ".arbite" / "project.yaml").read_text().strip() == "sink: file"
 
     out = cli("migrate", "--to", "sqlite").stdout
     assert "set 'sink: sqlite'" in out
