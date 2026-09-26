@@ -27,12 +27,14 @@ is a short alias for `adventure-call`.
 | `refs NAME [--kind attr\|name\|string]` | Current syntactic name matches, grouped by file and enclosing symbol; attributes are not type-checked |
 | `calls ID [--direction down\|up\|both] [--depth N]` | Call-flow cone: `nodes` = `ID: "<hop> path:line"`, +N callees, -N callers; `edges` |
 | `impact ID [--all]` | Blast radius: direct callers (call sites), transitive count (`--all` lists), readers/writers or importers; `files`, `test_files` |
+| `tests [FILE...] [--since REV]` | Which tests to run: uncommitted (and untracked) changed files by default; a changed test file counts as itself. `--plain` prints one path per line |
 | `state ID` | Module/class state read or written, directly and `through_calls` (`name:r\|w\|rw`) |
 | `imports [PATH] [--depth N] [--direction in\|out\|both] [--cycles]` | File import graph, or local view with hop counts |
 | `tree [DIR] [--depth N] [--metric symbols\|lines\|files]` | Directory sizes; dirs end in `/`, `_total` per dir |
 | `entries [--include-tests]` | Entry points ranked by transitive reach, with the evidence for each |
 | `orphans` | Callables with no callers, callees or framework role (possibly unused) |
 | `update` | Re-analyse by hand (after changing options, e.g. `update --exclude-dir gen`) |
+| `serve` | Human-only: opens the workspace web UI in a browser, from this store, on loopback. Agents stay on the JSON queries |
 
 ## IDs
 
@@ -63,6 +65,8 @@ function's `unresolved` calls. Confirm with the source before deleting or renami
 
 - Understand a function: `symbol ID --code`.
 - Before changing a signature: `impact ID` -> edit every `direct_callers` site -> run `test_files`.
+- Before running tests: `tests` (bare = what you have not committed) -> `tests --plain | xargs -r pytest -q`.
+  An empty list means no test imports the change, not that the change is safe.
 - Trace a feature: `find TEXT` -> `calls ID --depth 3` -> `source` the relevant nodes.
 - Find consumers of a field: `refs FIELD --kind attr` (then confirm name-based hits in source).
 - Orient in an unfamiliar area: `tree DIR --depth 1`, `file PATH`, `imports PATH`.
