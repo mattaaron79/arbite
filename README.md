@@ -46,8 +46,16 @@ in almost all cases cause agents to use the ticket system automatically
 Topological sort based on ticket dependency order:
 arbite list --topo --status open
 
-Tree view (more for humans):
+Tree view (more for humans). Every ticket is expanded once, so a ticket that two
+others both need is printed under the first of them and referred to as "(already
+shown above)" under the second; a closed dependency is ticked, because it no longer
+holds anything back. `--dependents` walks the other way -- what a ticket is holding
+up rather than what it waits for -- and `--full` asks for the older per-path walk
+that repeats a shared dependency instead. `--json` publishes the same marks as
+`edge` and `repeat` keys:
 arbite list --tree
+arbite deps tic-a1b2
+arbite deps tic-a1b2 --dependents
 
 View epic status:
 arbite list --topo --epic <epic_name>
@@ -396,7 +404,7 @@ The package exposes the console script `arbite`, providing:
 | Setup | `init`, `sink [info\|init]` |
 | Creation | `create` (incl. `--blank` scaffolding), `raw <memo\|feature\|request\|bug\|wish>` plus the one-word shortcuts `bug` / `feature` / `request` / `wish` / `memo` |
 | Triage | `fetch [type]` (oldest raw ticket + injected `derived_note`), `promote <id>` (classify in place + freeze a `raw/processed/` snapshot, optionally `--agent` to claim it), `list raw` |
-| Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps` |
+| Reading | `list` (flat, `next`, `raw`, `--topo`, `--tree` with `--dependents`/`--full`, `--epic`, `--tic`, `--count`), `search`, `show`, `deps <id>` (same dependency flags) |
 | Lifecycle | `claim`, `release`, `submit`, `accept`, `block`, `unblock`, `shelve`, `unshelve`, `close`, `reopen <id> --reason <text>` |
 | Attempts | `attempt` — `adopt <id> --agent <id>` records the attempt for a ticket that was already `in_progress`; every other attempt is created by the command that acquires the work |
 | Authoring | `note`, `set`, `set-status`, `depend`, `move`, `ref` (`add` / `rm` / `list`) |
@@ -692,9 +700,12 @@ Key behaviours worth calling out:
   problems remain — see [Integrity checking per sink](#integrity-checking-per-sink).
 
 [`INITIAL_DESIGN_DOC.md`](INITIAL_DESIGN_DOC.md:434) records a handful of
-deliberately open judgement calls — validation strictness for `domain`/`tags`, the
-`deps` visualization format, and whether `blocked_by` should support multiple
-blockers.
+deliberately open judgement calls — validation strictness for `domain`/`tags`, and
+whether `blocked_by` should support multiple blockers. The `deps` visualization is no
+longer one of them: both dependency views expand each ticket once and refer back to a
+ticket already shown, instead of unrolling the graph into one line per path, which
+made a release gate that every ticket feeds into thousands of lines long. `--full`
+keeps that older per-path walk for anyone who wants it.
 
 ---
 

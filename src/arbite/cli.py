@@ -1705,6 +1705,8 @@ def _report_nothing_workable(args, by_id, open_matching):
 def cmd_list(args):
     if args.count is not None and args.count < 1:
         raise TicketError(f"--count must be a positive integer, got {args.count}")
+    if (args.dependents or args.full) and not args.tree:
+        raise TicketError("--dependents and --full only apply to --tree")
     sink = _require_sink(args)
 
     # `every` includes tickets filed in buckets, because readiness and the
@@ -1737,18 +1739,29 @@ def cmd_list(args):
             _print_topo(by_id, scope_ids, sink, args.json, args.count)
             return
         scope = {tid: by_id[tid] for tid in scope_ids}
-        roots = [tid for tid in tic_ids if tid in by_id] if tic_ids else graph.tree_roots(scope, [])
+        roots = (
+            [tid for tid in tic_ids if tid in by_id]
+            if tic_ids
+            else graph.tree_roots(scope, [], dependents=args.dependents)
+        )
         # A tree has no single flat length to cap, so --count limits the number
-        # of top-level roots shown; each one still prints its full subtree,
+        # of top-level roots shown; each one still walks its whole subtree,
         # since a truncated dependency chain would be actively misleading.
         roots = apply_limit(
             sorted(roots, key=lambda tid: (scope[tid].priority_sort_key(), tid)), args.count
         )
         _warn_cycles(by_id, scope_ids)
+        rows = graph.dependency_rows(
+            by_id,
+            roots,
+            scope_ids=scope_ids,
+            dependents=args.dependents,
+            expand_once=not args.full,
+        )
         if args.json:
-            _print_json(_tree_payload(scope, roots))
+            _print_json(_tree_payload(rows, by_id))
         else:
-            _print_tree(scope, roots)
+            _print_tree(by_id, rows)
         return
 
     # Flat list: field filters plus the --tic id filter.
@@ -1758,51 +1771,94 @@ def cmd_list(args):
     _emit_tickets(apply_limit(rows, args.count), args.json, sink)
 
 
-def _tree_payload(scope, roots):
-    """The dependency forest as nested JSON-serialisable dicts, mirroring what
-    _print_tree renders. A ticket already on the current path is emitted with
-    "cycle": true and not descended into."""
-    def child_key(d):
-        return (scope[d].priority_sort_key(), d)
+# The tree's glyphs, chosen per output stream: box-drawing where the stream can
+# encode it (any UTF-8 terminal), ASCII otherwise, so a stream redirected to a
+# legacy codepage still renders a readable tree rather than raising
+# UnicodeEncodeError. Field order is (branch, last branch, pipe, gap, satisfied).
+TREE_BOX = ("├── ", "└── ", "│   ", "    ", "✓")
+TREE_ASCII = ("|-- ", "`-- ", "|   ", "    ", "v")
 
-    def node(tid, seen):
-        t = scope[tid]
-        data = t.to_dict()
+TREE_MARKS = {
+    graph.MARK_REPEAT: "already shown above",
+    graph.MARK_CYCLE: "cycle",
+    graph.MARK_MISSING: "missing",
+}
+
+
+def _tree_glyphs(stream):
+    """The connector set this output stream can print."""
+    try:
+        TREE_BOX[4].encode(getattr(stream, "encoding", None) or "ascii")
+    except (LookupError, UnicodeEncodeError):
+        return TREE_ASCII
+    return TREE_BOX
+
+
+def _tree_payload(rows, by_id):
+    """Fold flat display rows into the nested document `--json` publishes.
+
+    Every row becomes a node -- the ticket's own fields, plus `edge`, plus its mark
+    as a key when it has one -- attached to the nearest shallower row's `depends`, so
+    the document keeps the shape it has always had. A marked row spells out why it is
+    a leaf instead of repeating a subtree: `repeat` means the node was already
+    expanded above, `cycle` that the edge closes a loop, and a dangling id becomes
+    `{"id": ..., "missing": true}` with no ticket behind it."""
+    def node_of(row):
+        ticket = by_id.get(row.id)
+        if ticket is None:
+            return {"id": row.id, "missing": True, "edge": row.edge, "depends": []}
+        data = ticket.to_dict()
         data["path"] = None
-        if tid in seen:
-            data["cycle"] = True
-            data["depends"] = []
-            return data
-        seen = seen | {tid}
-        children = sorted((d for d in t.depends_on if d in scope), key=child_key)
-        data["depends"] = [node(d, seen) for d in children]
+        data["edge"] = row.edge
+        data["depends"] = []
+        if row.mark is not None:
+            data[row.mark] = True
         return data
 
-    return [
-        node(tid, set())
-        for tid in sorted(roots, key=lambda tid: (scope[tid].priority_sort_key(), tid))
-    ]
+    roots = []
+    stack = []
+    for row in rows:
+        node = node_of(row)
+        while stack and stack[-1][0] >= row.depth:
+            stack.pop()
+        if stack:
+            stack[-1][1]["depends"].append(node)
+        else:
+            roots.append(node)
+        if row.mark is None:
+            stack.append((row.depth, node))
+    return roots
 
 
-def _print_tree(scope, roots):
-    """Print scope as a dependency forest: children = depends_on, siblings sorted by priority."""
-    def child_key(d):
-        return (scope[d].priority_sort_key(), d)
+def _print_tree(by_id, rows, stream=None):
+    """Print display rows as an indented forest.
 
-    def walk(tid, indent, seen):
-        t = scope[tid]
-        prio = "-" if t.priority is None else str(t.priority)
-        print(f"{indent}{t.id} [{t.status}] p{prio} {t.title}")
-        if tid in seen:
-            print(f"{indent}  ... (cycle)")
-            return
-        seen = seen | {tid}
-        children = sorted((d for d in t.depends_on if d in scope), key=child_key)
-        for d in children:
-            walk(d, indent + "  ", seen)
-
-    for tid in sorted(roots, key=lambda tid: (scope[tid].priority_sort_key(), tid)):
-        walk(tid, "", set())
+    Connectors come from the ancestors that are not last children, a satisfied edge
+    is ticked (its dependency is closed, so it no longer holds anything back), and a
+    row's mark is spelled out at the end when it has one -- which is how a shared
+    prerequisite says 'already shown above' instead of repeating its subtree."""
+    stream = sys.stdout if stream is None else stream
+    branch, last_child, pipe, gap, tick = _tree_glyphs(stream)
+    ancestor_lasts = []
+    for row in rows:
+        # ancestor_lasts[i] answers "is this a last child" for depth i+1, so a row at
+        # depth d keeps the d-1 ancestors above it and nothing from a finished sibling.
+        del ancestor_lasts[max(row.depth - 1, 0):]
+        prefix = "".join(gap if last else pipe for last in ancestor_lasts)
+        if row.depth:
+            prefix += last_child if row.last else branch
+        ticket = by_id.get(row.id)
+        if ticket is None:
+            text = f"{row.id} (missing)"
+        else:
+            satisfied = f"{tick} " if row.edge == graph.EDGE_SATISFIED else ""
+            priority = "-" if ticket.priority is None else str(ticket.priority)
+            text = f"{satisfied}{ticket.id} [{ticket.status}] p{priority} {ticket.title}"
+        if row.mark is not None:
+            text = f"{text} ({TREE_MARKS[row.mark]})"
+        print(f"{prefix}{text}", file=stream)
+        if row.depth:
+            ancestor_lasts.append(row.last)
 
 
 def cmd_claim(args):
@@ -2295,44 +2351,28 @@ def cmd_show(args):
 
 
 def cmd_deps(args):
+    """Print a ticket's dependency tree.
+
+    The walk is `graph.dependency_rows`, the same one `list --tree` renders, so the
+    two views agree on order and shape: children are the ticket's `depends_on` (or,
+    with `--dependents`, the tickets that depend on it), most urgent first, and each
+    ticket is expanded once -- reaching a shared prerequisite again prints a
+    back-reference instead of the subtree a second time, which is what stops a
+    release gate that every ticket feeds into printing them over and over. A
+    satisfied edge is ticked because a closed dependency no longer holds anything
+    back, a dangling id is marked missing, and `--full` restores the older per-path
+    walk that expands every path."""
     sink = _require_sink(args)
     start = sink.get(args.id)
     by_id = {t.id: t for t in sink.query(TicketQuery(buckets=("*",)))}
-
+    rows = graph.dependency_rows(
+        by_id, [start.id], dependents=args.dependents, expand_once=not args.full
+    )
     if args.json:
-        def node(tid, seen):
-            t = by_id.get(tid)
-            if t is None:
-                # A dangling depends_on id: reported rather than dropped, so a
-                # caller can tell "no dependencies" from "dependency deleted".
-                return {"id": tid, "missing": True, "depends": []}
-            data = t.to_dict()
-            data["path"] = None
-            if tid in seen:
-                data["cycle"] = True
-                data["depends"] = []
-                return data
-            seen = seen | {tid}
-            data["depends"] = [node(d, seen) for d in t.depends_on]
-            return data
-
-        _print_json(node(start.id, set()))
+        _print_json(_tree_payload(rows, by_id)[0])
         return
-
-    def walk(tid, indent, seen):
-        t = by_id.get(tid)
-        if t is None:
-            print(f"{indent}{tid} (missing)")
-            return
-        print(f"{indent}{t.id} [{t.status}] {t.title}")
-        if tid in seen:
-            print(f"{indent}  ... (cycle)")
-            return
-        seen = seen | {tid}
-        for dep in t.depends_on:
-            walk(dep, indent + "  ", seen)
-
-    walk(start.id, "", set())
+    _warn_cycles(by_id, graph.dependency_closure(by_id, [start.id]))
+    _print_tree(by_id, rows)
 
 
 def cmd_depend(args):
@@ -4017,13 +4057,27 @@ def build_parser():
         "--tree",
         action="store_true",
         help="render the list as a dependency tree (children = depends_on) instead of a "
-        "flat table; siblings sorted by priority",
+        "flat table, most urgent sibling first; each ticket is expanded once and a "
+        "shared dependency is referred back to rather than repeated with its subtree",
     )
     view.add_argument(
         "--topo",
         action="store_true",
         help="render the list as a vertical list in topological dependency order; when "
         "several tickets are ready at once, the most urgent (lowest priority number) comes first",
+    )
+    p_list.add_argument(
+        "--dependents",
+        action="store_true",
+        help="with --tree: walk the other way, so a ticket's children are the tickets "
+        "that depend on it rather than the ones it depends on",
+    )
+    p_list.add_argument(
+        "--full",
+        action="store_true",
+        help="with --tree: expand every path instead of printing a ticket once and "
+        "referring back to it; the older unrolled output, which repeats a shared "
+        "dependency beneath each of its dependents",
     )
     p_list.add_argument(
         "subcommand",
@@ -4352,9 +4406,27 @@ def build_parser():
     p_deps = sub.add_parser(
         "deps",
         help="walk depends_on to show a dependency tree",
-        description="Recursively walk a ticket's depends_on field and print the dependency tree.",
+        description="Walk a ticket's depends_on field and print the dependency tree with "
+        "each ticket expanded once: a dependency reached a second time is shown as a "
+        "reference rather than repeated with its whole subtree, so a ticket that "
+        "everything feeds into still prints as a handful of lines. A satisfied edge is "
+        "ticked (the dependency is closed, so it holds nothing back), a dangling id is "
+        "marked missing, and a cycle is marked rather than followed.",
     )
     p_deps.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP_READONLY)
+    p_deps.add_argument(
+        "--dependents",
+        action="store_true",
+        help="walk the other way: show the tickets that depend on this one instead of "
+        "the ones it depends on",
+    )
+    p_deps.add_argument(
+        "--full",
+        action="store_true",
+        help="expand every path instead of printing a ticket once and referring back to "
+        "it; the older unrolled output, which repeats a shared dependency beneath each "
+        "of its dependents",
+    )
     _json_flag(p_deps)
     _sink_flag(p_deps)
     p_deps.set_defaults(func=cmd_deps)

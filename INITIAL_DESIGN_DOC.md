@@ -468,12 +468,17 @@ thing worth re-litigating deliberately rather than by accident:
 - **The integrity checks are shared where they mean the same thing** and per-sink
   where they don't, so `doctor` cannot quietly mean two different things.
 - **Agent scratchpads stay files on both sinks**: harness-facing state, not tickets.
+- **The dependency views render a DAG as a tree with back-references**: `deps` and
+  `list --tree` are one walk, and it expands every ticket once and prints a reference
+  where a shared prerequisite is reached again. The alternative -- one line per path
+  through the graph -- makes a release gate that everything feeds into thousands of
+  lines long. `--dependents` walks the same forest from its other end, and `--full`
+  keeps the per-path walk for anyone who wants it.
 
 ## Not yet decided / open for judgment calls
 
 - Exact validation strictness for `domain` and `tags` (fixed enum vs free
   string) — free-string is fine as a starting default.
-- `arbite deps` dependency-tree visualization format.
 - Whether `blocked_by` should support a list (multiple blockers) or stay
   single-value — single value with a string is fine as a starting default,
   revisit if it comes up in practice.

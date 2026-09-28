@@ -1207,6 +1207,111 @@ def test_views(project, cli):
     assert dependent in json.loads(cli("list", "--tic", dependent, "--json").stdout)[0]["id"]
 
 
+def test_the_dependency_views_render_a_mesh_with_back_references(project, cli):
+    """`deps` and `list --tree` are one walk, and that walk expands each ticket once:
+    a ticket reached by a second path is printed as a reference rather than as another
+    copy of its whole subtree. The lattice below is what a release gate everything feeds
+    into looks like, and it is the shape the old path-scoped walk multiplied -- it made
+    the output as long as the number of paths through the graph."""
+    leaf = create(cli, "leaf", priority=6)
+    left_leaf = create(cli, "left-leaf", priority=4)
+    right_leaf = create(cli, "right-leaf", priority=5)
+    left = create(cli, "left", priority=2)
+    right = create(cli, "right", priority=3)
+    top = create(cli, "top", priority=1)
+    for parent, child in (
+        (left_leaf, leaf),
+        (right_leaf, leaf),
+        (left, left_leaf),
+        (left, right_leaf),
+        (right, left_leaf),
+        (right, right_leaf),
+        (top, left),
+        (top, right),
+    ):
+        cli("depend", parent, child)
+
+    expected = [
+        f"{top} [open] p1 top",
+        f"├── {left} [open] p2 left",
+        f"│   ├── {left_leaf} [open] p4 left-leaf",
+        f"│   │   └── {leaf} [open] p6 leaf",
+        f"│   └── {right_leaf} [open] p5 right-leaf",
+        f"│       └── {leaf} [open] p6 leaf (already shown above)",
+        f"└── {right} [open] p3 right",
+        f"    ├── {left_leaf} [open] p4 left-leaf (already shown above)",
+        f"    └── {right_leaf} [open] p5 right-leaf (already shown above)",
+    ]
+    assert cli("deps", top).stdout.splitlines() == expected
+    # The list view is the same walk over the same tickets...
+    assert cli("list", "--tree").stdout.splitlines() == expected
+    # ...and the older per-path walk is still reachable: one line per path, which is
+    # two more lines here and four copies of the shared leaf.
+    full = cli("deps", top, "--full").stdout
+    assert len(full.splitlines()) == 11
+    assert full.count(leaf) == 4
+    assert "already shown above" not in full
+
+
+def test_the_dependency_view_can_walk_dependents(project, cli):
+    """`--dependents` walks the same forest from its other end -- what is waiting on a
+    ticket rather than what it waits for -- which is the question a prerequisite asks."""
+    shared = create(cli, "shared", priority=3)
+    left = create(cli, "left", priority=1, depends_on=shared)
+    right = create(cli, "right", priority=2, depends_on=shared)
+    top = create(cli, "top", priority=1, depends_on=left)
+
+    assert cli("deps", shared, "--dependents").stdout.splitlines() == [
+        f"{shared} [open] p3 shared",
+        f"├── {left} [open] p1 left",
+        f"│   └── {top} [open] p1 top",
+        f"└── {right} [open] p2 right",
+    ]
+    # Asking for the dependents of a ticket nothing is waiting on is just its own row.
+    assert cli("deps", top, "--dependents").stdout.splitlines() == [f"{top} [open] p1 top"]
+
+
+def test_the_dependency_json_carries_the_marks_the_tree_draws(project, cli):
+    """`--json` publishes the same forest the tree renders, so a caller can tell an
+    expanded node from a reference: `edge` says how a ticket stands to the one above it,
+    and `repeat` says this row is where the walk stopped rather than a subtree."""
+    leaf = create(cli, "leaf", priority=1)
+    left = create(cli, "left", priority=2, depends_on=leaf)
+    right = create(cli, "right", priority=3, depends_on=leaf)
+    top = create(cli, "top", priority=4, depends_on=f"{left},{right}")
+
+    payload = json.loads(cli("deps", top, "--json").stdout)
+    assert payload["id"] == top
+    assert payload["edge"] == "root"
+    assert [node["id"] for node in payload["depends"]] == [left, right]
+    assert [node["edge"] for node in payload["depends"]] == ["unmet", "unmet"]
+    expanded = payload["depends"][0]["depends"][0]
+    assert expanded["id"] == leaf and expanded["depends"] == []
+    reference = payload["depends"][1]["depends"][0]
+    assert reference["id"] == leaf
+    assert reference["repeat"] is True
+    assert reference["depends"] == []
+
+
+def test_a_satisfied_dependency_is_ticked_because_it_holds_nothing_back(project, cli):
+    """What the tree adds to the status bracket: a closed dependency no longer holds its
+    dependent back, so its edge is ticked. The rows a reader has to act on are the
+    unticked ones."""
+    done = create(cli, "done", priority=1)
+    waiting = create(cli, "waiting", priority=2, depends_on=done)
+    assert cli("deps", waiting).stdout.splitlines()[1] == f"└── {done} [open] p1 done"
+    cli("close", done)
+    assert cli("deps", waiting).stdout.splitlines()[1] == f"└── ✓ {done} [closed] p1 done"
+
+
+def test_the_tree_only_flags_refuse_to_be_silently_ignored(project, cli):
+    """`--dependents` and `--full` modify `--tree`; a plain list must not quietly ignore
+    what the caller asked for."""
+    proc = cli("list", "--dependents", expect=1)
+    assert "--dependents and --full only apply to --tree" in proc.stderr
+    cli("list", "--full", expect=1)
+
+
 def test_set_validates_and_reports_what_it_changed(project, cli):
     tid = create(cli, "before")
     cli("set", tid, "title", "after", "tags", "a, b", "priority", "4")
