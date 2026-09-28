@@ -2450,3 +2450,72 @@ def test_the_review_loop_rejects_with_reopen_and_then_accepts(cli, project):
     assert final["status"] == "closed"
     # The auto-note with no --message is exactly 'Accepted.'
     assert "claude.opus.001: Accepted." in cli("show", tid).stdout
+
+
+def _initialise_elsewhere(directory: Path, *init_args) -> str:
+    """Init a fresh project in `directory` and return one ticket id from it.
+
+    The `--root` tests need a *second* project to point at: the `cli` fixture always
+    runs in `tmp_project`, and `--root` is exactly the way to reach a project other
+    than the working directory."""
+    run_cli(directory, "init", *init_args)
+    return ticket_id(
+        run_cli(
+            directory,
+            "create",
+            "--title",
+            "Elsewhere ticket",
+            "--type",
+            "bug",
+            "--tier",
+            "medium",
+            "--domain",
+            "mesh",
+        ).stdout
+    )
+
+
+def test_root_runs_against_another_project_from_anywhere(cli, tmp_project, tmp_path):
+    """--root points a command at another project's .arbite/ without changing the
+    working directory -- the feature the flag exists for. A read and the file proxy
+    both resolve the named project rather than the cwd."""
+    other = tmp_path / "other"
+    other.mkdir()
+    tid = _initialise_elsewhere(other)
+
+    # The cwd (tmp_project) is a different, uninitialised directory, so without
+    # --root every one of these would fail with "run arbite init first".
+    assert tid in cli("--root", str(other), "show", tid).stdout
+    assert tid in cli("show", tid, "--root", str(other)).stdout
+
+    # The file proxy resolves the same root, so its listing shows the other
+    # project's ticket file rather than the cwd's empty store.
+    listed = cli("file", "list", ".", "--root", str(other)).stdout
+    assert f"{tid}.md" in listed
+
+
+def test_root_composes_with_sink_selection(cli, tmp_path):
+    """`--root` chooses the project; `--sink` still chooses the store within it. The
+    two are independent, so pointing at another project does not disturb selection."""
+    other = tmp_path / "other"
+    other.mkdir()
+    tid = _initialise_elsewhere(other, "--sink", "sqlite")
+    assert tid in cli("--root", str(other), "--sink", "sqlite", "show", tid).stdout
+
+
+def test_root_must_name_a_directory(cli, tmp_path):
+    """A --root that is not there is refused by name and exit 1, rather than quietly
+    resolving to an empty project."""
+    missing = tmp_path / "nope"
+    proc = cli("list", "--root", str(missing), expect=1)
+    assert f"--root '{missing}' is not a directory" in proc.stderr
+
+
+def test_root_init_creates_the_project_in_the_named_directory(cli, tmp_project, tmp_path):
+    """`arbite init --root DIR` is the setup counterpart: it creates .arbite/ in DIR,
+    not in the cwd, so a project can be initialised wherever --root names."""
+    target = tmp_path / "fresh"
+    target.mkdir()
+    cli("init", "--root", str(target))
+    assert (target / ".arbite").is_dir()
+    assert not (tmp_project / ".arbite").exists()

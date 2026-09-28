@@ -246,9 +246,9 @@ _NO_VALUE_ACTIONS = (
     argparse._VersionAction,
 )
 
-# The global storage selector appears on every command; documenting it once, in
-# the sink section, beats repeating it under all twenty-odd commands.
-_GLOBAL_ACTIONS = ("help", "sink", "version")
+# The global selectors appear on every command; documenting them once, in the sink
+# section, beats repeating them under all twenty-odd commands.
+_GLOBAL_ACTIONS = ("help", "sink", "root", "version")
 
 #: The commands whose per-flag reference lives in WORKSPACE.md rather than in the
 #: always-read guide: the ones that act on files through the proxy, plus the
@@ -520,6 +520,11 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "your command will read. Selection, highest precedence first: `--sink <kind>`, "
         "`ARBITE_SINK`, a `sink:` key in `.arbite/project.yaml`, then the default (`file`); that "
         "key is the committed choice, and `arbite init`/`arbite migrate` write it for you"
+    )
+    add(
+        "- `--root DIR` runs the command against another project: the project is the nearest "
+        "`.arbite/` at or above DIR, exactly as if arbite were started there (default: the "
+        "current directory). It changes only *which* project is located, not the sink selection"
     )
     add(
         "- a top-level `review:` key (default `true`) is where a finished ticket goes: `review/` "
@@ -1117,9 +1122,10 @@ def render_workspace(parser, subparsers_by_name: dict, active_info=None, stale_i
     add("## Commands")
     add("")
     add(
-        "Every command accepts `--sink <kind>` (documented once, in `.arbite/AGENTS.md` with the "
-        "rest of the sink facts). Argparse's longer descriptions are omitted here too -- `arbite "
-        "<cmd> -h` prints them."
+        "Every command accepts `--sink <kind>` and `--root DIR` (both documented once, in "
+        "`.arbite/AGENTS.md` with the rest of the sink facts; `--root` targets another project "
+        "directory). Argparse's longer descriptions are omitted here too -- `arbite <cmd> -h` "
+        "prints them."
     )
     add("")
     for name in WORKSPACE_COMMANDS:

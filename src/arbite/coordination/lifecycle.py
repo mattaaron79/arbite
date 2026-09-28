@@ -627,7 +627,9 @@ class TicketLifecycle:
         if ticket.status == "closed":
             raise TicketError(f"ticket {ticket.id} is already closed")
         detail = f": {message}" if message else "."
-        if not config.review_enabled():
+        # Read through the app's located project root, not the process cwd, so a
+        # `--root` invocation submits according to the target project's own config.
+        if not config.review_enabled(self.app.project_root):
             # Exactly what `arbite close` writes -- same cascade, same dating, same
             # move -- with the note this command contributes.
             ended, unresolved = self._close_work(

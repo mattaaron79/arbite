@@ -117,6 +117,25 @@ def _sink_flag(parser, suppress=True):
     )
 
 
+def _root_flag(parser, suppress=True):
+    """The global --root selector.
+
+    Runs a command against another project directory: the project is the nearest
+    `.arbite/` at or above DIR, exactly as it would be if arbite's working
+    directory were DIR. Like --sink it is offered before the command and, on every
+    subparser, after it -- and its default is suppressed there so a value given
+    before the command is not overwritten by the subparser's own.
+    """
+    parser.add_argument(
+        "--root",
+        metavar="DIR",
+        default=argparse.SUPPRESS if suppress else None,
+        help="run as if arbite were started in DIR, so the project is the nearest "
+        ".arbite/ at or above it (default: the current directory); use it to reach "
+        "another project without changing directory",
+    )
+
+
 def _print_json(payload):
     print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
@@ -165,18 +184,40 @@ RAW_SHORTCUT_HELP = {
 }
 
 
+def _root_start(args):
+    """The directory `--root` names, or None when the flag was not given.
+
+    A `--root` that is not a directory is refused here, by name, rather than being
+    resolved into a confusing "no .arbite/ found" further down: the caller named
+    the wrong thing, and saying so is the point of accepting an explicit root."""
+    override = getattr(args, "root", None)
+    if not override:
+        return None
+    path = Path(override).expanduser()
+    if not path.is_dir():
+        raise TicketError(f"--root '{override}' is not a directory")
+    return path
+
+
+def _project_root(args):
+    """The project root this command acts on: `--root` when given, else the nearest
+    `.arbite/` at or above the current directory (see `config.find_project_root`)."""
+    return config.find_project_root(_root_start(args))
+
+
 def _cwd_sink(args):
     """The sink for a command that works on the current directory rather than on
     an existing project (`arbite init`), so it never inherits a location from a
-    parent directory's config."""
-    project_root = Path.cwd()
+    parent directory's config. `--root` names that directory directly (no upward
+    walk), which is how a project is initialised somewhere other than the cwd."""
+    project_root = (_root_start(args) or Path.cwd()).resolve()
     spec = config.sink_spec(getattr(args, "sink", None), project_root)
     return spec, project_root
 
 
 def _require_sink(args):
     """The configured sink, or a clear instruction to initialise one."""
-    sink = config.open_sink(getattr(args, "sink", None))
+    sink = config.open_sink(getattr(args, "sink", None), _project_root(args))
     _warn_about_an_unused_database(args, sink)
     return sink
 
@@ -196,7 +237,7 @@ def _warn_about_an_unused_database(args, sink) -> None:
         return
     if getattr(args, "sink", None) or os.environ.get(config.ENV_SINK):
         return
-    project_root = config.find_project_root()
+    project_root = _project_root(args)
     if config.load_config(project_root).get("sink"):
         return
     database = config.default_location("sqlite", project_root / config.ARBITE_DIRNAME)
@@ -237,7 +278,7 @@ def _coordination_app(args, sink, project_root=None):
     the facts the layer needs (the located project root, the arbite directory, the
     resolved sink and where that selection came from) and nothing about claims,
     attempts or staleness is decided in argparse."""
-    project_root = project_root or config.find_project_root()
+    project_root = project_root or _project_root(args)
     return coordination_app.CoordinationApp.open(
         sink,
         project_root,
@@ -387,6 +428,28 @@ def _nested_choices(parser) -> set:
         if isinstance(action, argparse._SubParsersAction):
             return set(action.choices)
     return set()
+
+
+def _subparsers_of(parser):
+    """The SubParsersAction of a command group, or None for a leaf command."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    return None
+
+
+def _add_root_flag_deeply(subparsers) -> None:
+    """Offer `--root` on every subparser, one level down at a time.
+
+    The flag is global, so a caller expects to write it wherever is convenient
+    ('arbite list --root DIR', 'arbite file list --root DIR'); adding it here, in one
+    pass over the built tree, keeps every command consistent instead of hand-listing
+    three dozen subparsers."""
+    for subparser in subparsers.choices.values():
+        _root_flag(subparser)
+        nested = _subparsers_of(subparser)
+        if nested is not None:
+            _add_root_flag_deeply(nested)
 
 
 def knows_command(path: str) -> bool:
@@ -658,7 +721,9 @@ def cmd_sink(args):
     where its store lives, and what it can do."""
     action = args.subcommand or "info"
     if action == "init":
-        sink = config.open_sink(getattr(args, "sink", None), require_initialised=False)
+        sink = config.open_sink(
+            getattr(args, "sink", None), _project_root(args), require_initialised=False
+        )
         sink.init()
         print(f"{sink.kind} sink ready at {sink.root}")
         return
@@ -2075,7 +2140,7 @@ def cmd_scratch_clear(args):
             coordination_scratch.CLEAR_NEEDS_TARGET,
             text_hint=coordination_scratch.STAGED_HINT,
         )
-    arbite_dir = config.find_project_root() / config.ARBITE_DIRNAME
+    arbite_dir = _project_root(args) / config.ARBITE_DIRNAME
     result = coordination_scratch.scratch_clear(arbite_dir, args.names, all_=args.all)
     _emit_result(result, args.json)
     if result.exit_code:
@@ -2738,7 +2803,7 @@ def cmd_migrate(args):
     A successful migration also makes the destination the project default: the
     tickets live there now, and leaving `sink:` pointing at the store you migrated
     away from is the same silent-wrong-store trap `init` closes."""
-    project_root = config.find_project_root()
+    project_root = _project_root(args)
     source = config.open_sink(args.from_sink, project_root)
     target = config.open_sink_kind(args.to_sink, project_root)
     if source.kind == str(target.kind) and str(source.root) == str(target.root):
@@ -2877,6 +2942,7 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="arbite", description="Ticket sink CLI")
     parser.add_argument("--version", action="version", version=f"arbite {__version__}")
     _sink_flag(parser, suppress=False)
+    _root_flag(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
 
     p_init = sub.add_parser(
@@ -4588,6 +4654,9 @@ def build_parser():
     _sink_flag(p_doctor)
     p_doctor.set_defaults(func=cmd_doctor)
 
+    # A global flag has to be offered on the subparsers too, or 'arbite list --root
+    # DIR' would be an argparse error while 'arbite --root DIR list' worked.
+    _add_root_flag_deeply(sub)
     return parser, dict(sub.choices)
 
 
