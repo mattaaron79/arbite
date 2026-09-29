@@ -36,11 +36,15 @@ BRIGHT_RED = "\x1b[91m"
 
 # Two accents the base palette cannot express: the 'epic' violet -- the colour a
 # levelling-game reader already reads as rare and worth having -- and the reddish
-# orange an assignee is painted in. Each has a base-palette stand-in, chosen once in
-# `configure()` from what the terminal says about itself, so a console that knows only
-# the 16 colours gets the nearest thing rather than a code it would render as
-# something arbitrary.
-EPIC_256 = "\x1b[38;2;197;134;192m"
+# orange an assignee is painted in. Each is a ladder, and `configure()` picks the rung
+# from what the terminal says about itself, so a console is never handed a code it
+# would render as something arbitrary: the nearest colour available at every level.
+#
+# The violet starts as 24-bit (the softer one chosen by eye), drops to its 256-colour
+# approximation and then to the base palette's magenta; the orange is expressible in
+# 256 colours, so it has two rungs.
+EPIC_TRUECOLOR = "\x1b[38;2;197;134;192m"
+EPIC_256 = "\x1b[38;5;139m"
 EPIC_16 = MAGENTA
 ASSIGNEE_256 = "\x1b[38;5;208m"
 ASSIGNEE_16 = BRIGHT_RED
@@ -80,11 +84,12 @@ RULE_CHARACTER = "─"
 # ANSI/CSI escape sequences, for measuring a painted line in visible columns.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
-# Whether this process may paint, and whether it has the extended palette to paint
-# with. Both are set once by `configure`; a caller that never configures (a library
-# user, a unit test) gets plain text in the base colours.
+# Whether this process may paint, and how rich a palette it may paint with. All three
+# are set once by `configure`; a caller that never configures (a library user, a unit
+# test) gets plain text in the base colours.
 _enabled = False
 _rich = False
+_truecolor = False
 
 
 def _stream_is_tty(stream) -> bool:
@@ -120,13 +125,32 @@ def supports_256_colors(env=None) -> bool:
     console already known to render escapes (Windows Terminal and its kin are
     256-colour capable). A terminal that says nothing gets the base palette, so an
     extended code is never assumed on a console that would render it as something
-    arbitrary.
+    arbitrary. A terminal with 24-bit colour has these 256 colours as well.
     """
     env = os.environ if env is None else env
     term = (env.get(ENV_TERM) or "").lower()
     if "256color" in term or "truecolor" in term:
         return True
     if (env.get(ENV_COLORTERM) or "").lower() in ("truecolor", "24bit"):
+        return True
+    if os.name == "nt":
+        return _windows_console_renders_ansi(env)
+    return False
+
+
+def supports_truecolor(env=None) -> bool:
+    """Whether this terminal advertises 24-bit colour.
+
+    `COLORTERM` saying `truecolor`/`24bit`, or `TERM` naming a `truecolor` variant, is
+    the announcement; a Windows console already trusted to render escapes is treated as
+    capable for the same reason. Only the violet needs this: a 24-bit code on a console
+    that merely has 256 colours is a code it may render as something arbitrary, which
+    is what the middle rung of the ladder is for.
+    """
+    env = os.environ if env is None else env
+    if (env.get(ENV_COLORTERM) or "").lower() in ("truecolor", "24bit"):
+        return True
+    if "truecolor" in (env.get(ENV_TERM) or "").lower():
         return True
     if os.name == "nt":
         return _windows_console_renders_ansi(env)
@@ -186,10 +210,11 @@ def configure(mode="auto", stream=None, env=None) -> bool:
     Colour and the palette are decided together, so no command has to ask which accent
     to use: `paint_epic` and `paint_assignee` already know.
     """
-    global _enabled, _rich
+    global _enabled, _rich, _truecolor
     env = os.environ if env is None else env
     _enabled = color_enabled(mode, stream=stream, env=env)
     _rich = _enabled and supports_256_colors(env)
+    _truecolor = _enabled and supports_truecolor(env)
     return _enabled
 
 
@@ -199,13 +224,21 @@ def enabled() -> bool:
 
 
 def rich_palette() -> bool:
-    """Whether the extended palette is in use (false when colour is off)."""
+    """Whether 256 colours are in use (false when colour is off)."""
     return _rich
 
 
+def truecolor_palette() -> bool:
+    """Whether 24-bit colour is in use (false when colour is off)."""
+    return _truecolor
+
+
 def paint(text, *codes) -> str:
-    """Wrap `text` in the SGR codes, or return it untouched when colour is off."""
-    if not _enabled or not codes:
+    """Wrap `text` in the SGR codes, or return it untouched when colour is off.
+
+    Empty text is returned as it is: there is nothing to colour, so a caller painting
+    an empty prefix (an indent at depth zero, say) emits no bytes at all."""
+    if not _enabled or not codes or not text:
         return text
     return "".join(codes) + text + RESET
 
@@ -229,12 +262,17 @@ def paint_status(text) -> str:
 
 
 def epic_code() -> str:
-    """The violet an epic is painted in, extended when the terminal has it."""
-    return EPIC_256 if _rich else EPIC_16
+    """The violet an epic is painted in: the best rung of the ladder the terminal offers."""
+    if _truecolor:
+        return EPIC_TRUECOLOR
+    if _rich:
+        return EPIC_256
+    return EPIC_16
 
 
 def assignee_code() -> str:
-    """The reddish orange an assignee is painted in, extended when the terminal has it."""
+    """The reddish orange an assignee is painted in: 256 colours where available, the
+    base palette's bright red otherwise."""
     return ASSIGNEE_256 if _rich else ASSIGNEE_16
 
 
@@ -249,8 +287,19 @@ def paint_epic(text) -> str:
 
 
 def paint_assignee(text) -> str:
-    """An assignee id in a table: a reddish orange, so the name reads as a name."""
+    """An assignee id: a reddish orange, so the name reads as a name."""
     return paint(text, assignee_code())
+
+
+def paint_good(text) -> str:
+    """Good news on a row: a satisfied edge, the tick that says a dependency no longer
+    holds anything back."""
+    return paint(text, GREEN)
+
+
+def paint_problem(text) -> str:
+    """Bad news on a row: a dependency cycle, or an id that resolves to no ticket."""
+    return paint(text, RED)
 
 
 def paint_muted(text) -> str:

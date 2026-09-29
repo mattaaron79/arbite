@@ -1902,27 +1902,54 @@ def _print_tree(by_id, rows, stream=None):
     Connectors come from the ancestors that are not last children, a satisfied edge
     is ticked (its dependency is closed, so it no longer holds anything back), and a
     row's mark is spelled out at the end when it has one -- which is how a shared
-    prerequisite says 'already shown above' instead of repeating its subtree."""
+    prerequisite says 'already shown above' instead of repeating its subtree.
+
+    This is a view a person reads, so the shape recedes and the tickets carry the
+    colour: connectors and back-references are dim, ids are bold, a status is painted by
+    its meaning, a satisfied edge is ticked green, a cycle or a dangling id is red, and
+    an owner is the assignee orange. The trees of a forest are separated by a blank
+    line, the way `arbite progress` separates epics."""
     stream = sys.stdout if stream is None else stream
     branch, last_child, pipe, gap, tick = _tree_glyphs(stream)
     ancestor_lasts = []
-    for row in rows:
+    for index, row in enumerate(rows):
         # ancestor_lasts[i] answers "is this a last child" for depth i+1, so a row at
         # depth d keeps the d-1 ancestors above it and nothing from a finished sibling.
         del ancestor_lasts[max(row.depth - 1, 0):]
         prefix = "".join(gap if last else pipe for last in ancestor_lasts)
         if row.depth:
             prefix += last_child if row.last else branch
+        elif index:
+            # A root starts a new tree: a root and its subtree are one unit, so the
+            # next root is separated from the one above it rather than abutting it.
+            print(file=stream)
         ticket = by_id.get(row.id)
         if ticket is None:
-            text = f"{row.id} (missing)"
+            # A dangling id has no ticket behind it, and the mark below is what says so
+            # -- naming it here as well printed it twice.
+            text = term.paint_id(row.id)
         else:
-            satisfied = f"{tick} " if row.edge == graph.EDGE_SATISFIED else ""
+            satisfied = (
+                f"{term.paint_good(tick)} " if row.edge == graph.EDGE_SATISFIED else ""
+            )
             priority = "-" if ticket.priority is None else str(ticket.priority)
-            text = f"{satisfied}{ticket.id} [{ticket.status}] p{priority} {ticket.title}"
+            owner = (
+                f" {term.paint_assignee('@' + ticket.assignee)}" if ticket.assignee else ""
+            )
+            text = (
+                f"{satisfied}{term.paint_id(ticket.id)} "
+                f"[{term.paint_status(ticket.status)}] p{priority} {ticket.title}{owner}"
+            )
         if row.mark is not None:
-            text = f"{text} ({TREE_MARKS[row.mark]})"
-        print(f"{prefix}{text}", file=stream)
+            label = TREE_MARKS[row.mark]
+            # A back-reference is context; a cycle and a dangling id are problems.
+            marked = (
+                term.paint_muted(label)
+                if row.mark == graph.MARK_REPEAT
+                else term.paint_problem(label)
+            )
+            text = f"{text} ({marked})"
+        print(f"{term.paint_muted(prefix)}{text}", file=stream)
         if row.depth:
             ancestor_lasts.append(row.last)
 

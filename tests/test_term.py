@@ -155,25 +155,72 @@ def test_the_extended_palette_is_only_used_when_the_terminal_advertises_it():
     assert not term.supports_256_colors({})
 
 
-def test_the_accents_take_the_extended_palette_or_the_nearest_base_colour():
+def test_the_accents_take_the_richest_rung_the_terminal_advertises():
+    """The violet ladders down from 24-bit to its 256-colour approximation to the base
+    palette's magenta; the orange has two rungs. A terminal is never handed a code
+    richer than it said it could render."""
+    term.configure("always", env={"TERM": "xterm-256color", "COLORTERM": "truecolor"})
+    assert term.truecolor_palette() and term.rich_palette()
+    assert term.paint_epic("mesh-pipeline") == f"{term.EPIC_TRUECOLOR}mesh-pipeline{term.RESET}"
+    assert term.paint_heading("mesh-pipeline") == (
+        f"{term.BOLD}{term.EPIC_TRUECOLOR}mesh-pipeline{term.RESET}"
+    )
+
     term.configure("always", env={"TERM": "xterm-256color"})
-    assert term.rich_palette()
-    assert term.epic_code() == term.EPIC_256
-    assert term.paint_epic("mesh-pipeline") == "\x1b[38;5;135mmesh-pipeline\x1b[0m"
-    assert term.paint_assignee("claude.haiku.001") == "\x1b[38;5;208mclaude.haiku.001\x1b[0m"
+    assert not term.truecolor_palette() and term.rich_palette()
+    assert term.epic_code() == term.EPIC_256, "24-bit is not assumed from 256 colours"
+    assert term.paint_epic("mesh-pipeline") == f"{term.EPIC_256}mesh-pipeline{term.RESET}"
+    assert term.paint_assignee("claude.haiku.001") == (
+        f"{term.ASSIGNEE_256}claude.haiku.001{term.RESET}"
+    )
 
     term.configure("always", env={"TERM": "xterm"})
-    assert not term.rich_palette()
+    assert not term.rich_palette() and not term.truecolor_palette()
     assert term.epic_code() == term.EPIC_16
-    assert term.paint_heading("mesh-pipeline") == "\x1b[1m\x1b[35mmesh-pipeline\x1b[0m"
-    assert term.paint_assignee("claude.haiku.001") == "\x1b[91mclaude.haiku.001\x1b[0m"
+    assert term.paint_epic("mesh-pipeline") == f"{term.MAGENTA}mesh-pipeline{term.RESET}"
+    assert term.paint_assignee("claude.haiku.001") == (
+        f"{term.BRIGHT_RED}claude.haiku.001{term.RESET}"
+    )
+
+
+def test_supports_truecolor_only_believes_an_announcement():
+    assert term.supports_truecolor({"COLORTERM": "truecolor"})
+    assert term.supports_truecolor({"COLORTERM": "24bit"})
+    assert term.supports_truecolor({"TERM": "xterm-truecolor"})
+    assert not term.supports_truecolor({"TERM": "xterm-256color"})
+    assert not term.supports_truecolor({})
+
+
+def test_no_extended_code_reaches_a_base_palette_console():
+    term.configure("always", env={"TERM": "xterm"})
+    painted = term.paint_epic("mesh-pipeline") + term.paint_assignee("claude.haiku.001")
+    assert "\x1b[38;" not in painted, "no 256-colour or 24-bit code on 16 colours"
 
 
 def test_colour_off_means_no_accent_either():
     term.configure("never", env={"TERM": "xterm-256color"})
-    assert not term.rich_palette()
+    assert not term.rich_palette() and not term.truecolor_palette()
     assert term.paint_epic("mesh-pipeline") == "mesh-pipeline"
     assert term.paint_assignee("claude.haiku.001") == "claude.haiku.001"
+
+
+def test_good_news_is_green_and_bad_news_is_red():
+    """The two readings of a dependency row that are not the ticket's own fields."""
+    term.configure("always", env={"TERM": "xterm"})
+    assert term.paint_good("✓") == f"{term.GREEN}✓{term.RESET}"
+    assert term.paint_problem("cycle") == f"{term.RED}cycle{term.RESET}"
+
+    term.configure("never")
+    assert term.paint_good("✓") == "✓"
+    assert term.paint_problem("cycle") == "cycle"
+
+
+def test_painting_nothing_emits_nothing():
+    """A caller painting an empty prefix -- a tree row at depth zero -- must not get an
+    escape pair wrapped around nothing."""
+    term.configure("always", env={"TERM": "xterm"})
+    assert term.paint_muted("") == ""
+    assert term.paint("", term.BOLD) == ""
 
 
 def test_visible_width_ignores_escapes():

@@ -1312,6 +1312,75 @@ def test_the_tree_only_flags_refuse_to_be_silently_ignored(project, cli):
     cli("list", "--full", expect=1)
 
 
+def test_the_tree_is_prettified_for_a_person_without_changing_the_words(project, cli):
+    """The forest is a view a person reads, so the structure recedes while the tickets
+    carry the colour: bold ids, a status painted by its meaning, a green tick for a
+    satisfied edge, the owner in the assignee orange. Strip the escapes and it is the
+    same report, which is what keeps a tree in a file or a log readable."""
+    cli("init")
+    done = create(cli, "done", priority=1)
+    waiting = create(cli, "waiting", priority=2, depends_on=done)
+    cli("close", done)
+    cli("claim", waiting, "--agent", "claude.haiku.001")
+
+    plain = cli("deps", waiting).stdout
+    painted = cli(
+        "deps", waiting, "--color", "always", env={"TERM": "xterm-256color"}
+    ).stdout
+
+    assert f"\x1b[1m{waiting}\x1b[0m" in painted, "the id is bold"
+    assert f"[{term.YELLOW}in_progress{term.RESET}]" in painted, "the status is painted"
+    assert f"{term.GREEN}✓{term.RESET}" in painted, "a satisfied edge is ticked green"
+    assert f"{term.ASSIGNEE_256}@claude.haiku.001{term.RESET}" in painted, "the owner"
+    assert f"{term.DIM}└── {term.RESET}" in painted, "the connector recedes"
+    assert ANSI.sub("", painted) == plain, "colour decorates, it does not rewrite"
+
+
+def test_a_back_reference_is_context_and_a_broken_edge_is_a_problem(project, cli):
+    """Two marks, two readings: 'already shown above' is scaffolding and stays dim, while
+    a dependency id that resolves to nothing is red -- that is the row a reader has to
+    act on."""
+    cli("init")
+    leaf = create(cli, "leaf", priority=1)
+    left = create(cli, "left", priority=2, depends_on=leaf)
+    right = create(cli, "right", priority=3, depends_on=leaf)
+    top = create(cli, "top", priority=4, depends_on=f"{left},{right}")
+
+    painted = cli("deps", top, "--color", "always", env={"TERM": "xterm"}).stdout
+    assert f"({term.DIM}already shown above{term.RESET})" in painted
+
+    orphan = create(cli, "orphan", priority=5, depends_on="tic-gone")
+    broken = cli("deps", orphan, "--color", "always", env={"TERM": "xterm"}).stdout
+    assert f"({term.RED}missing{term.RESET})" in broken
+    assert broken.count("missing") == 1, "the id's mark says it once, not twice"
+
+
+def test_a_forest_separates_its_trees_with_a_blank_line(project, cli):
+    """A forest is several trees, and the blank line is what says where one ends -- the
+    same separation `arbite progress` puts between epics. The rows themselves are
+    untouched, so the blank line is the whole of the difference."""
+    cli("init")
+    first_dep = create(cli, "first-dep", priority=2)
+    first = create(cli, "first", priority=1, depends_on=first_dep)
+    second_dep = create(cli, "second-dep", priority=4)
+    second = create(cli, "second", priority=3, depends_on=second_dep)
+
+    lines = cli("list", "--tree").stdout.splitlines()
+
+    assert lines.count("") == 1, "one blank line, between the two trees"
+    separator = lines.index("")
+    assert lines[separator - 1].startswith("└── "), "it follows the end of a tree"
+    assert lines[separator + 1].startswith("tic-"), "and the next tree starts at a root"
+    assert lines[0] != "" and lines[-1] != "", "no blank line at either edge"
+    # Which tree comes first is the walker's business; that both are here, whole, is not.
+    assert set(lines[:separator] + lines[separator + 1:]) == {
+        f"{first} [open] p1 first",
+        f"└── {first_dep} [open] p2 first-dep",
+        f"{second} [open] p3 second",
+        f"└── {second_dep} [open] p4 second-dep",
+    }
+
+
 def test_set_validates_and_reports_what_it_changed(project, cli):
     tid = create(cli, "before")
     cli("set", tid, "title", "after", "tags", "a, b", "priority", "4")
