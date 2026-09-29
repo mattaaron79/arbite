@@ -40,7 +40,7 @@ BRIGHT_RED = "\x1b[91m"
 # `configure()` from what the terminal says about itself, so a console that knows only
 # the 16 colours gets the nearest thing rather than a code it would render as
 # something arbitrary.
-EPIC_256 = "\x1b[38;5;135m"
+EPIC_256 = "\x1b[38;2;197;134;192m"
 EPIC_16 = MAGENTA
 ASSIGNEE_256 = "\x1b[38;5;208m"
 ASSIGNEE_16 = BRIGHT_RED
