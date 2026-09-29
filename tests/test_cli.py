@@ -2424,6 +2424,101 @@ def test_progress_help_distinguishes_it_from_status_and_list_topo(cli, tmp_proje
     assert "not 'arbite list --topo'" in help_text
 
 
+#: A report is read by eye and by program, so the colour tests must not depend on what
+#: the developer's shell exported: `auto` pointed at a pipe, with an empty NO_COLOR
+#: neutralising one inherited from the environment (empty means 'unset').
+PLAIN_ENV = {"ARBITE_COLOR": "auto", "NO_COLOR": ""}
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def test_progress_separates_epics_and_underlines_each_heading(cli, project):
+    """A report covering several epics is read by eye: the heading is underlined by a
+    rule sized to it, the count line names the epic once instead of every row repeating
+    it, and one blank line separates one epic from the next."""
+    cli("init")
+    first = create(cli, "alpha work", epic="alpha")
+    second = create(cli, "beta work", epic="beta")
+
+    lines = cli("progress").stdout.splitlines()
+
+    alpha = next(index for index, line in enumerate(lines) if "alpha" in line)
+    assert lines[alpha] == "alpha — 1 ticket: 1 open", "one ticket is singular"
+    assert set(lines[alpha + 1]) == {"─"}, "the heading is underlined by a rule"
+    assert len(lines[alpha + 1]) == len(lines[alpha]), "the rule ends where the heading does"
+    assert first in lines[alpha + 2]
+
+    beta = next(index for index, line in enumerate(lines) if "beta" in line)
+    assert lines[beta - 1] == "", "a blank line separates the epics"
+    assert lines[beta] == "beta — 1 ticket: 1 open"
+    assert len(lines[beta + 1]) == len(lines[beta])
+    assert second in lines[beta + 2]
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_reports_are_plain_text_when_stdout_is_not_a_terminal(cli, tmp_project, sink_kind):
+    """Piped output (this harness included) is what a script, a log or a file gets, so
+    it carries no escape codes -- and neither does the JSON, whatever colour is asked
+    for, because a payload is parsed rather than looked at."""
+    cli("init", sink=sink_kind)
+    create(cli, "alpha work", epic="alpha", sink=sink_kind)
+
+    for args in (("progress",), ("progress", "--json"), ("status",), ("list",)):
+        assert "\x1b" not in cli(*args, env=PLAIN_ENV, sink=sink_kind).stdout, args
+    assert "\x1b" not in cli(
+        "progress", "--color", "always", "--json", sink=sink_kind
+    ).stdout
+
+
+def test_color_always_paints_and_color_never_refuses(cli, project):
+    """`--color always` is the caller insisting, and it beats an environment that says
+    otherwise -- before the command as well as after it; `--color never` is the caller
+    refusing, and it beats `ARBITE_COLOR` too."""
+    cli("init")
+    create(cli, "alpha work", epic="alpha")
+
+    painted = cli(
+        "progress", "--color", "always", env={"ARBITE_COLOR": "never"}
+    ).stdout
+    before = cli("--color", "always", "progress", env=PLAIN_ENV).stdout
+    plain = cli("progress", "--color", "never", env={"ARBITE_COLOR": "always"}).stdout
+
+    assert "\x1b[" in painted and "\x1b[" in before
+    assert "\x1b" not in plain
+    # Colour decorates the words rather than replacing or splitting them: a caller
+    # grepping for an epic, a count or a status still finds it in the painted text.
+    visible = ANSI.sub("", painted)
+    assert "alpha — 1 ticket: 1 open" in visible
+    assert "1 open" in painted
+    assert ANSI.sub("", painted) == ANSI.sub("", plain)
+
+
+def test_arbite_color_sets_the_default_and_no_color_outranks_it(cli, project):
+    """`ARBITE_COLOR` is how a shell or a harness asks for colour everywhere without
+    repeating the flag; `NO_COLOR` still wins over it, because a user who exported that
+    means every tool in that shell. `--color always` remains the explicit override."""
+    cli("init")
+    create(cli, "alpha work", epic="alpha")
+
+    exported = cli("progress", env={"ARBITE_COLOR": "always", "NO_COLOR": ""}).stdout
+    silenced = cli("progress", env={"ARBITE_COLOR": "always", "NO_COLOR": "1"}).stdout
+    insisted = cli(
+        "progress", "--color", "always", env={"ARBITE_COLOR": "auto", "NO_COLOR": "1"}
+    ).stdout
+
+    assert "\x1b[" in exported
+    assert "\x1b" not in silenced
+    assert "\x1b[" in insisted
+
+
+def test_an_unknown_color_mode_is_refused_before_anything_is_read(cli, project):
+    cli("init")
+
+    proc = cli("progress", "--color", "mauve", expect=2)
+
+    assert "invalid choice" in proc.stderr and "--color" in proc.stderr
+
+
 # --- submit and accept: the review hand-off -------------------------------
 
 

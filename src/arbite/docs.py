@@ -248,7 +248,7 @@ _NO_VALUE_ACTIONS = (
 
 # The global selectors appear on every command; documenting them once, in the sink
 # section, beats repeating them under all twenty-odd commands.
-_GLOBAL_ACTIONS = ("help", "sink", "root", "version")
+_GLOBAL_ACTIONS = ("help", "sink", "root", "version", "color")
 
 #: The commands whose per-flag reference lives in WORKSPACE.md rather than in the
 #: always-read guide: the ones that act on files through the proxy, plus the
@@ -525,6 +525,12 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "- `--root DIR` runs the command against another project: the project is the nearest "
         "`.arbite/` at or above DIR, exactly as if arbite were started there (default: the "
         "current directory). It changes only *which* project is located, not the sink selection"
+    )
+    add(
+        "- `--color WHEN` decides when reports are coloured: `auto` (the default) only when "
+        "stdout is a terminal that will render escapes, `always`, or `never`. `NO_COLOR` turns "
+        "it off and `ARBITE_COLOR` sets an environment's default; colour is decoration, so no "
+        "table says less in plain text and `--json` is never coloured at all"
     )
     add(
         "- a top-level `review:` key (default `true`) is where a finished ticket goes: `review/` "
@@ -1122,9 +1128,10 @@ def render_workspace(parser, subparsers_by_name: dict, active_info=None, stale_i
     add("## Commands")
     add("")
     add(
-        "Every command accepts `--sink <kind>` and `--root DIR` (both documented once, in "
-        "`.arbite/AGENTS.md` with the rest of the sink facts; `--root` targets another project "
-        "directory). Argparse's longer descriptions are omitted here too -- `arbite <cmd> -h` "
+        "Every command accepts `--sink <kind>`, `--root DIR` and `--color WHEN`; the sink "
+        "selectors are documented once in `.arbite/AGENTS.md` (`--root` targets another project "
+        "directory, `--color` is `auto`, `always` or `never` and changes only how output is "
+        "painted). Argparse's longer descriptions are omitted here too -- `arbite <cmd> -h` "
         "prints them."
     )
     add("")

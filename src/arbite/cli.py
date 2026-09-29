@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, config, docs, graph, schema
+from . import __version__, config, docs, graph, schema, term
 from .coordination import app as coordination_app
 from .coordination import claims as coordination_claims
 from .coordination import discovery as coordination_discovery
@@ -133,6 +133,26 @@ def _root_flag(parser, suppress=True):
         help="run as if arbite were started in DIR, so the project is the nearest "
         ".arbite/ at or above it (default: the current directory); use it to reach "
         "another project without changing directory",
+    )
+
+
+def _color_flag(parser, suppress=True):
+    """The global --color selector.
+
+    Like --sink and --root it is offered before the command and, on every subparser,
+    after it, and its default is suppressed there so a value given before the command
+    is not overwritten by the subparser's own. The mode itself is resolved once in
+    `main()`, through `term.resolve_mode`, so `ARBITE_COLOR` supplies the default and
+    the flag overrides it.
+    """
+    parser.add_argument(
+        "--color",
+        metavar="WHEN",
+        choices=term.COLOR_MODES,
+        default=argparse.SUPPRESS if suppress else None,
+        help="when to colour the output: 'auto' (default) only when stdout is a "
+        "terminal that will render escapes, 'always', or 'never'. NO_COLOR is "
+        "honoured; ARBITE_COLOR sets the default for a whole environment",
     )
 
 
@@ -438,18 +458,28 @@ def _subparsers_of(parser):
     return None
 
 
-def _add_root_flag_deeply(subparsers) -> None:
-    """Offer `--root` on every subparser, one level down at a time.
+def _add_global_flag_deeply(subparsers, add_flag) -> None:
+    """Offer a global flag on every subparser, one level down at a time.
 
     The flag is global, so a caller expects to write it wherever is convenient
-    ('arbite list --root DIR', 'arbite file list --root DIR'); adding it here, in one
-    pass over the built tree, keeps every command consistent instead of hand-listing
-    three dozen subparsers."""
+    ('arbite list --root DIR', 'arbite file list --color never'); adding it here, in
+    one pass over the built tree, keeps every command consistent instead of
+    hand-listing three dozen subparsers."""
     for subparser in subparsers.choices.values():
-        _root_flag(subparser)
+        add_flag(subparser)
         nested = _subparsers_of(subparser)
         if nested is not None:
-            _add_root_flag_deeply(nested)
+            _add_global_flag_deeply(nested, add_flag)
+
+
+def _add_root_flag_deeply(subparsers) -> None:
+    """Offer `--root` on every subparser."""
+    _add_global_flag_deeply(subparsers, _root_flag)
+
+
+def _add_color_flag_deeply(subparsers) -> None:
+    """Offer `--color` on every subparser."""
+    _add_global_flag_deeply(subparsers, _color_flag)
 
 
 def knows_command(path: str) -> bool:
@@ -963,7 +993,10 @@ def cmd_status(args):
     status_width = max([len(status) for status in counts] + [len("total")])
     count_width = max([len(str(n)) for n in counts.values()] + [len(str(total))])
     for status, n in counts.items():
-        print(f"{status:<{status_width}}  {n:>{count_width}}")
+        # The status name is painted but its padding is computed first, so the
+        # column stays aligned whatever colour does (an escape takes no columns).
+        label = term.paint_status(f"{status:<{status_width}}")
+        print(f"{label}  {n:>{count_width}}")
     print(f"{'total':<{status_width}}  {total:>{count_width}}")
 
 
@@ -1040,13 +1073,27 @@ def cmd_progress(args):
         _print_json(payload)
         return
 
-    for heading, members in groups:
+    for index, (heading, members) in enumerate(groups):
         counts = count_by_status(members, vocabulary=True)
         # Every status present, in vocabulary order, so the line reads the same
         # shape as `arbite status` -- the same counting implementation, so the
-        # two cannot disagree.
-        summary = " / ".join(f"{n} {status}" for status, n in counts.items() if n)
-        print(f"{heading}  ({len(members)} tickets: {summary or 'none'})")
+        # two cannot disagree. Each `n status` pair is painted as one unit, so the
+        # words a caller greps for stay contiguous whether colour is on or off.
+        summary = " / ".join(
+            term.paint(f"{n} {status}", *term.status_codes(status))
+            for status, n in counts.items()
+            if n
+        )
+        # A blank line separates epics: a heading, its rule and its table are one
+        # unit, and the next epic starts a new one rather than continuing the table.
+        if index:
+            print()
+        count = f"{len(members)} {_plural(len(members), 'ticket')}"
+        line = f"{term.paint_heading(heading)} — {count}: {summary or 'none'}"
+        print(line)
+        # Sized from the painted line's *visible* width, so the rule ends where the
+        # heading does rather than counting the escape codes themselves.
+        print(term.rule(term.visible_width(line)))
         _print_flat(members)
 
 
@@ -1451,8 +1498,18 @@ def _filter_query(args) -> TicketQuery:
     ).normalized()
 
 
+def _plural(count, singular, plural=None):
+    """'1 ticket', '2 tickets' -- so a count line never reads '1 tickets'."""
+    if count == 1:
+        return singular
+    return plural or f"{singular}s"
+
+
 def _print_flat(rows):
-    """Print tickets as a fixed-width table (rows must be non-empty)."""
+    """Print tickets as a fixed-width table (rows must be non-empty).
+
+    Padding is applied before painting, because a colour escape takes no columns:
+    the visible width of a row is the same whether colour is on or off."""
     id_w = max(len(t.id) for t in rows) + 1
     status_w = max(len(t.status) for t in rows) + 1
     priority_w = max(len("-") if t.priority is None else len(str(t.priority)) for t in rows) + 1
@@ -1463,8 +1520,10 @@ def _print_flat(rows):
 
     for t in rows:
         prio = "-" if t.priority is None else str(t.priority)
+        ticket_id = term.paint_id(f"{t.id:<{id_w}}")
+        status = term.paint_status(f"{t.status:<{status_w}}")
         print(
-            f"{t.id:<{id_w}} {t.status:<{status_w}} {prio:<{priority_w}} "
+            f"{ticket_id} {status} {prio:<{priority_w}} "
             f"{t.tier:<{tier_w}} {t.domain:<{domain_w}} {(t.epic or '-'):<{epic_w}} "
             f"{(t.assignee or '-'):<{assignee_w}} {t.title}"
         )
@@ -2983,6 +3042,7 @@ def build_parser():
     parser.add_argument("--version", action="version", version=f"arbite {__version__}")
     _sink_flag(parser, suppress=False)
     _root_flag(parser, suppress=False)
+    _color_flag(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
 
     p_init = sub.add_parser(
@@ -3806,7 +3866,9 @@ def build_parser():
         "are ordered topologically by depends_on (the same ordering 'list next' uses) and "
         "an unsatisfiable dependency cycle is warned about on stderr, as the other "
         "listings do. Each epic gets a count line (e.g. '1 open / 1 in_progress / 6 "
-        "closed') so progress is readable without counting rows. Tickets filed in a bucket "
+        "closed') so progress is readable without counting rows, and is set off by a "
+        "blank line with a rule under its heading; the table is coloured when stdout "
+        "can render escapes (see '--color'). Tickets filed in a bucket "
         "(wishlist/plans) are out of the status workflow, so they are not live and cannot "
         "put an epic in scope. This is not 'arbite status' (which counts the whole backlog "
         "per status) and not 'arbite list --topo' (which shows a filtered selection rather "
@@ -4729,6 +4791,7 @@ def build_parser():
     # A global flag has to be offered on the subparsers too, or 'arbite list --root
     # DIR' would be an argparse error while 'arbite --root DIR list' worked.
     _add_root_flag_deeply(sub)
+    _add_color_flag_deeply(sub)
     return parser, dict(sub.choices)
 
 
@@ -4748,6 +4811,10 @@ def main():
 
     parser, _ = build_parser()
     args = parser.parse_args()
+    # Colour is decided once, after argparse has seen --color: --color overrides
+    # ARBITE_COLOR, which overrides the 'auto' default, and 'auto' keeps a stdout
+    # that is not a terminal plain.
+    term.configure(term.resolve_mode(getattr(args, "color", None)))
     try:
         args.func(args)
     except ArbiteError as e:
