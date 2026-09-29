@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from arbite import cli as arbite_cli
-from arbite import docs, schema
+from arbite import docs, schema, term
 from arbite.errors import Conflict
 from arbite.sinks import Expect, SinkSpec, build_sink
 from arbite.sinks import file as file_sink
@@ -2509,6 +2509,25 @@ def test_arbite_color_sets_the_default_and_no_color_outranks_it(cli, project):
     assert "\x1b[" in exported
     assert "\x1b" not in silenced
     assert "\x1b[" in insisted
+
+
+def test_the_epic_and_the_assignee_carry_their_own_accents(cli, project):
+    """A grouping and an owner each read as themselves: the epic violet and the
+    assignee orange are accents a 256-colour terminal gets exactly, and a terminal that
+    knows only the base palette gets the nearest plain colour instead of a code it
+    would render as something arbitrary."""
+    cli("init")
+    tid = create(cli, "alpha work", epic="alpha")
+    cli("claim", tid, "--agent", "claude.haiku.001")
+
+    rich = cli("progress", "--color", "always", env={"TERM": "xterm-256color"}).stdout
+    base = cli("progress", "--color", "always", env={"TERM": "xterm"}).stdout
+
+    assert term.EPIC_256 in rich and term.ASSIGNEE_256 in rich
+    assert term.EPIC_16 in base and term.ASSIGNEE_16 in base
+    assert term.EPIC_256 not in base and term.ASSIGNEE_256 not in base
+    # The accent is the only difference: the words are the same either way.
+    assert ANSI.sub("", rich) == ANSI.sub("", base)
 
 
 def test_an_unknown_color_mode_is_refused_before_anything_is_read(cli, project):

@@ -530,7 +530,9 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "- `--color WHEN` decides when reports are coloured: `auto` (the default) only when "
         "stdout is a terminal that will render escapes, `always`, or `never`. `NO_COLOR` turns "
         "it off and `ARBITE_COLOR` sets an environment's default; colour is decoration, so no "
-        "table says less in plain text and `--json` is never coloured at all"
+        "table says less in plain text and `--json` is never coloured at all. The palette is "
+        "the base 16 colours, with the epic violet and the assignee orange drawn from the "
+        "extended palette only where the terminal says it has one"
     )
     add(
         "- a top-level `review:` key (default `true`) is where a finished ticket goes: `review/` "

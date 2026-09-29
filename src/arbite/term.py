@@ -20,9 +20,8 @@ import os
 import re
 import sys
 
-# SGR codes, in the 8/16-colour range only: any terminal that renders ANSI at all
-# renders these, where 256-colour and truecolour codes degrade to something
-# arbitrary on a console that does not expect them.
+# The base palette: SGR codes in the 8/16-colour range, which every terminal that
+# renders ANSI at all renders the same way.
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
 DIM = "\x1b[2m"
@@ -33,6 +32,18 @@ BLUE = "\x1b[34m"
 MAGENTA = "\x1b[35m"
 CYAN = "\x1b[36m"
 GREY = "\x1b[90m"
+BRIGHT_RED = "\x1b[91m"
+
+# Two accents the base palette cannot express: the 'epic' violet -- the colour a
+# levelling-game reader already reads as rare and worth having -- and the reddish
+# orange an assignee is painted in. Each has a base-palette stand-in, chosen once in
+# `configure()` from what the terminal says about itself, so a console that knows only
+# the 16 colours gets the nearest thing rather than a code it would render as
+# something arbitrary.
+EPIC_256 = "\x1b[38;5;135m"
+EPIC_16 = MAGENTA
+ASSIGNEE_256 = "\x1b[38;5;208m"
+ASSIGNEE_16 = BRIGHT_RED
 
 #: The values `--color` accepts, and the only ones `ARBITE_COLOR` may name.
 COLOR_MODES = ("auto", "always", "never")
@@ -40,9 +51,11 @@ COLOR_MODES = ("auto", "always", "never")
 #: `ARBITE_COLOR` sets the default mode for a whole environment. `NO_COLOR` is the
 #: cross-tool switch, honoured when it is set to anything but the empty string (an
 #: empty `NO_COLOR` means 'unset', which is how no-color.org defines it).
+#: `COLORTERM` is the conventional place a terminal announces extended colour.
 ENV_COLOR = "ARBITE_COLOR"
 ENV_NO_COLOR = "NO_COLOR"
 ENV_TERM = "TERM"
+ENV_COLORTERM = "COLORTERM"
 
 #: How each ticket status prints. Keyed by the values in `schema.STATUSES`; a status
 #: this map has not heard of prints plain, so a status added to the vocabulary later
@@ -52,7 +65,9 @@ STATUS_CODES = {
     "raw": (DIM,),
     "open": (GREEN,),
     "in_progress": (YELLOW,),
-    "review": (MAGENTA,),
+    # Not the violet an epic is painted in: a status and a grouping sit in the same
+    # table, so the two must not be readable as each other.
+    "review": (BLUE,),
     "blocked": (RED,),
     "shelved": (DIM,),
     "closed": (DIM,),
@@ -65,9 +80,11 @@ RULE_CHARACTER = "─"
 # ANSI/CSI escape sequences, for measuring a painted line in visible columns.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
-# Whether this process may paint. Set once by `configure`; a caller that never
-# configures (a library user, a unit test) gets plain text.
+# Whether this process may paint, and whether it has the extended palette to paint
+# with. Both are set once by `configure`; a caller that never configures (a library
+# user, a unit test) gets plain text in the base colours.
 _enabled = False
+_rich = False
 
 
 def _stream_is_tty(stream) -> bool:
@@ -93,6 +110,27 @@ def _windows_console_renders_ansi(env) -> bool:
     if (env.get("ConEmuANSI") or "").upper() == "ON":
         return True
     return bool(env.get(ENV_TERM))
+
+
+def supports_256_colors(env=None) -> bool:
+    """Whether this terminal advertises the extended 256-colour palette.
+
+    Only what the terminal says about itself is believed: `TERM` naming a `256color`
+    or `truecolor` variant, `COLORTERM` saying `truecolor`/`24bit`, or a Windows
+    console already known to render escapes (Windows Terminal and its kin are
+    256-colour capable). A terminal that says nothing gets the base palette, so an
+    extended code is never assumed on a console that would render it as something
+    arbitrary.
+    """
+    env = os.environ if env is None else env
+    term = (env.get(ENV_TERM) or "").lower()
+    if "256color" in term or "truecolor" in term:
+        return True
+    if (env.get(ENV_COLORTERM) or "").lower() in ("truecolor", "24bit"):
+        return True
+    if os.name == "nt":
+        return _windows_console_renders_ansi(env)
+    return False
 
 
 def color_enabled(mode="auto", stream=None, env=None) -> bool:
@@ -143,15 +181,26 @@ def resolve_mode(flag=None, env=None) -> str:
 
 
 def configure(mode="auto", stream=None, env=None) -> bool:
-    """Decide once, for this process, whether commands may paint their output."""
-    global _enabled
+    """Decide once, for this process, whether commands may paint their output.
+
+    Colour and the palette are decided together, so no command has to ask which accent
+    to use: `paint_epic` and `paint_assignee` already know.
+    """
+    global _enabled, _rich
+    env = os.environ if env is None else env
     _enabled = color_enabled(mode, stream=stream, env=env)
+    _rich = _enabled and supports_256_colors(env)
     return _enabled
 
 
 def enabled() -> bool:
     """Whether painting currently does anything."""
     return _enabled
+
+
+def rich_palette() -> bool:
+    """Whether the extended palette is in use (false when colour is off)."""
+    return _rich
 
 
 def paint(text, *codes) -> str:
@@ -179,9 +228,29 @@ def paint_status(text) -> str:
     return paint(text, *status_codes(text))
 
 
+def epic_code() -> str:
+    """The violet an epic is painted in, extended when the terminal has it."""
+    return EPIC_256 if _rich else EPIC_16
+
+
+def assignee_code() -> str:
+    """The reddish orange an assignee is painted in, extended when the terminal has it."""
+    return ASSIGNEE_256 if _rich else ASSIGNEE_16
+
+
 def paint_heading(text) -> str:
-    """An epic or section heading."""
-    return paint(text, BOLD, CYAN)
+    """A heading: bold, in the epic violet that heads each epic in `arbite progress`."""
+    return paint(text, BOLD, epic_code())
+
+
+def paint_epic(text) -> str:
+    """An epic name in a table, so a grouping reads apart from the status beside it."""
+    return paint(text, epic_code())
+
+
+def paint_assignee(text) -> str:
+    """An assignee id in a table: a reddish orange, so the name reads as a name."""
+    return paint(text, assignee_code())
 
 
 def paint_muted(text) -> str:

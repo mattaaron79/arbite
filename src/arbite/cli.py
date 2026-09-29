@@ -1508,8 +1508,10 @@ def _plural(count, singular, plural=None):
 def _print_flat(rows):
     """Print tickets as a fixed-width table (rows must be non-empty).
 
-    Padding is applied before painting, because a colour escape takes no columns:
-    the visible width of a row is the same whether colour is on or off."""
+    Padding is applied before painting, because a colour escape takes no columns: the
+    visible width of a row is the same whether colour is on or off. The epic and the
+    assignee carry their own accents; a '-' placeholder is left plain, because there
+    is nothing there to point at."""
     id_w = max(len(t.id) for t in rows) + 1
     status_w = max(len(t.status) for t in rows) + 1
     priority_w = max(len("-") if t.priority is None else len(str(t.priority)) for t in rows) + 1
@@ -1522,10 +1524,15 @@ def _print_flat(rows):
         prio = "-" if t.priority is None else str(t.priority)
         ticket_id = term.paint_id(f"{t.id:<{id_w}}")
         status = term.paint_status(f"{t.status:<{status_w}}")
+        epic = term.paint_epic(f"{t.epic:<{epic_w}}") if t.epic else f"{'-':<{epic_w}}"
+        assignee = (
+            term.paint_assignee(f"{t.assignee:<{assignee_w}}")
+            if t.assignee
+            else f"{'-':<{assignee_w}}"
+        )
         print(
             f"{ticket_id} {status} {prio:<{priority_w}} "
-            f"{t.tier:<{tier_w}} {t.domain:<{domain_w}} {(t.epic or '-'):<{epic_w}} "
-            f"{(t.assignee or '-'):<{assignee_w}} {t.title}"
+            f"{t.tier:<{tier_w}} {t.domain:<{domain_w}} {epic} {assignee} {t.title}"
         )
 
 
