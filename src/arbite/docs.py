@@ -177,6 +177,73 @@ def install_instructions(path: Path) -> str:
     )
     return "prepended"
 
+
+# Markers delimit the ignore block: they make it *the arbite section*, so
+# `install_gitignore` rewrites that one region in place and leaves every other
+# line of the file exactly as it found it.
+ARBITE_GITIGNORE_BEGIN = "# BEGIN ARBITE GITIGNORE"
+ARBITE_GITIGNORE_END = "# END ARBITE GITIGNORE"
+
+# The runtime state `arbite init` itself creates beside the tickets, and any
+# sqlite store with its WAL/SHM sidecars. The paths are anchored to the project
+# root (a leading slash) because a bare pattern would also swallow a
+# same-named directory anywhere in the tree.
+ARBITE_GITIGNORE_BLOCK = """\
+# BEGIN ARBITE GITIGNORE
+# Runtime state arbite writes beside the tickets: coordination claims/attempts/
+# events, scratch payloads, and any sqlite store (sidecars included). Tickets and
+# the generated docs are the development record; these are local evidence.
+/.arbite/coordination/
+/.arbite/scratch/
+/.arbite/arbite.db*
+# END ARBITE GITIGNORE"""
+
+
+def install_gitignore(path: Path) -> str:
+    """Set the arbite runtime-state entries in the ignore file at `path`.
+
+    The markers make the block *the arbite section*: when the file already
+    carries one, only the marked region is replaced with the current entries --
+    everything above and below it survives byte for byte, and a stale section
+    from an older arbite is refreshed rather than fossilised.
+
+    Returns what it did, so `arbite init` can report it:
+
+    - 'created'  -- the file did not exist; it is written with the block alone;
+    - 'appended' -- the file existed with no section; the block is appended
+      below the existing contents. Appended rather than prepended because git's
+      last matching rule wins: arbite's lines must not get to override a
+      project's own later rules;
+    - 'updated'  -- the file carried a marked section and it changed; only that
+      region was rewritten;
+    - 'present'  -- the marked section already holds exactly the current
+      entries, so the file is left untouched.
+
+    A half-section -- one marker without the other, or markers out of order --
+    counts as 'present': demarkation is then the project's business, and there
+    is no safe region to replace."""
+    if not path.exists():
+        path.write_text(ARBITE_GITIGNORE_BLOCK + "\n", encoding="utf-8")
+        return "created"
+    existing = path.read_text(encoding="utf-8")
+    begin = existing.find(ARBITE_GITIGNORE_BEGIN)
+    end = existing.find(ARBITE_GITIGNORE_END)
+    if begin == -1 and end == -1:
+        path.write_text(
+            existing.rstrip("\n") + "\n\n" + ARBITE_GITIGNORE_BLOCK + "\n",
+            encoding="utf-8",
+        )
+        return "appended"
+    if begin == -1 or end <= begin:
+        return "present"
+    end += len(ARBITE_GITIGNORE_END)
+    replaced = existing[:begin] + ARBITE_GITIGNORE_BLOCK + existing[end:]
+    if replaced == existing:
+        return "present"
+    path.write_text(replaced, encoding="utf-8")
+    return "updated"
+
+
 # Per-field descriptions for the frontmatter table, keyed by field name.
 # Interpolating the vocabulary constants keeps the doc honest about what the
 # CLI actually accepts. One line per field: the guide is read on every task, so a

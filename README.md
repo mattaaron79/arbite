@@ -253,8 +253,12 @@ now live. An `ARBITE_SINK` selection is treated as this-process-only: it is repo
 rather than written to committed config, and it is the one case `init` writes no
 config file at all.
 
-If the database file is used, add it to `.gitignore`: unlike the file sink, it is
-binary and won't produce a readable history.
+If the database file is used, keep it out of git: unlike the file sink, it is
+binary and won't produce a readable history. `arbite init --gitignore` installs
+the runtime-state entries (the coordination and scratch directories, and any
+sqlite store with its WAL/SHM sidecars) into your `.gitignore` as a marked
+section: an existing file is never overwritten, and a re-run refreshes only
+that section.
 
 ### The interface
 

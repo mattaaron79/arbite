@@ -184,6 +184,66 @@ def test_init_claude_doc_prepends_without_clobbering_the_file(cli, tmp_project):
     assert (tmp_project / "CLAUDE.md").read_text() == doc
 
 
+def test_init_leaves_gitignore_alone_without_the_flag(cli, tmp_project):
+    """Like the agent docs, touching .gitignore is opt-in: a plain `init` must not
+    write one into a project that never asked for it."""
+    cli("init")
+    assert not (tmp_project / ".gitignore").exists()
+
+
+def test_init_gitignore_creates_then_leaves_the_block_alone(cli, tmp_project):
+    """`--gitignore` writes a new .gitignore with the runtime-state entries, and
+    re-running `init` is idempotent: the demarkation markers stop a second copy."""
+    output = cli("init", "--gitignore").stdout
+    ignore = (tmp_project / ".gitignore").read_text()
+    assert "created" in output and ".gitignore" in output
+    assert ignore.startswith("# BEGIN ARBITE GITIGNORE")
+    assert ignore.rstrip().endswith("# END ARBITE GITIGNORE")
+    for entry in ("/.arbite/coordination/", "/.arbite/scratch/", "/.arbite/arbite.db*"):
+        assert entry in ignore, entry
+
+    again = cli("init", "--gitignore").stdout
+    assert "already contains the arbite runtime-state entries" in again
+    assert (tmp_project / ".gitignore").read_text() == ignore
+
+
+def test_init_gitignore_appends_without_clobbering_the_file(cli, tmp_project):
+    """An existing .gitignore keeps its contents; the block goes below them --
+    appended, not prepended, so git's last-match-wins keeps working for the
+    project's own later rules."""
+    original = "__pycache__/\n*.pyc\n"
+    (tmp_project / ".gitignore").write_text(original)
+    output = cli("init", "--gitignore").stdout
+    ignore = (tmp_project / ".gitignore").read_text()
+    assert "appended" in output
+    assert ignore.startswith(original)
+    assert "# BEGIN ARBITE GITIGNORE" in ignore
+    assert ignore.count("# BEGIN ARBITE GITIGNORE") == 1
+
+
+def test_init_gitignore_replaces_only_the_marked_section(cli, tmp_project):
+    """The markers make the block *the arbite section*: re-running refreshes that
+    region in place (here, a stale hand-edited one) and every other line --
+    above, below, and between -- survives untouched."""
+    stale = (
+        "__pycache__/\n"
+        "# BEGIN ARBITE GITIGNORE\n"
+        "/.arbite/stale-old-state/\n"
+        "# END ARBITE GITIGNORE\n"
+        "# project rule below the section\n"
+        "!keep-me\n"
+    )
+    (tmp_project / ".gitignore").write_text(stale)
+    output = cli("init", "--gitignore").stdout
+    ignore = (tmp_project / ".gitignore").read_text()
+    assert "refreshed the arbite section" in output
+    assert ignore.startswith("__pycache__/\n")
+    assert ignore.endswith("# project rule below the section\n!keep-me\n")
+    assert "/.arbite/stale-old-state/" not in ignore
+    assert "/.arbite/coordination/" in ignore
+    assert ignore.count("# BEGIN ARBITE GITIGNORE") == 1
+
+
 def test_init_with_the_sqlite_sink_creates_a_database_and_says_so(cli, tmp_project):
     output = cli("init", "--sink", "sqlite").stdout
     assert "sqlite sink ready" in output

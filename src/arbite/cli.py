@@ -745,6 +745,32 @@ def cmd_init(args):
                 "left unchanged"
             )
 
+    # --gitignore installs the runtime-state entries (coordination/, scratch/, any
+    # sqlite store and its sidecars) into ./.gitignore, so the directories this
+    # command just created -- which the tree never asked for -- do not dirty it.
+    # Appended rather than prepended: git's last match wins, and arbite's lines
+    # should not get to override a project's later decisions.
+    if getattr(args, "gitignore", False):
+        gitignore_path = project_root / ".gitignore"
+        outcome = docs.install_gitignore(gitignore_path)
+        if outcome == "created":
+            print(f"created {gitignore_path} with the arbite runtime-state entries")
+        elif outcome == "appended":
+            print(
+                f"appended the arbite runtime-state entries to {gitignore_path} "
+                "(existing contents left in place)"
+            )
+        elif outcome == "updated":
+            print(
+                f"refreshed the arbite section in {gitignore_path} "
+                "(the rest of the file left in place)"
+            )
+        else:
+            print(
+                f"{gitignore_path} already contains the arbite runtime-state entries; "
+                "left unchanged"
+            )
+
 
 def cmd_sink(args):
     """Report or initialise the active sink: which implementation is in use,
@@ -3090,7 +3116,9 @@ def build_parser():
         "--agents-doc/--claude-doc to have the instructions block installed into those files "
         "for you) and .arbite/WORKSPACE.md (the file-proxy and workspace-command reference the "
         "guide points at), and pre-create a scratchpad file under .arbite/agents/ "
-        "for every id listed in an 'agents:' list in .arbite/project.yaml, if present. Which sink is "
+        "for every id listed in an 'agents:' list in .arbite/project.yaml, if present. Pass "
+        "--gitignore to also install the runtime-state entries (coordination/, scratch/, any "
+        "sqlite store) into ./.gitignore. Which sink is "
         "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
         "in .arbite/project.yaml, then file. The store it creates then becomes the project default -- "
         "'sink:' is written to .arbite/project.yaml, created if it does not exist, so no later command "
@@ -3112,6 +3140,14 @@ def build_parser():
         help="create ./CLAUDE.md, or prepend the arbite instructions block to it if the "
         "file exists without that block, so Claude Code finds arbite ('--claud-doc' is "
         "accepted as an alias)",
+    )
+    p_init.add_argument(
+        "--gitignore",
+        action="store_true",
+        help="create ./.gitignore with the arbite runtime-state entries "
+        "(coordination/, scratch/, any sqlite store and its sidecars), or install "
+        "them into an existing one as a marked section that re-runs refresh in "
+        "place, so the state this command creates does not dirty the tree",
     )
     _sink_flag(p_init)
     p_init.set_defaults(func=cmd_init)
