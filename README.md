@@ -14,6 +14,28 @@ database file, where `status` is a column and queries are real SQL. Every comman
 field, exit code and `--json` payload is identical whichever sink is in use — see
 [Sinks](#sinks).
 
+## Install
+
+`arbite` needs Python 3.9+ and is not published on PyPI yet, so install it from a
+clone of this repo:
+
+```bash
+git clone https://github.com/mattaaron79/arbite.git
+cd arbite
+pipx install .        # puts `arbite` on PATH for your user (plain `pip install .` also works)
+arbite --version      # confirm it is on PATH
+```
+
+Then initialise it in the repo you want to track tickets in:
+
+```bash
+cd /path/to/your/project
+arbite init           # creates .arbite/ and the agent-facing AGENTS.md / WORKSPACE.md
+```
+
+For development installs, the update helper scripts, and pipx caveats, see
+[Installation](#installation) below.
+
 ## Breaking changes when upgrading
 
 Two changes are hard cuts with **no fallback, no deprecation warning and no
@@ -871,8 +893,10 @@ The independent axes are easy to conflate, so they are deliberately separate fie
 
 ## Installation
 
-`arbite` is a standard installable package ([`pyproject.toml`](pyproject.toml:1)) with
-a single runtime dependency (`pyyaml`) and a console-script entry point:
+The short version is at [Install](#install) at the top of this file; this section is
+the long version. `arbite` is a standard installable package
+([`pyproject.toml`](pyproject.toml:1)) with a single runtime dependency (`pyyaml`)
+and a console-script entry point:
 
 ```toml
 [project.scripts]
