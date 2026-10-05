@@ -30,6 +30,7 @@ The order the proxy exists to enforce: a claim is exclusive writer ownership of 
 - `arbite receipt <op>` -- one operation's evidence: the version it replaced, the version it wrote, where those bytes are kept, all read back and proved against the digests the receipt records before anything prints. Missing evidence is refused, not glossed over
 - `arbite receipt --summary [--ticket T]` -- every operation in log order with both versions and who did it, plus what the store still holds. Take this *before* anything is pruned: the coordination store is ignored by git and dies with the machine, so this is the export a devlog is written from
 - `arbite events [--tail N] [--after CURSOR] [--include-reads]` -- the coordination event stream, one line per event, in cursor order; reads are excluded unless asked for, and `--follow` is refused because arbite never blocks -- poll with `--after <cursor>`, where 'nothing new' is exit 2 rather than an error
+- `arbite stream read <id> [--after SEQ | --tail N]` -- the narration stream a worker writes as it works, one record per line; poll with `--after`, where 'nothing new' is exit 2, and `arbite stream list` / `arbite stream path <id>` show what is recording and where the file is
 - `arbite scratch list` / `arbite scratch clear [NAME...] [--all]` -- what is staged as the payload of a write or an edit, and how to empty it deliberately
 - `arbite attempt adopt <id> --agent <your-id>` -- record an attempt for work that was already `in_progress` when attempt tracking began
 
@@ -171,6 +172,38 @@ Every command accepts `--sink <kind>`, `--root DIR` and `--color WHEN`; the sink
 - `--tail N` -- print the last N selected events (a bare 'arbite events' prints the last 20)
 - `--include-reads` -- include read observations, which the default view excludes
 - `--follow` -- refused: arbite commands are one-shot and never block -- poll with '--after <cursor>'
+- `--json` -- JSON output (see 'Conventions' in .arbite/AGENTS.md)
+
+**`arbite stream`** -- `arbite stream [-h] [--sink KIND] [--root DIR] [--color WHEN] SUBCOMMAND ...`
+
+**`arbite stream write`** -- `arbite stream write [-h] [--kind {thought,action,result}] [--actor AGENT_ID] [--json] [--sink KIND] [--root DIR] [--color WHEN] TICKET_ID [TEXT ...]`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `TEXT` -- the line to record; '-' reads stdin (one record per line)
+- `--kind KIND` -- what the record is: a thought (default), an action taken, or a result
+- `--actor AGENT_ID` -- who to attribute the record to (default: the active attempt's worker); arbite records attribution, never authentication
+- `--json` -- JSON output (see 'Conventions' in .arbite/AGENTS.md)
+
+**`arbite stream read`** -- `arbite stream read [-h] [--after SEQ] [--tail N] [--json] [--sink KIND] [--root DIR] [--color WHEN] TICKET_ID`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `--after SEQ` -- print records after this sequence, and report the sequence to resume from
+- `--tail N` -- print the last N records (a bare 'arbite stream read' prints the last 20)
+- `--json` -- JSON output (see 'Conventions' in .arbite/AGENTS.md)
+
+**`arbite stream list`** -- `arbite stream list [-h] [--json] [--sink KIND] [--root DIR] [--color WHEN]`
+
+- `--json` -- JSON output (see 'Conventions' in .arbite/AGENTS.md)
+
+**`arbite stream path`** -- `arbite stream path [-h] [--json] [--sink KIND] [--root DIR] [--color WHEN] TICKET_ID`
+
+- `TICKET_ID` -- see 'Ticket ids' under Conventions
+- `--json` -- JSON output (see 'Conventions' in .arbite/AGENTS.md)
+
+**`arbite stream clear`** -- `arbite stream clear [-h] [--all] [--json] [--sink KIND] [--root DIR] [--color WHEN] [TICKET_ID ...]`
+
+- `TICKET_ID` -- ticket ids whose streams should be cleared (omit them and pass --all)
+- `--all` -- clear every stream in .arbite/streams/
 - `--json` -- JSON output (see 'Conventions' in .arbite/AGENTS.md)
 
 **`arbite workspace`** -- `arbite workspace [-h] [--sink KIND] [--root DIR] [--color WHEN] SUBCOMMAND ...`

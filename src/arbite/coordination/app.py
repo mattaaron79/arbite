@@ -51,6 +51,7 @@ from .results import (
 )
 from .scratch import scratch_root, scratch_summary
 from .store import CoordinationStore, open_coordination_store
+from .streams import record_count, stream_summary, streams_root
 
 #: The event row's columns, pinned by the frozen transcripts (EV2, EV3, EV5): a
 #: cursor, the kind, the subject, the operation, ticket/attempt, actor and time.
@@ -338,8 +339,10 @@ class CoordinationApp:
         workspace = self.derived_workspace()
         info = self.store.info()
         scratch = scratch_summary(self.arbite_dir)
+        narration = stream_summary(self.arbite_dir)
         coordination_path = self._display_root(info.root, directory=info.kind == "file")
         scratch_path = self._display_root(scratch_root(self.arbite_dir), directory=True)
+        streams_path = self._display_root(streams_root(self.arbite_dir), directory=True)
 
         claims = (
             "no active claims"
@@ -355,6 +358,7 @@ class CoordinationApp:
             _field("store", f"{self.sink_kind} ({self.store_source})"),
             _field("coordination", f"{coordination_path}  ({coordination_summary})"),
             _field("scratch", f"{scratch_path}  ({scratch.describe()})"),
+            _field("streams", f"{streams_path}  ({narration.describe()})"),
         ]
         return succeeded(
             lines=lines,
@@ -377,6 +381,10 @@ class CoordinationApp:
                 "scratch": {
                     "root": _relative(scratch_root(self.arbite_dir), self.project_root),
                     **scratch.to_dict(),
+                },
+                "streams": {
+                    "root": _relative(streams_root(self.arbite_dir), self.project_root),
+                    **narration.to_dict(),
                 },
             },
         )
@@ -449,14 +457,18 @@ class CoordinationApp:
             return OperationResult(Outcome(EMPTY), [message, cursor_line], data, [])
         return OperationResult(Outcome(OK), rows + [cursor_line], data, [])
 
-    def doctor_facts(self) -> dict:
-        """The coordination and scratch facts `doctor` reports.
+    def doctor_facts(self, tickets=()) -> dict:
+        """The coordination, scratch and narration facts `doctor` reports.
 
-        `doctor`'s JSON names the backend it is inspecting and the scratch area's
-        size; its text keeps the existing report shape here, because the note lines
-        that render scratch in text are the scratch slice's (tic-95c0) together with
-        the guidance they carry, and the recovery slice (tic-b03b) owns reporting
-        coordination findings as problems."""
+        `doctor`'s JSON names the backend it is inspecting, the scratch area's size and
+        the narration area's; its text keeps the existing report shape here, because the
+        note lines that render scratch in text are the scratch slice's (tic-95c0)
+        together with the guidance they carry, and the recovery slice (tic-b03b) owns
+        reporting coordination findings as problems.
+
+        `tickets` is the store's tickets, needed because "in flight" is a *ticket*
+        status and the coordination store holds no statuses: the caller already read
+        them for its own checks, so passing them in beats asking a second store."""
         info = self.store.info()
         return {
             "coordination": {
@@ -464,7 +476,46 @@ class CoordinationApp:
                 "root": _relative(info.root, self.project_root),
             },
             "scratch": scratch_summary(self.arbite_dir).to_dict(),
+            "streams": stream_summary(self.arbite_dir).to_dict(),
+            "streams_missing": self._streams_missing(tickets),
         }
+
+    def _streams_missing(self, tickets) -> list:
+        """The in-flight tickets whose working attempt has narrated nothing.
+
+        Narration is suggested, never required, so this is a fact to report and not a
+        finding to fix: a ticket being worked or awaiting review is the moment somebody
+        could be watching a live feed, and an empty stream there is worth one line. A
+        ticket with no attempt at all (legacy `in_progress` work) is left out rather than
+        blamed, because there is no attempt whose quietness could be attributed."""
+        missing = []
+        for ticket in sorted(tickets, key=lambda ticket: ticket.id):
+            if ticket.status not in ("in_progress", "review"):
+                continue
+            attempt = self._stream_attempt(ticket)
+            if attempt is None:
+                continue
+            if record_count(self.arbite_dir, attempt_id=attempt.id) == 0:
+                missing.append(ticket.id)
+        return missing
+
+    def _stream_attempt(self, ticket):
+        """The attempt whose narration `ticket` would have written, if any.
+
+        While work is live that is its active attempt; once it is in review the attempt
+        that submitted it is finished, so the most recently started one is what the
+        reviewer would have watched."""
+        active = self.store.active_attempts(ticket.id)
+        if active:
+            return active[-1]
+        if ticket.status != "review":
+            return None
+        attempts = [
+            attempt for attempt in self.store.records("attempt") if attempt.ticket_id == ticket.id
+        ]
+        if not attempts:
+            return None
+        return max(attempts, key=lambda attempt: (attempt.started, attempt.id))
 
     def _display_root(self, root, directory: bool) -> str:
         """A store root as the text and JSON reports print it: project-relative

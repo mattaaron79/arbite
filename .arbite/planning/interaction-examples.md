@@ -136,6 +136,7 @@ root:      /media/matt/m2tb/projects/arbite
 store:     file (sink: file in .arbite/project.yaml)
 coordination: .arbite/coordination/  (2 active claims, 31 events, 14 receipts)
 scratch:   .arbite/scratch/  (1 file, 4.1 KiB)
+streams:   .arbite/streams/  (no streams)
 # exit 0
 ```
 
@@ -154,6 +155,7 @@ root:      /media/matt/m2tb/projects/arbite
 store:     file (sink: file in .arbite/project.yaml)
 coordination: .arbite/coordination/  (no active claims, 31 events, 14 receipts)
 scratch:   .arbite/scratch/  (empty)
+streams:   .arbite/streams/  (no streams)
 # exit 0
 ```
 
@@ -169,6 +171,7 @@ scratch:   .arbite/scratch/  (empty)
 $ arbite claim tic-cf9f --agent claude.opus.001
 claimed tic-cf9f for claude.opus.001 -> .arbite/in_progress/tic-cf9f.md
 attempt: att-91bd (generation 1, ticket tic-cf9f, workspace ws-7c41)
+stream: /media/matt/m2tb/projects/arbite/.arbite/streams/tic-cf9f.jsonl (write with 'arbite stream write tic-cf9f -')
 next: claim the files you will change -- 'arbite file claim <path>... --ticket tic-cf9f --attempt att-91bd'
 # exit 0
 ```
@@ -181,6 +184,8 @@ JSON (abridged, showing the added fields):
   "path": ".arbite/in_progress/tic-cf9f.md",
   "attempt": {"id": "att-91bd", "generation": 1, "state": "active",
               "workspace": "ws-7c41", "started": "2026-09-21T13:12:04Z"},
+  "stream": {"path": "/media/matt/m2tb/projects/arbite/.arbite/streams/tic-cf9f.jsonl",
+             "write": "arbite stream write tic-cf9f -"},
   "next_actions": ["arbite file claim <path>... --ticket tic-cf9f --attempt att-91bd"]
 }
 ```
@@ -258,6 +263,7 @@ claimed tic-cf9f for claude.haiku.003 -> .arbite/in_progress/tic-cf9f.md (taken 
 revoked: attempt att-91bd generation 1 (reason recorded); its 2 file claims were released
 released: src/arbite/schema.py, src/arbite/sinks/base.py (partial work left on disk: 1 file modified)
 new attempt: att-c50e (generation 1)
+stream: /media/matt/m2tb/projects/arbite/.arbite/streams/tic-cf9f.jsonl (write with 'arbite stream write tic-cf9f -')
 # exit 0
 ```
 
@@ -1106,7 +1112,8 @@ $ arbite doctor --json
   "coordination": {"kind": "file", "root": ".arbite/coordination",
                    "claims_active": 2, "events": 31, "pending_operations": 1},
   "tickets_checked": 22, "problems": [], "fixed": 0, "remaining": 0,
-  "scratch": {"files": 3, "bytes": 12700}
+  "scratch": {"files": 3, "bytes": 12700},
+  "streams": {"files": 0, "bytes": 0}, "streams_missing": []
 }
 # exit 0
 ```
@@ -1122,6 +1129,7 @@ $ arbite doctor --json
 $ arbite list next --claim claude.opus.001
 claimed tic-cf9f -> .arbite/in_progress/tic-cf9f.md
 attempt: att-91bd
+stream: /media/matt/m2tb/projects/arbite/.arbite/streams/tic-cf9f.jsonl (write with 'arbite stream write tic-cf9f -')
                                                       $ arbite list next --claim claude.sonnet.002
                                                       tic-9b57  open  ...  (tic-cf9f not offered: attempted)
 $ arbite file claim src/arbite/schema.py --ticket tic-cf9f --attempt att-91bd
@@ -1187,6 +1195,134 @@ about what arbite enforces, not about what it wishes were true.
 
 ---
 
+# ST — narration streams
+
+`arbite stream` is the per-ticket narration log: one JSONL file per ticket under
+`.arbite/streams/`, written only through `stream write` and read back with `stream read`
+using cursor semantics borrowed from the event stream. The records are prose about the work
+— what is being read, tried, seen — which is why they are neither `arbite note` (a
+milestone appended to the ticket body, which costs a ticket rewrite) nor `arbite events`
+(structured coordination facts).
+
+## ST1 · narrate a ticket, and read the stream
+
+```sh
+$ arbite stream write tic-cf9f "reading the sink's ticket scan"
+wrote 1 record to .arbite/streams/tic-cf9f.jsonl (seq 1)
+# exit 0
+```
+
+```sh
+$ arbite stream write tic-cf9f -
+wrote 2 record(s) to .arbite/streams/tic-cf9f.jsonl (seq 2..3)
+# exit 0
+```
+
+```sh
+$ arbite stream read tic-cf9f
+1   06:12:04  claude.opus.001   thought reading the sink's ticket scan
+2   06:12:04  claude.opus.001   thought a stream file's stem matches the ticket pattern, so the scan has to skip it
+3   06:12:04  claude.opus.001   thought added 'streams' to RESERVED_DIRS
+4   06:12:04  claude.opus.001   result  arbite list no longer reports a phantom ticket
+cursor: 4 (resume with 'arbite stream read tic-cf9f --after 4')
+# exit 0
+```
+
+*target:* a worker narrates with a line argument or, as in the second fence, by
+piping its own output through `-` (one record per line, blank lines dropped), and
+the records are attributed to the ticket's active attempt. The read prints one row
+per record with its sequence and the sequence to resume from, so a dashboard can
+tail the file without parsing prose.
+
+## ST2 · resume a poll with `--after`
+
+```sh
+$ arbite stream read tic-cf9f --after 2
+3   06:12:04  claude.opus.001   thought added 'streams' to RESERVED_DIRS
+4   06:12:04  claude.opus.001   result  arbite list no longer reports a phantom ticket
+cursor: 4 (resume with 'arbite stream read tic-cf9f --after 4')
+# exit 0
+```
+
+```sh
+$ arbite stream read tic-cf9f --after 4
+no stream for tic-cf9f since seq 4
+# exit 2
+```
+
+*target:* `--after SEQ` is the poll and `--tail N` bootstraps from the end; the two
+are alternatives. "Nothing new" is exit 2 rather than an error, the rule
+`arbite events --after` already follows, so a watcher branches on the code instead
+of matching text.
+
+## ST3 · what is recording, and where the file is
+
+```sh
+$ arbite stream list
+1 stream(s) in .arbite/streams/:
+  tic-cf9f   4 record(s)  822 B  last 06:12:04 by claude.opus.001
+# exit 0
+```
+
+```sh
+$ arbite stream path tic-cf9f
+/media/matt/m2tb/projects/arbite/.arbite/streams/tic-cf9f.jsonl
+# exit 0
+```
+
+*target:* the listing names which tickets are narrating and how far each got; the
+path is absolute because it is a file to `tail -f`, and it is printed whether or not
+anything has been written yet.
+
+## ST4 · clear narration
+
+```sh
+$ arbite stream clear tic-cf9f
+cleared .arbite/streams/tic-cf9f.jsonl (4 record(s), 822 B)
+next: 'arbite stream list' to see what remains
+# exit 0
+```
+
+```sh
+$ arbite stream clear --all
+cleared 0 streams from .arbite/streams/ (nothing was recorded)
+# exit 0
+```
+
+*target:* retention is explicit -- nothing prunes a stream automatically, and this
+is the documented way to. Clearing one ticket reads as a sentence about that file
+and hands back the listing; `--all` on an empty area is an honest zero rather than
+an error, and the area's lock file is not a stream and is never cleared.
+
+## ST5 · refuse narration for a ticket nobody is working
+
+```sh
+$ arbite stream write tic-cf9f "cannot narrate"
+error: ticket tic-cf9f is not being worked (no active attempt); claim it first with 'arbite claim <id> --agent <you>'
+# exit 1
+```
+
+*target:* a record names the attempt that was working, so writing one without an
+active attempt is refused before anything is written -- the fix is to claim the
+ticket, not to narrate harder.
+
+## ST6 · `submit` says so when nothing was narrated
+
+```sh
+$ arbite submit tic-cf9f
+submitted tic-cf9f -> .arbite/review/tic-cf9f.md (review)
+ended attempt att-91bd (finished)
+partial work is left on disk and visible; the next worker must re-read it
+note: attempt att-91bd recorded no stream entries (narrate with 'arbite stream write tic-cf9f -')
+# exit 0
+```
+
+*target:* narration is suggested, never required: the ticket is submitted either
+way, and the ending attempt's silence is one `note:` line pointing at the command
+that would have filled the gap. `close` and `accept` do not gate at all.
+
+---
+
 # Scenario to ticket map
 
 | Ticket | Key | Scenarios that must pass |
@@ -1206,6 +1342,7 @@ about what arbite enforces, not about what it wishes were true.
 | Add passthrough command observation | C13 | PC1, PC5, PC6 |
 | Add passthrough guarded mode | C14 | PC2, PC3, PC4 |
 | Validate and document the shared-directory proxy workflow | C15 | BY1, BY3, all exit codes, full-suite conformance |
+| Add per-ticket narration streams (`arbite stream`) | — | ST1, ST2, ST3, ST4, ST5, ST6 |
 
 The wishlist ticket for mandating passthrough carries no scenarios yet by design;
 it is a policy question, not a behaviour.

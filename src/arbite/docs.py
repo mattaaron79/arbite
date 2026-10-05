@@ -131,6 +131,7 @@ Use your session to classify all tickets with `arbite promote <id> --title ... -
 
 ```bash
 arbite claim <id> --agent <your-id>        # take it: status -> in_progress
+arbite stream write <id> -                 # narrate as you work (piped from your output)
 arbite note <id> <your-id> "what changed"  # log progress as you go
 arbite submit <id>                         # finish: status -> review, assignee kept
 arbite accept <id> --agent <reviewer-id>   # the reviewer closes it, credited to them
@@ -191,10 +192,12 @@ ARBITE_GITIGNORE_END = "# END ARBITE GITIGNORE"
 ARBITE_GITIGNORE_BLOCK = """\
 # BEGIN ARBITE GITIGNORE
 # Runtime state arbite writes beside the tickets: coordination claims/attempts/
-# events, scratch payloads, and any sqlite store (sidecars included). Tickets and
-# the generated docs are the development record; these are local evidence.
+# events, scratch payloads, per-ticket narration streams, and any sqlite store
+# (sidecars included). Tickets and the generated docs are the development record;
+# these are local evidence.
 /.arbite/coordination/
 /.arbite/scratch/
+/.arbite/streams/
 /.arbite/arbite.db*
 # END ARBITE GITIGNORE"""
 
@@ -328,6 +331,7 @@ WORKSPACE_COMMANDS = (
     "changes",
     "cmd",
     "events",
+    "stream",
     "workspace",
     "attempt",
 )
@@ -759,6 +763,7 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("arbite move tic-a1b2 /wishlist                        # file a reclassified wish by hand")
     add("arbite show tic-a1b2                                  # read it in full")
     add("arbite claim tic-a1b2 --agent claude.haiku.001        # take it (status -> in_progress)")
+    add("arbite stream write tic-a1b2 -                         # narrate as you work (live tail)")
     add('arbite note tic-a1b2 claude.haiku.001 "progress"      # ...do the work, log progress...')
     add('arbite block tic-a1b2 --reason "waiting on tic-c3d4"  # if stalled')
     add("arbite unblock tic-a1b2 --agent claude.haiku.001      # blocker cleared")
@@ -778,6 +783,17 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "`arbite bug|feature|request|memo|wish <message>` == `arbite raw <type> <message>`: the "
         "same raw ticket from a shorter command. Any command takes `-h`/`--help`, which is where "
         "its flags are documented (the reference below is a name and a purpose, not a flag list)."
+    )
+    add("")
+
+    # -- Narration ---------------------------------------------------------
+    add("## Narration streams")
+    add("")
+    add(
+        "A worker narrates as it goes with `arbite stream write <id> -` (or a line argument); "
+        "records land in `.arbite/streams/<id>.jsonl`, gitignored, and a dashboard polls them "
+        "with `arbite stream read <id> --after <seq>`. This is per-ticket prose, distinct from "
+        "`arbite events`, which is the coordination fact stream."
     )
     add("")
 
@@ -914,7 +930,8 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         "command updates `status`/`updated` together, and `block`, `shelve`, `release`, "
         "`unblock`, `reopen` and `unshelve` also append an automatic timestamped note. The "
         "workspace commands -- `file`, `scratch`, `receipt`, `changes`, `cmd`, `events`, "
-        "`workspace` and `attempt` -- are documented flag by flag in `.arbite/WORKSPACE.md`."
+        "`stream`, `workspace` and `attempt` -- are documented flag by flag in "
+        "`.arbite/WORKSPACE.md`."
     )
     add("")
     lines.extend(_command_index_lines(parser))
@@ -962,9 +979,9 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         add(
             f"**Not available in this project:** the active `{sink_kind}` sink has no coordination "
             "backend, so `arbite file ...`, `arbite cmd`, `arbite receipt`, `arbite changes`, "
-            "`arbite events`, `arbite workspace` and `arbite attempt` refuse rather than pretend "
-            "(exit 1, naming the sink). Everything outside the proxy -- tickets, statuses, the "
-            "workflow above -- works normally."
+            "`arbite events`, `arbite stream`, `arbite workspace` and `arbite attempt` refuse "
+            "rather than pretend (exit 1, naming the sink). Everything outside the proxy -- "
+            "tickets, statuses, the workflow above -- works normally."
         )
         add("")
 
@@ -1018,10 +1035,10 @@ def render_workspace(parser, subparsers_by_name: dict, active_info=None, stale_i
         add(
             f"**Not available in this project:** the active `{sink_kind}` sink has no coordination "
             "backend, so `arbite file ...`, `arbite cmd`, `arbite receipt`, `arbite changes`, "
-            "`arbite events`, `arbite workspace` and `arbite attempt` refuse rather than pretend "
-            "(exit 1, naming the sink). Everything outside the proxy -- tickets, statuses, the "
-            "workflow in `.arbite/AGENTS.md` -- works normally, so there is no workspace contract "
-            "to describe here."
+            "`arbite events`, `arbite stream`, `arbite workspace` and `arbite attempt` refuse "
+            "rather than pretend (exit 1, naming the sink). Everything outside the proxy -- "
+            "tickets, statuses, the workflow in `.arbite/AGENTS.md` -- works normally, so there is "
+            "no workspace contract to describe here."
         )
         add("")
         return _ANSI_RE.sub("", "\n".join(lines)) + "\n"
@@ -1129,6 +1146,12 @@ def render_workspace(parser, subparsers_by_name: dict, active_info=None, stale_i
         "stream, one line per event, in cursor order; reads are excluded unless asked for, and "
         "`--follow` is refused because arbite never blocks -- poll with `--after <cursor>`, where "
         "'nothing new' is exit 2 rather than an error"
+    )
+    add(
+        "- `arbite stream read <id> [--after SEQ | --tail N]` -- the narration stream a worker "
+        "writes as it works, one record per line; poll with `--after`, where 'nothing new' is "
+        "exit 2, and `arbite stream list` / `arbite stream path <id>` show what is recording and "
+        "where the file is"
     )
     add(
         "- `arbite scratch list` / `arbite scratch clear [NAME...] [--all]` -- what is staged as "

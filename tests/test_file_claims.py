@@ -375,6 +375,7 @@ def test_protected_paths_are_refused_by_name(tmp_path):
         ".git/config": "arbite does not manage .git metadata",
         ".arbite/coordination/claims/clm-1234.json": "arbite does not manage its own runtime state",
         ".arbite/scratch/payload.py": "arbite does not manage its own runtime state",
+        ".arbite/streams/tic-a1b2.jsonl": "arbite does not manage its own runtime state",
         ".arbite/project.yaml": "arbite does not manage its own configuration",
     }
 
@@ -384,6 +385,38 @@ def test_protected_paths_are_refused_by_name(tmp_path):
         assert f"'{raw}' is protected: {expected}" in proc.stderr, raw
 
     assert store_for(project).records("claim") == []
+
+
+def test_the_stream_area_is_refused_for_reads_and_writes_too(tmp_path):
+    """A narration record is runtime state for every operation, not only a claim: a read
+    and a write are refused by the same path rule, before a token or a payload is looked
+    at."""
+    project = claims.holder_project(tmp_path)
+    (project / ".arbite" / "scratch" / "payload.txt").write_text("narration\n", encoding="utf-8")
+    stream = ".arbite/streams/tic-a1b2.jsonl"
+
+    read = examples.run_cli(project, "file", "read", stream)
+    written = examples.run_cli(
+        project,
+        "file",
+        "write",
+        stream,
+        "--ticket",
+        HOLDER_TICKET,
+        "--attempt",
+        HOLDER,
+        "--input",
+        "payload.txt",
+    )
+
+    for refused in (read, written):
+        assert refused.returncode == 1, (refused.stdout, refused.stderr)
+        assert (
+            f"'{stream}' is protected: arbite does not manage its own runtime state"
+            in refused.stderr
+        )
+
+    assert store_for(project).records("observation") == []
 
 
 def test_directories_and_special_files_are_not_claimable(tmp_path):

@@ -92,6 +92,7 @@ arbite promote tic-a1b2 --agent claude.haiku.001      # ...or classify and claim
 arbite move tic-a1b2 /wishlist                        # file a reclassified wish by hand
 arbite show tic-a1b2                                  # read it in full
 arbite claim tic-a1b2 --agent claude.haiku.001        # take it (status -> in_progress)
+arbite stream write tic-a1b2 -                         # narrate as you work (live tail)
 arbite note tic-a1b2 claude.haiku.001 "progress"      # ...do the work, log progress...
 arbite block tic-a1b2 --reason "waiting on tic-c3d4"  # if stalled
 arbite unblock tic-a1b2 --agent claude.haiku.001      # blocker cleared
@@ -108,6 +109,10 @@ arbite migrate --to sqlite                            # copy every ticket into a
 ```
 
 `arbite bug|feature|request|memo|wish <message>` == `arbite raw <type> <message>`: the same raw ticket from a shorter command. Any command takes `-h`/`--help`, which is where its flags are documented (the reference below is a name and a purpose, not a flag list).
+
+## Narration streams
+
+A worker narrates as it goes with `arbite stream write <id> -` (or a line argument); records land in `.arbite/streams/<id>.jsonl`, gitignored, and a dashboard polls them with `arbite stream read <id> --after <seq>`. This is per-ticket prose, distinct from `arbite events`, which is the coordination fact stream.
 
 ## Triage: raw tickets, wishes, filing
 
@@ -146,7 +151,7 @@ esac
 
 ## Commands
 
-Rendered from the installed version's own parsers, so it always matches the CLI: name and purpose here, flags and the longer descriptions in `arbite <cmd> -h` (the README documents every command in full). Every command accepts `--sink <kind>`; every status command updates `status`/`updated` together, and `block`, `shelve`, `release`, `unblock`, `reopen` and `unshelve` also append an automatic timestamped note. The workspace commands -- `file`, `scratch`, `receipt`, `changes`, `cmd`, `events`, `workspace` and `attempt` -- are documented flag by flag in `.arbite/WORKSPACE.md`.
+Rendered from the installed version's own parsers, so it always matches the CLI: name and purpose here, flags and the longer descriptions in `arbite <cmd> -h` (the README documents every command in full). Every command accepts `--sink <kind>`; every status command updates `status`/`updated` together, and `block`, `shelve`, `release`, `unblock`, `reopen` and `unshelve` also append an automatic timestamped note. The workspace commands -- `file`, `scratch`, `receipt`, `changes`, `cmd`, `events`, `stream`, `workspace` and `attempt` -- are documented flag by flag in `.arbite/WORKSPACE.md`.
 
 - `init` -- create the arbite directory and initialise the selected sink
 - `sink` -- show or initialise the active sink
@@ -158,6 +163,7 @@ Rendered from the installed version's own parsers, so it always matches the CLI:
 - `changes` -- show what a ticket changed: the net per attempt, and the ordered log
 - `cmd` -- run a command and record the changes it is observed to make (passthrough)
 - `events` -- read the coordination event stream: what happened, one line per event
+- `stream` -- narrate as you work: the per-ticket stream of thought a dashboard tails
 - `status` -- count tickets per status (the shape of the backlog, not 'set status')
 - `progress` -- show live epics: what is in flight, plus the epic's other tickets
 - `create` -- create a new ticket in the open status

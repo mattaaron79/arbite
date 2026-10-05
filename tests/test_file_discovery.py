@@ -71,16 +71,27 @@ def test_the_generated_documents_are_not_tickets(tmp_path):
 
 
 def test_the_coordination_tree_and_the_store_are_invisible(tmp_path):
-    """arbite's runtime state is not discovery's surface, however it is reached."""
+    """arbite's runtime state is not discovery's surface, however it is reached.
+
+    The narration streams are runtime state too, so a listing of the arbite root skips
+    them exactly as it skips `coordination/`, and a stream file -- whose stem matches
+    `ID_PATTERN`, like a ticket -- is not a phantom ticket in the walk."""
     project = state.listing_project(tmp_path)
+    (project / ".arbite" / "streams").mkdir(parents=True, exist_ok=True)
+    (project / ".arbite" / "streams" / "tic-a1b2.jsonl").write_text(
+        '{"seq": 1}\n', encoding="utf-8"
+    )
 
     walked = examples.run_cli(project, "file", "list", ".")
     named = examples.run_cli(project, "file", "list", ".arbite/coordination")
+    streamed = examples.run_cli(project, "file", "list", ".arbite/streams")
     searched = examples.run_cli(project, "file", "search", "claim", ".arbite/coordination/claims")
+    stream_search = examples.run_cli(project, "file", "search", "seq", ".arbite/streams")
 
     assert walked.returncode == 0, walked.stderr
     assert "coordination" not in walked.stdout
-    for refused in (named, searched):
+    assert "streams" not in walked.stdout
+    for refused in (named, streamed, searched, stream_search):
         assert refused.returncode == 1, refused.stdout
         assert "arbite does not manage its own runtime state" in refused.stderr
 

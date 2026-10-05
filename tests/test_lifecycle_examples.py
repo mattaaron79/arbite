@@ -87,6 +87,9 @@ def test_CL1_the_json_payload_carries_the_attempt(claimable_project):
     assert set(expected["attempt"]) <= set(payload["attempt"])
     for key, value in expected["attempt"].items():
         assert payload["attempt"][key] == value, key
+    # The narration stream is one of the fields a claim hands back: the file a dashboard
+    # would tail, and the command that writes to it.
+    assert payload["stream"] == expected["stream"]
     assert payload["next_actions"] == expected["next_actions"]
 
 

@@ -45,16 +45,17 @@ from .results import REFUSAL_INDENT
 from .scratch import SCRATCH_DIRNAME, human_size
 
 #: The names arbite protects. `.git` is VCS metadata rather than content; the
-#: coordination and scratch trees are runtime state (a claim record is not a file a
-#: writer may claim, and a payload is transport that authorises nothing); the store
-#: files and `project.yaml` are arbite's own state and configuration, which describe
-#: the workspace rather than belonging to the work in it. Tickets, plan documents and
+#: coordination, scratch and streams trees are runtime state (a claim record is not a
+#: file a writer may claim, a payload is transport that authorises nothing, and a
+#: narration record is prose about the work, not the work); the store files and
+#: `project.yaml` are arbite's own state and configuration, which describe the
+#: workspace rather than belonging to the work in it. Tickets, plan documents and
 #: agent scratchpads under `.arbite/` are *not* protected here: they are documents,
 #: and whether the proxy should list or read them is the discovery slice's question
 #: (tic-1c4f), not a path rule.
 GIT_METADATA_DIRNAME = ".git"
 ARBITE_DIRNAME = ".arbite"
-PROTECTED_ARBITE_DIRS = ("coordination", "scratch")
+PROTECTED_ARBITE_DIRS = ("coordination", "scratch", "streams")
 PROTECTED_ARBITE_FILES = ("project.yaml",)
 PROTECTED_ARBITE_PREFIXES = ("arbite.db",)
 

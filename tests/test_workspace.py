@@ -69,6 +69,10 @@ def test_init_records_the_workspace_binding_and_the_layout(project):
     assert (project / ".arbite" / "scratch").is_dir()
 
     if sink_kind == "file":
+        # The file sink's layout creates every RESERVED_DIRS entry, streams among
+        # them; a SQLite project has no file layout, and the streams module makes
+        # the directory lazily on the first write.
+        assert (project / ".arbite" / "streams").is_dir()
         for name in ("claims", "events", "receipts", "artifacts", "attempts", "observations"):
             assert (project / ".arbite" / "coordination" / name).is_dir(), name
 

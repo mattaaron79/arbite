@@ -39,9 +39,11 @@ from .coordination import reads as coordination_reads
 from .coordination import recovery as coordination_recovery
 from .coordination import results as outcomes
 from .coordination import scratch as coordination_scratch
+from .coordination import streams as coordination_streams
 from .coordination import writes as coordination_writes
 from .coordination.scratch import ensure_scratch_dir, note_lines, scratch_summary
 from .coordination.store import open_coordination_store
+from .coordination.streams import stream_note_lines, stream_summary
 from .errors import ArbiteError, Busy, Conflict, NotReady, TicketError, UsageRefused
 from .query import TicketQuery, TextMatch, apply_limit, resolve_terms
 from .schema import CLASSIFICATION_EPIC, STATUSES, TIERS, Ticket
@@ -745,9 +747,10 @@ def cmd_init(args):
                 "left unchanged"
             )
 
-    # --gitignore installs the runtime-state entries (coordination/, scratch/, any
-    # sqlite store and its sidecars) into ./.gitignore, so the directories this
-    # command just created -- which the tree never asked for -- do not dirty it.
+    # --gitignore installs the runtime-state entries (coordination/, scratch/,
+    # streams/, any sqlite store and its sidecars) into ./.gitignore, so the
+    # directories this command just created -- which the tree never asked for --
+    # do not dirty it.
     # Appended rather than prepended: git's last match wins, and arbite's lines
     # should not get to override a project's later decisions.
     if getattr(args, "gitignore", False):
@@ -1490,6 +1493,7 @@ def cmd_promote(args):
             f"attempt: {attempt.id} (generation {attempt.generation}, ticket {t.id}, "
             f"workspace {attempt.workspace_id})"
         )
+        print(lifecycle.stream_line(t.id))
         print(lifecycle.file_hint_text(t.id, attempt.id))
 
 
@@ -2322,6 +2326,120 @@ def cmd_scratch_clear(args):
         sys.exit(result.exit_code)
 
 
+def _stream_texts(args):
+    """The lines `arbite stream write` will record, from its arguments or stdin.
+
+    `-` reads stdin and records one line per line, because a worker narrating as it
+    goes pipes its own output rather than quoting one long argument; blank lines are
+    dropped, since an empty record says nothing and would only spend a sequence. Any
+    other arguments are joined into one line, so an unquoted sentence records as the
+    sentence it was meant to be. Nothing at all is refused rather than recorded."""
+    if args.message == ["-"]:
+        texts = [line for line in sys.stdin.read().splitlines() if line.strip()]
+    elif args.message:
+        texts = [" ".join(args.message)]
+    else:
+        texts = []
+    if not texts:
+        raise TicketError("nothing to write (pass TEXT, or '-' to read from stdin)")
+    return texts
+
+
+def cmd_stream_write(args):
+    """Narrate one line into a ticket's stream, attributed to the attempt working it.
+
+    Anyone may read a stream; writing one is the *working* attempt's business, so this
+    requires an active attempt and takes the actor from it unless `--actor` overrides
+    the attribution. That is why there is no token or claim here: a stream record
+    changes no project bytes and authorises nothing, so the only invariant worth
+    enforcing is that the narration belongs to somebody who is really working the
+    ticket."""
+    sink = _require_sink(args)
+    ticket = sink.get(args.id, unique=True)
+    app = _coordination_app(args, sink)
+    active = app.store.active_attempts(ticket.id)
+    if not active:
+        raise TicketError(
+            f"ticket {ticket.id} is not being worked (no active attempt); claim it first "
+            "with 'arbite claim <id> --agent <you>'"
+        )
+    if len(active) > 1:
+        raise TicketError(
+            f"ticket {ticket.id} has {len(active)} active attempts "
+            f"({', '.join(attempt.id for attempt in active)}); stream with '--actor' and "
+            "the exact attempt in mind is ambiguous, so record which one first"
+        )
+    attempt = active[0]
+    result = coordination_streams.stream_write(
+        app.arbite_dir,
+        ticket.id,
+        attempt.id,
+        args.actor or attempt.worker_id,
+        args.kind,
+        _stream_texts(args),
+    )
+    _emit_result(result, getattr(args, "json", False))
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
+def cmd_stream_read(args):
+    """Read a ticket's narration: one line per record, and the sequence to resume from.
+
+    The poll surface a dashboard uses. One-shot by construction -- there is no
+    `--follow` -- so a watcher keeps its own cursor and calls again, and "nothing new
+    since that sequence" is exit 2 rather than an error, so a loop can branch on the
+    code without parsing prose."""
+    sink = _require_sink(args)
+    ticket = sink.get(args.id, unique=True)
+    app = _coordination_app(args, sink)
+    result = coordination_streams.stream_read(
+        app.arbite_dir, ticket.id, after=args.after, tail=args.tail
+    )
+    _emit_result(result, getattr(args, "json", False))
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
+def cmd_stream_list(args):
+    """Report which tickets are narrating, and how far each one got."""
+    sink = _require_sink(args)
+    app = _coordination_app(args, sink)
+    result = coordination_streams.stream_list(app.arbite_dir)
+    _emit_result(result, getattr(args, "json", False))
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
+def cmd_stream_path(args):
+    """Print where one ticket's stream is, so a shell can tail it.
+
+    The absolute path rather than the report-relative one, because the point of the
+    command is to hand the file to something else."""
+    sink = _require_sink(args)
+    ticket = sink.get(args.id, unique=True)
+    app = _coordination_app(args, sink)
+    result = coordination_streams.stream_path_result(app.arbite_dir, ticket.id)
+    _emit_result(result, getattr(args, "json", False))
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
+def cmd_stream_clear(args):
+    """Delete narration deliberately: the named tickets' streams, or all of them.
+
+    The documented prune. A ticket id that has no stream is refused with the listing
+    that shows what is really recorded, and `--all` on an empty area reports an honest
+    zero -- the shape `arbite scratch clear` has, because both are areas a human
+    tidies by hand."""
+    sink = _require_sink(args)
+    app = _coordination_app(args, sink)
+    result = coordination_streams.stream_clear(app.arbite_dir, args.ids, all_=args.all)
+    _emit_result(result, getattr(args, "json", False))
+    if result.exit_code:
+        sys.exit(result.exit_code)
+
+
 def cmd_close(args):
     """Close a ticket: the end of its work as well as of its status.
 
@@ -2852,17 +2970,19 @@ def cmd_doctor(args):
     # The scratch area is *reported*, not judged: a leftover payload is what an interrupted
     # run leaves and the only copy of a change somebody may still need, so it is a fact about
     # the store rather than a problem with it, and it never changes the exit code by itself.
+    # The narration area is reported the same way, plus the in-flight tickets that stayed
+    # quiet -- narration is suggested, so a silent worker is a fact and never a problem.
+    facts = app.doctor_facts(tickets)
     notes = note_lines(
         scratch_summary(app.arbite_dir),
         guidance=not args.fix,
         clear_command="scratch clear" if knows_command("scratch clear") else None,
-    )
+    ) + stream_note_lines(stream_summary(app.arbite_dir), facts["streams_missing"])
 
     if args.json:
         # Which coordination backend is in use, and what is in it, is part of the report
         # because a project whose tickets and whose claims live in different places needs to
         # be able to say so out loud.
-        facts = app.doctor_facts()
         _print_json(
             {
                 "sink": {"kind": info.kind, "root": info.root},
@@ -2872,6 +2992,8 @@ def cmd_doctor(args):
                 "fixed": fixed,
                 "remaining": remaining,
                 "scratch": facts["scratch"],
+                "streams": facts["streams"],
+                "streams_missing": facts["streams_missing"],
             }
         )
     else:
@@ -3117,8 +3239,8 @@ def build_parser():
         "for you) and .arbite/WORKSPACE.md (the file-proxy and workspace-command reference the "
         "guide points at), and pre-create a scratchpad file under .arbite/agents/ "
         "for every id listed in an 'agents:' list in .arbite/project.yaml, if present. Pass "
-        "--gitignore to also install the runtime-state entries (coordination/, scratch/, any "
-        "sqlite store) into ./.gitignore. Which sink is "
+        "--gitignore to also install the runtime-state entries (coordination/, scratch/, "
+        "streams/, any sqlite store) into ./.gitignore. Which sink is "
         "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
         "in .arbite/project.yaml, then file. The store it creates then becomes the project default -- "
         "'sink:' is written to .arbite/project.yaml, created if it does not exist, so no later command "
@@ -3145,7 +3267,7 @@ def build_parser():
         "--gitignore",
         action="store_true",
         help="create ./.gitignore with the arbite runtime-state entries "
-        "(coordination/, scratch/, any sqlite store and its sidecars), or install "
+        "(coordination/, scratch/, streams/, any sqlite store and its sidecars), or install "
         "them into an existing one as a marked section that re-runs refresh in "
         "place, so the state this command creates does not dirty the tree",
     )
@@ -3889,6 +4011,144 @@ def build_parser():
     _json_flag(p_events)
     _sink_flag(p_events)
     p_events.set_defaults(func=cmd_events)
+
+    p_stream = sub.add_parser(
+        "stream",
+        help="narrate as you work: the per-ticket stream of thought a dashboard tails",
+        description="Each ticket has its own append-only narration stream at "
+        "`.arbite/streams/<ticket_id>.jsonl`, one JSON record per line, written only "
+        "through `stream write`: free-form prose about the work -- what is being read, "
+        "tried, seen -- which is deliberately not the same thing as `arbite events` "
+        "(structured coordination facts) or `arbite note` (a milestone appended to the "
+        "ticket body, which costs a ticket rewrite). The area is gitignored runtime "
+        "state and is invisible to discovery, scanning and claims. `write TEXT` records "
+        "one line and `write -` reads one record per stdin line, attributing them to the "
+        "ticket's active attempt; `read` prints records with their sequence and the "
+        "sequence to resume from (`--after SEQ` to poll, `--tail N` to bootstrap, and "
+        "'nothing new' exits 2); `list` shows which tickets are narrating; `path` prints "
+        "the file for a tail; and `clear` is the documented prune.",
+    )
+    stream_sub = p_stream.add_subparsers(
+        dest="stream_action", required=True, metavar="SUBCOMMAND"
+    )
+    _sink_flag(p_stream)
+
+    p_stream_write = stream_sub.add_parser(
+        "write",
+        help="record narration for a ticket (TEXT, or '-' to read one record per stdin line)",
+        description="Append one record per line to a ticket's stream, and report the "
+        "sequences written. The ticket must have an active attempt -- narration belongs "
+        "to the work being done -- and the record is attributed to that attempt's worker "
+        "unless `--actor` says otherwise. Arbite records attribution, never "
+        "authentication: a stream is prose about the work, and no record authorises "
+        "anything.",
+    )
+    p_stream_write.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_stream_write.add_argument(
+        "message",
+        nargs="*",
+        metavar="TEXT",
+        help="the line to record; '-' reads stdin (one record per line)",
+    )
+    p_stream_write.add_argument(
+        "--kind",
+        choices=coordination_streams.STREAM_KINDS,
+        default=coordination_streams.DEFAULT_KIND,
+        help="what the record is: a thought (default), an action taken, or a result",
+    )
+    p_stream_write.add_argument(
+        "--actor",
+        metavar="AGENT_ID",
+        default=None,
+        help="who to attribute the record to (default: the active attempt's worker); "
+        "arbite records attribution, never authentication",
+    )
+    _json_flag(p_stream_write)
+    _sink_flag(p_stream_write)
+    p_stream_write.set_defaults(func=cmd_stream_write)
+
+    p_stream_read = stream_sub.add_parser(
+        "read",
+        help="print a ticket's narration with the sequence to resume from (exit 2 when "
+        "nothing is new)",
+        description="Print a ticket's stream in sequence order: one line per record with "
+        "its sequence, local time, actor and kind, then the sequence to resume from. A "
+        "bare read prints the last "
+        f"{coordination_streams.DEFAULT_STREAM_TAIL} records; `--after SEQ` prints "
+        "everything after that sequence, which is how a poll resumes and is the same "
+        "'nothing new exits 2' rule `arbite events` follows; `--tail N` bootstraps from "
+        "the end. The command is one-shot: a watcher keeps its own cursor and calls "
+        "again.",
+    )
+    p_stream_read.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    p_stream_read.add_argument(
+        "--after",
+        type=int,
+        metavar="SEQ",
+        default=None,
+        help="print records after this sequence, and report the sequence to resume from",
+    )
+    p_stream_read.add_argument(
+        "--tail",
+        type=int,
+        metavar="N",
+        default=None,
+        help=f"print the last N records (a bare 'arbite stream read' prints the last "
+        f"{coordination_streams.DEFAULT_STREAM_TAIL})",
+    )
+    _json_flag(p_stream_read)
+    _sink_flag(p_stream_read)
+    p_stream_read.set_defaults(func=cmd_stream_read)
+
+    p_stream_list = stream_sub.add_parser(
+        "list",
+        help="show which tickets have a stream, and how far each one got (exit 2 when "
+        "there are none)",
+        description="List every ticket with narration in `.arbite/streams/`, in ticket "
+        "id order: how many records it holds, how big it is, and when and by whom the "
+        "last one was written. Nothing recorded exits 2, which is the normal state of a "
+        "project whose workers have not narrated yet.",
+    )
+    _json_flag(p_stream_list)
+    _sink_flag(p_stream_list)
+    p_stream_list.set_defaults(func=cmd_stream_list)
+
+    p_stream_path = stream_sub.add_parser(
+        "path",
+        help="print the absolute path of a ticket's stream, for tailing",
+        description="Print the absolute path of a ticket's stream file, so a shell can "
+        "`tail -f` it or a dashboard can read it in place. The path is printed even when "
+        "nothing has been written yet: the file is where the next record will land.",
+    )
+    p_stream_path.add_argument("id", metavar="TICKET_ID", help=TICKET_ID_HELP)
+    _json_flag(p_stream_path)
+    _sink_flag(p_stream_path)
+    p_stream_path.set_defaults(func=cmd_stream_path)
+
+    p_stream_clear = stream_sub.add_parser(
+        "clear",
+        help="delete narration: the named tickets' streams, or every stream with --all",
+        description="Delete stream files from `.arbite/streams/`, deliberately: this is "
+        "the prune the documentation names, and nothing else removes narration. A "
+        "named clear prints a sentence about the file it cleared and hands back `arbite "
+        "stream list`; `--all` reports how many streams and how many bytes it cleared. A "
+        "ticket with no stream is refused with the listing that shows what is really "
+        "recorded. The area's lock file is not a stream and is never cleared.",
+    )
+    p_stream_clear.add_argument(
+        "ids",
+        nargs="*",
+        metavar="TICKET_ID",
+        help="ticket ids whose streams should be cleared (omit them and pass --all)",
+    )
+    p_stream_clear.add_argument(
+        "--all",
+        action="store_true",
+        help="clear every stream in .arbite/streams/",
+    )
+    _json_flag(p_stream_clear)
+    _sink_flag(p_stream_clear)
+    p_stream_clear.set_defaults(func=cmd_stream_clear)
 
     p_status = sub.add_parser(
         "status",

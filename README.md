@@ -100,6 +100,11 @@ arbite status --json
 Which store am I using, and where is it?
 arbite sink info
 
+Watch a worker narrate (or tail the file it names):
+arbite stream list
+arbite stream read tic-a1b2 --after 0
+arbite stream path tic-a1b2
+
 ---
 
 ## Why
@@ -277,8 +282,8 @@ config file at all.
 
 If the database file is used, keep it out of git: unlike the file sink, it is
 binary and won't produce a readable history. `arbite init --gitignore` installs
-the runtime-state entries (the coordination and scratch directories, and any
-sqlite store with its WAL/SHM sidecars) into your `.gitignore` as a marked
+the runtime-state entries (the coordination, scratch and streams directories, and
+any sqlite store with its WAL/SHM sidecars) into your `.gitignore` as a marked
 section: an existing file is never overwritten, and a re-run refreshes only
 that section.
 
@@ -439,6 +444,7 @@ The package exposes the console script `arbite`, providing:
 | Workspace | `workspace` — `show` reports the derived workspace, the store in use and the coordination backend's counts |
 | Payloads | `scratch` — `list` shows what `file write --input` / `file edit --edits` would read, `clear NAME...` and `clear --all` delete it |
 | Events | `events` — the coordination event stream, one line per event (`--after` / `--tail`, `--include-reads`); `--follow` is refused |
+| Narration | `stream` — per-ticket narration: `write <id> TEXT\|-` (attributed to the active attempt), `read <id>` (`--after SEQ` / `--tail N`, exit 2 when nothing is new), `list`, `path <id>`, `clear <id>...\|--all` |
 | Evidence | `receipt <OP>` — one operation's receipt (`receipt`), both versions and the artifacts that hold them, verified before printing, plus `receipt --summary` for the pre-pruning devlog export; `changes <T> [--all]` — what a ticket changed per attempt (`changes`), or the ordered operation log with `--all` |
 | Passthrough | `cmd` — run a tool and record what it changed: observed by default, `--claim PATH...` claims the declared paths before the run (guarded); `--shell` opts into `sh -c`, `--json` gives the branchable form |
 | Integrity | `doctor [--fix]` |
@@ -537,6 +543,25 @@ Key behaviours worth calling out:
   write or edit consumes its payload because the bytes now live in the receipt, `--keep`
   opts out, and a refusal that stopped on the bytes keeps the payload and says so, so a
   recoverable error never forces a model to re-emit a file.
+- **`arbite stream write|read|list|path|clear`** is per-ticket narration: the stream of
+  thought a worker writes *while* it works, so a dashboard can tail it. Each ticket gets one
+  append-only JSONL file at `.arbite/streams/<ticket_id>.jsonl` -- gitignored runtime state,
+  invisible to discovery, scanning and claims -- with one record per line carrying its
+  sequence, UTC time, ticket, attempt, actor and kind (`thought`, `action` or `result`).
+  `write <id> TEXT` records one line and `write <id> -` reads one record per stdin line,
+  which is how a worker pipes its own output; it belongs to the ticket's *active attempt*
+  (exit `1` when nobody is working the ticket, writing nothing) and is attributed to that
+  attempt's worker unless `--actor` says otherwise -- attribution, never authentication,
+  because a narration record changes no project bytes and authorises nothing. `read <id>`
+  prints rows with their sequence and the sequence to resume from, `--after SEQ` being the
+  poll and "nothing new" exiting `2` (the rule `arbite events` follows); `list` shows which
+  tickets are narrating, `path <id>` prints the absolute file for `tail -f`, and
+  `clear <id>...` / `clear --all` is the documented prune. Adoption is suggested rather than
+  forced: `claim` names the file and the command, `submit` prints one `note:` when the
+  attempt that just ended narrated nothing (never a refusal -- `close` and `accept` do not
+  gate at all), and `doctor` reports the area's size and the in-flight tickets that stayed
+  quiet. This is per-ticket prose, distinct from `arbite events`, which is the structured
+  coordination fact stream.
 - **`arbite cmd [--ticket T --attempt A] [--shell] -- CMD...`** is passthrough: it runs a
   familiar tool and records what that run *changed*, so an agent keeps its habits (`sed -i`,
   a formatter, a linter with `--fix`) and still leaves evidence. A digest manifest of the
@@ -804,6 +829,7 @@ stranded.
   agents/
     claude.haiku.001.md
     ...
+  streams/         per-ticket narration (gitignored) -- not tickets
   AGENTS.md        generated guide: workflow, rules, command index
   WORKSPACE.md     generated file-proxy and workspace-command reference
 ```
@@ -834,7 +860,7 @@ stranded.
   reference the guide points at: the file proxy's claim → read → mutate → receipt
   contract, what arbite does *not* guarantee about it, and the flags of every
   workspace command (`file`, `scratch`, `cmd`, `receipt`, `changes`, `events`,
-  `workspace`, `attempt`). Neither document is a ticket: both are skipped by name
+  `stream`, `workspace`, `attempt`). Neither document is a ticket: both are skipped by name
   when the file sink scans for one.
 
 A SQLite-sink project has the same `.arbite/agents/` directories, `AGENTS.md` and
@@ -956,6 +982,7 @@ arbite promote tic-a1b2 --title "Add per-mesh LOD" --tier medium --domain mesh \
 arbite list next --tier medium        # what's ready at my capability level?
 arbite claim tic-a1b2 --agent claude.haiku.001   # -> status in_progress, filed under in_progress/
 arbite note tic-a1b2 claude.haiku.001 "found the LOD cache invalidation bug"
+arbite stream write tic-a1b2 -         # narrate as you work; readers poll 'arbite stream read tic-a1b2'
 arbite block tic-a1b2 --reason "waiting on tic-c3d4"
 arbite unblock tic-a1b2 --agent claude.haiku.001
 arbite close tic-a1b2
@@ -992,6 +1019,7 @@ These exist because agents, not humans, are the main callers:
 
 - **`--json`** on `list`, `list next`, `list raw`, `ref list`, `fetch`, `show`,
   `search`, `deps`, `doctor`, `sink`, `status`, `progress`, `workspace show`, `events`,
+  `stream write`, `stream read`, `stream list`, `stream path`, `stream clear`,
   `scratch list`, `scratch clear`
   and `delete` emits machine-readable
   output whose field names match the frontmatter. The human table format is explicitly *not* a

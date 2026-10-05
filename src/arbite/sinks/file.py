@@ -59,11 +59,14 @@ FLAT_STATUS_DIRS = tuple(s for s in STATUSES if s != CLOSED_DIR)
 # buckets `arbite init` creates. A bucket is somewhere a ticket can deliberately
 # be filed *instead of* its status folder.
 #
-# `coordination/` (claims, attempts, receipts, events, artifacts) and `scratch/`
-# (payload transport) hold runtime state rather than tickets. They are excluded by
-# name even though every document in them is a non-`.md` file, so that a record can
-# never be read as a ticket even if one is ever named like a markdown document.
-RESERVED_DIRS = ("agents", "coordination", "scratch")
+# `coordination/` (claims, attempts, receipts, events, artifacts), `scratch/`
+# (payload transport) and `streams/` (per-ticket narration) hold runtime state
+# rather than tickets. They are excluded by name even though every document in them
+# is a non-`.md` file, so that a record can never be read as a ticket even if one is
+# ever named like a markdown document -- `streams/tic-a1b2.jsonl` has
+# `path.stem == "tic-a1b2"`, which `ID_PATTERN` matches, so without the exclusion the
+# scan, the buckets and `doctor` would report a phantom ticket.
+RESERVED_DIRS = ("agents", "coordination", "scratch", "streams")
 DEFAULT_BUCKETS = ("wishlist", "plans")
 
 # Generated files that merely live under the root: never tickets. `arbite init`

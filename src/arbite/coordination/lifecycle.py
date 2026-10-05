@@ -68,7 +68,7 @@ from ..errors import (
     TicketNotFound,
 )
 from ..sinks import Expect
-from . import recovery
+from . import recovery, streams
 from .app import CoordinationApp
 from .paths import probe
 from .records import (
@@ -639,7 +639,11 @@ class TicketLifecycle:
             lines.extend(self._closed_lines(ended))
             lines.extend(self._pending_lines(unresolved))
             lines.append(self._manifest_line(ticket.id))
-            return succeeded(lines=lines, data=self._manifest_data(ticket, ended))
+            entries, gate = self._stream_gate(ticket.id, ended)
+            lines.extend(gate)
+            data = self._manifest_data(ticket, ended)
+            data["stream_entries"] = entries
+            return succeeded(lines=lines, data=data)
 
         ended = self.end_attempt(ticket, state=STATE_FINISHED, outcome="submitted", actor=agent)
         expect = Expect(status=ticket.status, assignee=ticket.assignee)
@@ -649,7 +653,31 @@ class TicketLifecycle:
         self._write(ticket, expect, action="submit", attempt_ended=ended is not None)
         lines = [f"submitted {ticket.id} -> {self._location(ticket.id)} (review)"]
         lines.extend(self._ending_lines(ended))
-        return succeeded(lines=lines, data=self._lifecycle_data(ticket, ended))
+        entries, gate = self._stream_gate(ticket.id, ended)
+        lines.extend(gate)
+        data = self._lifecycle_data(ticket, ended)
+        data["stream_entries"] = entries
+        return succeeded(lines=lines, data=data)
+
+    def _stream_gate(self, ticket_id: str, ended: Optional[EndedAttempt]) -> tuple:
+        """`(entries, lines)`: what the ending attempt narrated, and a `note:` if nothing.
+
+        Finishing is not conditional on narration -- a worker that stayed quiet is not
+        refused, and `close`/`accept` do not gate at all -- so this is the softest
+        possible nudge: the fact in JSON, and one sentence pointing at the command when
+        the attempt that just ended recorded nothing. Both branches of `submit` call it,
+        so the review and `review: false` paths cannot drift apart."""
+        if ended is None:
+            return 0, []
+        entries = streams.record_count(
+            self.app.arbite_dir, ticket_id=ticket_id, attempt_id=ended.attempt.id
+        )
+        if entries:
+            return entries, []
+        return entries, [
+            f"note: attempt {ended.attempt.id} recorded no stream entries "
+            f"(narrate with 'arbite stream write {ticket_id} -')"
+        ]
 
     def accept(self, ticket, agent: str, message: Optional[str] = None):
         """Close a ticket that is in review: the reviewer's counterpart to `submit`.
@@ -1235,6 +1263,18 @@ class TicketLifecycle:
     def _new_attempt_id(self) -> str:
         return new_id("attempt", {attempt.id for attempt in self.store.records("attempt")})
 
+    def stream_hint(self, ticket_id: str) -> dict:
+        """The narration facts a successful acquisition hands back.
+
+        One place, because three paths print them -- `claim`, `list next --claim` (both
+        through `_claimed_result`) and `promote --agent`, which raises the attempt itself
+        -- and `claim --json` carries the same two facts."""
+        return streams.stream_hint(self.app.arbite_dir, ticket_id)
+
+    def stream_line(self, ticket_id: str) -> str:
+        """The printed form of `stream_hint`: one line, the same facts."""
+        return streams.HINT_LINE.format(**self.stream_hint(ticket_id))
+
     def _claimed_result(
         self,
         ticket,
@@ -1276,9 +1316,16 @@ class TicketLifecycle:
                 f"attempt: {attempt.id} (generation {attempt.generation}, ticket {ticket.id}, "
                 f"workspace {attempt.workspace_id})"
             )
+        # Narration is suggested, not required, which is why the file is named here
+        # rather than demanded anywhere: a worker that narrates gets a live feed, and one
+        # that does not is never refused. The path is absolute because it is a file to
+        # tail, exactly as `arbite stream path` prints it.
+        stream = self.stream_hint(ticket.id)
+        lines.append(self.stream_line(ticket.id))
         data = {
             **ticket.to_dict(self._location(ticket.id)),
             "attempt": attempt_payload(attempt),
+            "stream": stream,
         }
         if revoked:
             data["revoked"] = [

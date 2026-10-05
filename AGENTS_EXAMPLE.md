@@ -33,6 +33,7 @@ Use your session to classify all tickets with `arbite promote <id> --title ... -
 
 ```bash
 arbite claim <id> --agent <your-id>        # take it: status -> in_progress
+arbite stream write <id> -                 # narrate as you work (piped from your output)
 arbite note <id> <your-id> "what changed"  # log progress as you go
 arbite submit <id>                         # finish: status -> review, assignee kept
 arbite accept <id> --agent <reviewer-id>   # the reviewer closes it, credited to them
