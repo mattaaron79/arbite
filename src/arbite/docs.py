@@ -192,9 +192,9 @@ ARBITE_GITIGNORE_END = "# END ARBITE GITIGNORE"
 ARBITE_GITIGNORE_BLOCK = """\
 # BEGIN ARBITE GITIGNORE
 # Runtime state arbite writes beside the tickets: coordination claims/attempts/
-# events, scratch payloads, per-ticket narration streams, and any sqlite store
-# (sidecars included). Tickets and the generated docs are the development record;
-# these are local evidence.
+# receipts/events/artifacts, scratch payloads, per-ticket narration streams, and
+# any sqlite store (sidecars included). Tickets, agent scratchpads and the plans
+# are the development record and stay committed; these are local evidence.
 /.arbite/coordination/
 /.arbite/scratch/
 /.arbite/streams/

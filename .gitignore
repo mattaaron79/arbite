@@ -7,15 +7,6 @@ dist/
 tickets/
 /plans/
 
-# Runtime coordination state: claims, attempts, receipts, events, artifacts,
-# scratch payloads and per-ticket narration streams are local evidence, not the
-# development record. Tickets, agent scratchpads and the plans are committed;
-# these are not.
-/.arbite/coordination/
-/.arbite/scratch/
-/.arbite/streams/
-/.arbite/arbite.db*
-
 # Local / personal editor settings
 .vscode/
 .idea/
@@ -23,3 +14,14 @@ tickets/
 
 THOUGHTS.md
 .directory
+
+# BEGIN ARBITE GITIGNORE
+# Runtime state arbite writes beside the tickets: coordination claims/attempts/
+# receipts/events/artifacts, scratch payloads, per-ticket narration streams, and
+# any sqlite store (sidecars included). Tickets, agent scratchpads and the plans
+# are the development record and stay committed; these are local evidence.
+/.arbite/coordination/
+/.arbite/scratch/
+/.arbite/streams/
+/.arbite/arbite.db*
+# END ARBITE GITIGNORE
