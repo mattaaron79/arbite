@@ -826,6 +826,15 @@ def cmd_workspace_show(args):
         print(result.to_text())
 
 
+def cmd_workspace_reset(args):
+    """Clear a stale project's live coordination state (tic-cf80): end every active
+    attempt, release every active claim, re-record the binding for this location and
+    restamp old workspace ids. History is kept. Without --force it only reports."""
+    sink = _require_sink(args)
+    result = _coordination_app(args, sink).workspace_reset(args.force, actor=args.agent)
+    _emit_file_result(result, args.json)
+
+
 def cmd_receipt(args):
     """Print one operation's recorded evidence, or the summary a devlog is generated from.
 
@@ -2945,6 +2954,9 @@ def cmd_doctor(args):
     # which ticket a record names and not about how many tickets there are.
     closed_tickets = [ticket.id for ticket in tickets if ticket.status == "closed"]
     storage_findings = app.store.storage_problems(fix=args.fix)
+    # Judged against the workspace this project derives *now*, so a moved project's old
+    # stamps are reported (and with --fix restamped) rather than its new ones.
+    workspace = app.derived_workspace()
     if args.fix:
         problems.extend(
             coordination_recovery.repair(
@@ -2954,6 +2966,7 @@ def cmd_doctor(args):
                 known_command=knows_command,
                 closed_tickets=closed_tickets,
                 storage_findings=storage_findings,
+                workspace=workspace,
             )
         )
     else:
@@ -2963,6 +2976,7 @@ def cmd_doctor(args):
                 ticket_ids=ticket_ids,
                 closed_tickets=closed_tickets,
                 storage_findings=storage_findings,
+                workspace=workspace,
             )
         )
     fixed = sum(1 for p in problems if p.fixed)
@@ -3298,7 +3312,7 @@ def build_parser():
 
     p_workspace = sub.add_parser(
         "workspace",
-        help="report the workspace this project derives (show)",
+        help="report the workspace this project derives (show), or clear its live state (reset)",
         description="Report the workspace this project *is*: the id derived from the located "
         ".arbite/ directory plus the resolved sink, the project root, which store is in use "
         "and where that choice came from, the coordination backend's location and what it "
@@ -3307,7 +3321,8 @@ def build_parser():
         "is a new workspace rather than a mutation of an old one, and there is no conflict "
         "path. Read-only: `workspace show` writes nothing at all, not even the workspace "
         "record (that is `arbite init`'s job), so two runs on unchanged state print identical "
-        "text.",
+        "text. `workspace reset` is the one write: it clears a stale project's live attempts "
+        "and file claims.",
     )
     workspace_sub = p_workspace.add_subparsers(
         dest="workspace_action", required=True, metavar="SUBCOMMAND"
@@ -3325,6 +3340,26 @@ def build_parser():
     _json_flag(p_workspace_show)
     _sink_flag(p_workspace_show)
     p_workspace_show.set_defaults(func=cmd_workspace_show)
+    p_workspace_reset = workspace_sub.add_parser(
+        "reset",
+        help="clear live coordination state: end every attempt, release every file claim",
+        description="For a stale or moved project whose leftover attempts and file claims get "
+        "in the way: end every active attempt (state interrupted, outcome reset), release "
+        "every active file claim, re-record the workspace binding for this location and "
+        "restamp records carrying an old workspace id. Receipts, events, artifacts, released "
+        "records and scratch payloads are kept, and no ticket changes status: an in-progress "
+        "ticket stays in progress, and its worker resumes with 'arbite attempt adopt'. Without "
+        "--force it prints what it would do, changes nothing and exits 1.",
+    )
+    p_workspace_reset.add_argument(
+        "--force", action="store_true", help="actually reset (otherwise only report)"
+    )
+    p_workspace_reset.add_argument(
+        "--agent", default=None, help="who is resetting, recorded on the events"
+    )
+    _json_flag(p_workspace_reset)
+    _sink_flag(p_workspace_reset)
+    p_workspace_reset.set_defaults(func=cmd_workspace_reset)
 
     p_attempt = sub.add_parser(
         "attempt",

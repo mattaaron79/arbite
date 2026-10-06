@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..errors import CoordinationError
+from . import relocation
 from .records import READ_CATEGORY, Workspace, derived_workspace_id, parse_utc
 from .results import (
     EMPTY,
@@ -45,6 +46,7 @@ from .results import (
     OUTCOME_LABELS,
     OperationResult,
     Outcome,
+    failed,
     next_actions_for,
     register_next_actions,
     succeeded,
@@ -171,6 +173,14 @@ def _field(label: str, value: str) -> str:
 def _count(value: int, singular: str, plural: Optional[str] = None) -> str:
     noun = singular if value == 1 else (plural or f"{singular}s")
     return f"{value} {noun}"
+
+
+def _attempt_row(attempt) -> dict:
+    return {"id": attempt.id, "ticket": attempt.ticket_id, "worker": attempt.worker_id}
+
+
+def _attempt_text(attempt) -> str:
+    return f"{attempt.id} ({attempt.ticket_id}, {attempt.worker_id})"
 
 
 class CoordinationApp:
@@ -388,6 +398,43 @@ class CoordinationApp:
                 },
             },
         )
+
+    def workspace_reset(self, force: bool, actor: Optional[str] = None) -> OperationResult:
+        """End every active attempt, release every active claim and restamp the store as
+        the workspace derived here (tic-cf80). Without `force`, report what it would do
+        and change nothing."""
+        workspace = self.derived_workspace()
+        attempts, claims = relocation.plan_reset(self.store)
+        restamp = [p.detail for p in relocation.findings(self.store, workspace)]
+        data = {
+            "workspace": workspace.id,
+            "root": workspace.root,
+            "attempts": [_attempt_row(a) for a in attempts],
+            "claims": [claim.path for claim in claims],
+        }
+        if not force:
+            lines = [f"workspace reset would, for {workspace.id} ({workspace.root}):"]
+            lines += [f"  end attempt {_attempt_text(a)}" for a in attempts]
+            if claims:
+                lines.append(f"  release {_count(len(claims), 'active claim')}")
+            lines += [f"  {detail.split(';')[0]}" for detail in restamp]
+            if len(lines) == 1:
+                lines.append("  nothing: no active attempts or claims, and no stale stamps")
+            lines.append("nothing was changed; re-run with --force to reset")
+            return failed(lines[-1], reason="force_required", data=data, lines=lines)
+
+        result = relocation.reset(self.store, workspace, actor=actor)
+        lines = [_field("workspace", f"{workspace.id}  ({workspace.root})")]
+        lines += [f"ended attempt {_attempt_text(a)}" for a in result.attempts]
+        lines.append(f"released {_count(len(result.claims), 'active claim')}")
+        lines += [p.detail for p in relocation.restamp_problems(result.restamp)]
+        tickets = sorted({a.ticket_id for a in result.attempts})
+        next_actions = (
+            [f"'arbite attempt adopt <id> --agent <your-id>' to resume one of {', '.join(tickets)}"]
+            if tickets
+            else []
+        )
+        return succeeded(lines=lines, data=data, next_actions=next_actions)
 
     # ------------------------------------------------------------------
     # The event stream

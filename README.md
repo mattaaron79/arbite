@@ -447,7 +447,7 @@ The package exposes the console script `arbite`, providing:
 | Narration | `stream` — per-ticket narration: `write <id> TEXT\|-` (attributed to the active attempt), `read <id>` (`--after SEQ` / `--tail N`, exit 2 when nothing is new), `list`, `path <id>`, `clear <id>...\|--all` |
 | Evidence | `receipt <OP>` — one operation's receipt (`receipt`), both versions and the artifacts that hold them, verified before printing, plus `receipt --summary` for the pre-pruning devlog export; `changes <T> [--all]` — what a ticket changed per attempt (`changes`), or the ordered operation log with `--all` |
 | Passthrough | `cmd` — run a tool and record what it changed: observed by default, `--claim PATH...` claims the declared paths before the run (guarded); `--shell` opts into `sh -c`, `--json` gives the branchable form |
-| Integrity | `doctor [--fix]` |
+| Integrity | `doctor [--fix]`; `workspace reset [--force]` — end every attempt and release every claim in a stale project |
 | Destruction | `delete <id> --force` |
 
 Key behaviours worth calling out:
@@ -461,6 +461,17 @@ Key behaviours worth calling out:
   to derive one from), and there is deliberately no `bind`: a relocated root or a
   repointed store is a new workspace, not a mutation, so there is no conflict path
   to resolve.
+- **A moved project is restamped, and a stale one can be reset.** Moving a project
+  derives a new workspace id, so attempts and claims written before the move name the
+  old one; `arbite doctor` reports them grouped by id and `doctor --fix` restamps them
+  (re-keying claims, whose ids derive from workspace and path), re-recording the
+  binding too when it was made at another root. A migration alone is not a move: the
+  binding travels with the records and stays authoritative. **`arbite workspace reset
+  --force`** goes further for a stale project: it ends every active attempt
+  (`interrupted`, outcome `reset`), releases every active file claim and restamps,
+  keeping receipts, events and released records. No ticket changes status; resume an
+  in-progress one with `arbite attempt adopt`. Without `--force` it prints the plan
+  and exits `1`.
 - **Coordination state is part built.** The versioned records the file proxy needs —
   workspace, work attempt, file claim, read observation, operation receipt, artifact
   and event — exist, are validated, and are stored beside the tickets

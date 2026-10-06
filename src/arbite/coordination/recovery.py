@@ -39,6 +39,7 @@ from typing import Optional
 
 from ..errors import EvidenceRefused, PathRefused, RecordError, Stale
 from ..sinks.base import Problem
+from . import relocation
 from .paths import probe
 from .records import (
     ABSENT,
@@ -100,6 +101,7 @@ ATTEMPT_OUTCOME_WORDS = {
     "blocked": "ticket blocked",
     "reopened": "ticket reopened",
     "taken_over": "ticket taken over",
+    "reset": "workspace reset",
 }
 
 #: The two claim findings a repair may act on. Both are states nobody can use: the
@@ -502,7 +504,8 @@ def _record_drift(store, outcome: OperationJudgement, preserved: Optional[str]) 
 
 
 def findings(
-    store, ticket_ids=None, closed_tickets=None, operation_findings=None, storage_findings=()
+    store, ticket_ids=None, closed_tickets=None, operation_findings=None, storage_findings=(),
+    workspace=None,
 ) -> list:
     """Every coordination finding, in the order a reader acts on them.
 
@@ -517,6 +520,10 @@ def findings(
     `storage_findings` come last, and they are the backend's own (see
     `CoordinationStore.storage_problems`): they are about the store's bookkeeping rather
     than about the work, so they belong after the things wrong with the work itself.
+
+    `workspace` is the workspace the project derives now; given, a binding recorded at
+    another root is reported as stale and records are judged against the derived
+    workspace instead of it (see `relocation.target_workspace`).
     """
     ownership, dangling = _claim_findings(store)
     operations = (
@@ -526,7 +533,7 @@ def findings(
         *ownership,
         *operations,
         *dangling,
-        *_other_findings(store, ticket_ids, closed_tickets),
+        *_other_findings(store, ticket_ids, closed_tickets, workspace),
         *storage_findings,
     ]
 
@@ -628,10 +635,9 @@ def _claim_findings(store) -> tuple:
     """The claim findings, as `(live but unusable, naming something missing)`.
 
     Split because the responses differ: the first group is a claim a live holder cannot
-    use (its attempt is over), the second is a claim naming an attempt or a workspace this
-    store does not have. Within a group the order is by path, so two runs agree and a
-    human reads the paths in one direction."""
-    workspace_id = _workspace_id(store)
+    use (its attempt is over), the second is a claim naming an attempt this store does not
+    have (a foreign workspace stamp is `relocation`'s finding). Within a group the order is
+    by path, so two runs agree and a human reads the paths in one direction."""
     attempts = {attempt.id: attempt for attempt in store.records("attempt")}
     orphaned, dangling = [], []
     for claim in sorted(store.records("claim"), key=lambda claim: (claim.path, claim.id)):
@@ -642,15 +648,6 @@ def _claim_findings(store) -> tuple:
             dangling.append(_claim_problem(store, claim, None))
         elif attempt.state != ATTEMPT_ACTIVE:
             orphaned.append(_claim_problem(store, claim, attempt))
-        if workspace_id is not None and claim.workspace_id != workspace_id:
-            dangling.append(
-                Problem(
-                    "claim_for_another_workspace",
-                    f"claim on {claim.path} names workspace {claim.workspace_id}, but this "
-                    f"store records {workspace_id}",
-                    ticket_id=claim.ticket_id,
-                )
-            )
     return orphaned, dangling
 
 
@@ -666,26 +663,29 @@ def _ended_reason(attempt: WorkAttempt) -> str:
     return f"attempt {attempt.state} {attempt.ended}"
 
 
-def _other_findings(store, ticket_ids=None, closed_tickets=None) -> list:
-    """The record findings that are about neither claims nor unfinished operations."""
+def _other_findings(
+    store, ticket_ids=None, closed_tickets=None, workspace=None, stamps=True
+) -> list:
+    """The record findings that are about neither claims nor unfinished operations.
+
+    `stamps=False` leaves out the workspace-stamp findings, for a repair whose restamp
+    already reported them."""
     problems = []
     ambiguous = multiple_workspace_problem(store)
-    if ambiguous is not None:
+    if ambiguous is not None and workspace is None:
         problems.append(ambiguous)
-    workspace_id = _workspace_id(store)
+    if stamps:
+        problems.extend(relocation.findings(store, workspace))
     known_tickets = set(ticket_ids) if ticket_ids is not None else None
     closed = set(closed_tickets) if closed_tickets is not None else None
     for attempt in store.records("attempt"):
-        if workspace_id is not None and attempt.workspace_id != workspace_id:
-            problems.append(
-                Problem(
-                    "attempt_for_another_workspace",
-                    f"attempt {attempt.id} names workspace {attempt.workspace_id}, but this "
-                    f"store records {workspace_id}",
-                    ticket_id=attempt.ticket_id,
-                )
-            )
-        if known_tickets is not None and attempt.ticket_id not in known_tickets:
+        # An ended attempt naming a deleted ticket is history (delete is allowed once
+        # the attempt has ended); only a live one can block anything.
+        if (
+            known_tickets is not None
+            and attempt.is_active
+            and attempt.ticket_id not in known_tickets
+        ):
             problems.append(
                 Problem(
                     "attempt_without_ticket",
@@ -741,7 +741,7 @@ def multiple_workspace_problem(store) -> Optional[Problem]:
 
 def repair(
     store, ticket_ids=None, root=None, known_command=None, closed_tickets=None,
-    storage_findings=(),
+    storage_findings=(), workspace=None,
 ) -> list:
     """`doctor --fix`: repair what is unambiguous, report what is not.
 
@@ -754,7 +754,12 @@ def repair(
 
     `storage_findings` is what the backend's own `storage_problems(fix=True)` produced, so
     the report names the bookkeeping a repair just dropped rather than saying nothing
-    about it."""
+    about it.
+
+    Records stamped with another workspace id are restamped first (see `relocation`), so
+    the claim repair below then judges them like any other claim. `workspace` is the
+    derived one (see `relocation.target_workspace`)."""
+    restamped = _restamp(store, workspace)
     root = root if root is not None else workspace_root(store)
     outcomes = reconcile(store, root)
     phase_two = [
@@ -770,12 +775,21 @@ def repair(
     ]
     ownership, dangling = _repair_claims(store)
     return [
+        *restamped,
         *ownership,
         *phase_two,
         *dangling,
-        *_other_findings(store, ticket_ids, closed_tickets),
+        *_other_findings(store, ticket_ids, closed_tickets, workspace, stamps=not restamped),
         *storage_findings,
     ]
+
+
+def _restamp(store, workspace) -> list:
+    """Restamp foreign records when there are any, and render what changed."""
+    if not relocation.findings(store, workspace):
+        return []
+    target = relocation.target_workspace(store, workspace)
+    return relocation.restamp_problems(relocation.restamp(store, target))
 
 
 def _finalised_problem(outcome: OperationJudgement) -> Problem:
@@ -811,9 +825,7 @@ def _repair_claims(store) -> tuple:
         if attempt is not None and attempt.state == ATTEMPT_ACTIVE:
             continue
         if workspace_id is not None and claim.workspace_id != workspace_id:
-            # A claim from another workspace is a finding, not something to release: this
-            # store is not the one it belongs to.
-            dangling.append(_claim_problem(store, claim, attempt))
+            # Left foreign by the restamp, which has already reported why.
             continue
         if not _release_claim(store, claim, attempt):
             # The claim moved while this run was repairing it: report what is there now.
@@ -880,7 +892,7 @@ def _claim_problem(store, claim: FileClaim, attempt: Optional[WorkAttempt]) -> P
             ticket_id=claim.ticket_id,
         )
     return Problem(
-        "claim_for_another_workspace",
+        relocation.FOREIGN_CLAIMS,
         f"claim on {claim.path} names workspace {claim.workspace_id}, but this store records "
         f"{_workspace_id(store)}",
         ticket_id=claim.ticket_id,

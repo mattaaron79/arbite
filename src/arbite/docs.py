@@ -1062,6 +1062,15 @@ def render_workspace(parser, subparsers_by_name: dict, active_info=None, stale_i
         "is why there is no bind command to forget and no conflict path."
     )
     add("")
+    add(
+        "A project moved on disk derives a new workspace id while its records keep the old one: "
+        "`arbite doctor --fix` restamps them (and re-records a binding made at another root). "
+        "When leftover attempts and file claims get in the way of a stale project, `arbite "
+        "workspace reset --force` ends every active attempt, releases every claim and restamps, "
+        "keeping all history; without `--force` it only says what it would do. Tickets keep "
+        "their status, so resume an in-progress one with `arbite attempt adopt`."
+    )
+    add("")
 
     # -- The contract ------------------------------------------------------
     add("## Claim, read, mutate, release")
