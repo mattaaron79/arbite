@@ -596,13 +596,24 @@ def _topic_overview(ctx: DocContext) -> list:
         "an attempt, and a shell write is drift the next read reports as an external edit."
     )
     add("")
-    add("## Go deeper")
+    add("## Topics")
     add("")
-    add("- `arbite docs list` -- every topic, one line each")
-    add("- `arbite docs <topic>` -- one subject in depth")
-    add("- `arbite docs commands [NAME]` -- usage and every flag for a command")
-    add("- `arbite docs all` -- every topic in one stream (e.g. to regenerate a file)")
-    add("- `arbite <command> -h` -- the CLI's own help for that command")
+    add("`arbite docs <topic>` fetches one of these in depth:")
+    add("")
+    for topic in TOPICS:
+        if topic.name == "overview":
+            continue
+        add(f"- `{topic.name}` -- {topic.summary}")
+    add(
+        "- `commands [NAME]` -- usage and every flag for a command, rendered from the "
+        "live parser"
+    )
+    add("")
+    add(
+        "Also: `arbite docs list` (the same topics grouped by section), `arbite docs "
+        "all` (everything in one stream), `arbite docs search TERM`, and `arbite "
+        "<command> -h` for the CLI's own help."
+    )
     add("")
     return lines
 
