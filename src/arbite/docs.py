@@ -1,48 +1,41 @@
-"""Renders the two agent-facing docs `arbite init` writes into the arbite directory.
+"""The `arbite docs` documentation surface.
 
-`.arbite/AGENTS.md` is the *guide*: what the workflow is, the rules an agent must act
-on, the field vocabulary, and a one-line index of every command. `.arbite/WORKSPACE.md`
-is the *reference* for the file proxy and the workspace commands -- their flags, the
-honest limits and where the evidence lives. Splitting them is what keeps the guide
-small, because it is read into an agent's context at the start of every task: it
-carries no per-flag reference at all (`arbite <cmd> -h` prints those), and the detail
-only a proxy user needs is one pointer away in a file that only that work reads.
+Documentation is a command, not a set of committed files. `arbite docs` prints a
+token-light overview -- the always-read half, kept small because it is pulled into an
+agent's context -- and `arbite docs <topic>` prints one deeper subject on demand: the
+workflow, the fields, the sinks, agent identity and triage, the conventions that
+govern scripts and agent loops, the file proxy and its evidence, the honest limits,
+and the design background. `arbite docs commands [NAME]` renders a command's usage
+and flags from the live parser, and `arbite docs list` is the topic index. Nothing is
+regenerated into a project's tree, so editing a sentence here changes what every
+project reads with no git churn.
 
-Both documents are rendered from the installed argparse parsers and the schema
-constants, so neither can drift from the CLI: the command index and the reference
-blocks come from the parsers themselves, and the prose interpolates the same
-vocabulary the CLI validates against (it previously advertised a `frontier` tier that
-`create` and `list --tier` both rejected).
+Topics are Python functions returning markdown lines -- this module is the registry.
+The reference material is rendered from the installed argparse parsers and the schema
+constants, so a topic can only ever name a command, status or field the CLI actually
+accepts. The prose is also *sink-aware*: it describes the store the reader's plain
+`arbite` command will touch, so a database-backed project is never told "the folder is
+the source of truth", and a sink with no coordination backend is never handed a
+file-proxy contract.
 
-Both are also *sink-aware*: the files are read by agents that will act on what they
-say, so they may only claim what is true of the store in use. With a file sink "a
-ticket's folder is the source of truth" is the central rule and belongs front and
-centre; with a database sink that sentence would be a lie, so the status/location
-prose switches on the sink's own capabilities instead of being hard-coded. The same
-rule governs the file-proxy sections: they are rendered only for a sink kind
-`open_coordination_store` accepts (asked, not assumed), they state the honest limits --
-a shell can bypass the proxy, observation is not exclusivity, nothing recovers work
-automatically, and evidence is never pruned -- and a sink with no coordination backend
-gets one paragraph saying so instead.
-
-Written terse on purpose: facts-per-token rather than prose. Boilerplate that would
-otherwise repeat once per command is stated once and cross-referenced, and argparse's
-longer per-command descriptions are dropped because the prose sections already carry
-what they say -- `arbite <cmd> -h` still prints them in full.
+`arbite init` no longer writes either generated document; it leaves one static pointer
+at `.arbite/AGENTS.md` telling a harness to run `arbite docs` (see
+`install_agents_pointer`). The instructions block installed into a project's own
+AGENTS.md/CLAUDE.md lives here too.
 
 TICKET_ID_HELP / TICKET_ID_HELP_READONLY / JSON_HELP / MESSAGE_HELP live here
-(cli.py imports them) so the renderer can collapse the copies of that boilerplate
-into a single cross-reference without the two copies drifting apart.
+(cli.py imports them) so the command reference can collapse the copies of that
+boilerplate into a single cross-reference without the two copies drifting apart.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
-from datetime import date
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable, Optional
 
-from . import __version__
 from .schema import (
     CLASSIFICATION_EPIC,
     FIELD_ORDER,
@@ -99,33 +92,35 @@ ARBITE_INSTRUCTIONS_BLOCK = """\
 <!-- BEGIN ARBITE INSTRUCTIONS -->
 # Arbite Ticketing System
 
+## Docs
+
+Arbite documents itself from the command line: run `arbite docs` for the overview,
+`arbite docs list` for every topic, and `arbite docs commands <name>` for a command's
+flags. This block is the short version; `arbite docs` is the source of truth.
+
 ## Ticketing
-Use arbite ticketing system for all tasks. See /.arbite/AGENTS.md. Create a ticket if required and claim the ticket before starting work.
+Use arbite for all tasks. Create a ticket if required and claim it before starting work. Tickets live under `.arbite/` in state folders (`open/`, `in_progress/`, `review/`, `blocked/`, `shelved/`, `closed/YYYY-MM/`); `wishlist/` and `plans/` are buckets, not statuses, and `raw/processed/` holds frozen snapshots of promoted captures. The store and the review behaviour come from `.arbite/project.yaml` (`sink:`, `review:`).
 
-# Agent Identiy
+# Agent Identity
 
-When claiming a ticket, please use an identity format like: "claude.opus-5.001" where the company.model.instance is your best educated guess unless otherwise specified.
-If orchestrating, let subagents know their identity and instance number.
+When claiming a ticket, use an identity like "claude.opus-5.001" -- company.model.instance, your best educated guess unless told otherwise. If orchestrating, tell subagents their identity and instance number.
 
 ## Sole command: "Work Next|All <epic>"
 
-If your sole command is "Work Next" or "Work All", you can use the following commands to find the next arbite ticket(s):
 ```bash
-arbite list next   # Show next workable ticket
+arbite list next                      # next workable ticket
 arbite list --topo --status open [--epic <epic>]
 ```
 
-Note: If there are no tickets, see next command "Classify". If "Work All", try to orchestrate tickets if that is in your skill set, otherwise
-work in sequence until finished.
+If there are no tickets, use "Classify". If "Work All", orchestrate if that is in your skill set, otherwise work in sequence until finished.
 
 ## Sole command "Classify"
 
-If your sole command is "Classify" use the following command to list all tickets that require classification:
 ```bash
 arbite list raw
 ```
 
-Use your session to classify all tickets with `arbite promote <id> --title ... --tier ... --domain ...` (adding `--description`/`--epic`/`--priority`/`--tags` as you learn more), looking deeper into the requirements, adding notes, etc until all raw tickets are classified. Add `--agent <your-id>` to claim one you are going to work yourself; a wish is reclassified and filed in the wishlist bucket by the same command instead of being opened.
+Classify every raw ticket with `arbite promote <id> --title ... --tier ... --domain ...` (add `--description`/`--epic`/`--priority`/`--tags` as you learn more). Add `--agent <your-id>` to classify and claim one you will work yourself; a wish is reclassified and filed in the wishlist bucket instead of being opened.
 
 ## Workflow: claim -> in_progress -> submit -> review -> accept
 
@@ -137,12 +132,11 @@ arbite submit <id>                         # finish: status -> review, assignee 
 arbite accept <id> --agent <reviewer-id>   # the reviewer closes it, credited to them
 ```
 
-A reviewer who sends work back uses `arbite reopen <id> --reason "<why>"` -- the reason is required, because it is the only record of what the author must fix. With the file sink a ticket's status is also the folder it sits in (`open/`, `in_progress/`, `review/`, `blocked/`, `shelved/`, `closed/YYYY-MM/`), while `wishlist/` and `plans/` are buckets rather than statuses and `raw/processed/` holds frozen snapshots of promoted captures. A project can set `review: false` in `.arbite/project.yaml`, in which case `arbite submit` closes the ticket directly instead of parking it in review.
+Send work back with `arbite reopen <id> --reason "<why>"` (the reason is required -- it is the only record of what the author must fix). With `review: false` in `.arbite/project.yaml`, `arbite submit` closes the ticket directly instead of parking it in review.
 
 # Ticketing etiquette addendum
 
-In addition to etiquette specified in .arbite/AGENTS.md, please add to notes of ticket when closing a paragraph explaining what the user, QA, or other
-agents will be able to observe via integration testing, if any new effects will be observable.
+When closing a ticket, add a note paragraph explaining what the user, QA, or other agents will be able to observe via integration testing (and any new effects that will be observable).
 
 ## Git
 By default and unless otherwise specified, check into main/master after closing a ticket.
@@ -287,12 +281,11 @@ FIELD_NOTES = {
 
 # Boilerplate that would otherwise appear once per command: each entry is
 # (verbatim argparse help text, short cross-reference to render instead). The JSON
-# one is special-cased by `_shorten`, because the exit-code table it points at lives
-# in the guide while the reference that uses it may be WORKSPACE.md.
-_JSON_STUB = "JSON output (see Conventions)"
+# one points at the exit-code and JSON contract in the `conventions` topic.
+_JSON_STUB = "JSON output (see 'conventions' under `arbite docs list`)"
 _SUBSTITUTIONS = (
-    (TICKET_ID_HELP, "see 'Ticket ids' under Conventions"),
-    (TICKET_ID_HELP_READONLY, "see 'Ticket ids' under Conventions"),
+    (TICKET_ID_HELP, "see 'ticket ids' in `arbite docs conventions`"),
+    (TICKET_ID_HELP_READONLY, "see 'ticket ids' in `arbite docs conventions`"),
     (JSON_HELP, _JSON_STUB),
     (MESSAGE_HELP, "the request text (multiple words are joined with spaces)"),
     (
@@ -303,7 +296,7 @@ _SUBSTITUTIONS = (
         "either told its own tier by the harness or self-assesses from its model "
         "class (the company.model prefix of its agent id, e.g. claude.haiku sits "
         "below claude.opus), and should only claim tickets at or below that tier.",
-        "See 'tier' under Ticket fields.",
+        "See 'tier' in `arbite docs fields`.",
     ),
 )
 
@@ -320,46 +313,18 @@ _NO_VALUE_ACTIONS = (
 # section, beats repeating them under all twenty-odd commands.
 _GLOBAL_ACTIONS = ("help", "sink", "root", "version", "color")
 
-#: The commands whose per-flag reference lives in WORKSPACE.md rather than in the
-#: always-read guide: the ones that act on files through the proxy, plus the
-#: coordination records around them. `arbite init` renders both documents from the
-#: same parsers, so the split cannot drift from the CLI.
-WORKSPACE_COMMANDS = (
-    "file",
-    "scratch",
-    "receipt",
-    "changes",
-    "cmd",
-    "events",
-    "stream",
-    "workspace",
-    "attempt",
-)
-
 
 # ANSI/CSI escape sequences. argparse >= 3.14 colours its help output when it
 # believes it is writing to a terminal (or when FORCE_COLOR is set, which agent
 # harnesses do), and those codes would otherwise end up embedded in the markdown
-# as junk like '\x1b[1;34m'. This file is always read as plain text, so they are
-# stripped -- see _disable_color() for the belt to this braces.
+# as junk like '\x1b[1;34m'. The docs are always read as plain text, so every line
+# is stripped of escapes before it is returned.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def _flat(text: str) -> str:
     """Collapse a wrapped help string onto one line, with no escape codes."""
     return _ANSI_RE.sub("", " ".join((text or "").split()))
-
-
-def _disable_color(*parsers) -> None:
-    """Ask parsers not to colourise their help (a no-op before Python 3.14).
-
-    The renderer strips escapes either way, so this only keeps the intermediate
-    text readable when debugging; the parsers are transient ones built for
-    `arbite init`, never the ones serving `--help` to a user.
-    """
-    for parser in parsers:
-        if hasattr(parser, "color"):
-            parser.color = False
 
 
 def _shorten(text: str, json_stub: str = _JSON_STUB) -> str:
@@ -406,22 +371,6 @@ def _usage(subparser) -> str:
     return text[len("usage: "):] if text.startswith("usage: ") else text
 
 
-def _stamp(add, follow_up: str) -> None:
-    """Emit the header both documents carry, then the blank line after it.
-
-    `follow_up` is what the file says about *being reached*: the guide must warn
-    that nothing discovers it automatically and point at WORKSPACE.md, while
-    WORKSPACE.md says it is reached from the guide. Both carry the same version and
-    date stamp, and both start with the same prefix -- a test strips that line to
-    check that re-running `init` rewrites the file byte-identically."""
-    add(
-        f"_Auto-generated by `arbite init` (arbite {__version__}) on {date.today().isoformat()}"
-        ": every `arbite init` run here rewrites it, so edit the package's docs template "
-        f"(`docs.py`) rather than this file. {follow_up}_"
-    )
-    add("")
-
-
 def _command_index_lines(parser) -> list:
     """One line per command: its name and the parser's own one-line help.
 
@@ -465,7 +414,7 @@ def _stale_store_warning(stale_kind, stale_root, stale_count, sink_kind, sink_ro
     """The one paragraph a project with two ticket stores must never be without.
 
     A store holding tickets that nothing selects looks exactly like an empty one, so
-    the guide states the mismatch in bold and names both stores and the way out."""
+    the docs state the mismatch in bold and name both stores and the way out."""
     return (
         f"> **Warning: this project holds a second ticket store that nothing selects.** "
         f"There are {stale_count} ticket(s) in a `{stale_kind}` store at `{stale_root}`, "
@@ -480,168 +429,376 @@ def _stale_store_warning(stale_kind, stale_root, stale_count, sink_kind, sink_ro
     )
 
 
-def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) -> str:
-    """Render the lean guide for the sink this project will actually use.
+# ---------------------------------------------------------------------------
+# The `arbite docs` surface
+# ---------------------------------------------------------------------------
+#
+# Documentation is a command, not a set of committed files. `arbite docs` prints the
+# token-light overview; `arbite docs <topic>` prints one deeper subject. Topic prose
+# lives in this module; the command reference is rendered from the live parsers so a
+# topic can only ever name a command the CLI actually accepts, and everything is
+# filtered through `build_context` so the prose matches the store the reader's plain
+# `arbite` command will touch. Nothing is regenerated into a project's tree, so
+# editing a sentence here changes what every project reads with no git churn.
 
-    `active_info` describes the store a *plain* command reads: the committed config,
-    with no `--sink` and no `ARBITE_SINK` in play -- which is what an agent reading
-    this file will get when it runs the commands here. `stale_info`, when given,
-    describes another store in the same project that *has tickets* and that nothing
-    selects (a database left behind by a deleted config, an `ARBITE_SINK` one-off,
-    a half-finished migration).
+# The one static file `arbite init` leaves behind: a pointer, not a copy of the docs.
+# Its content never varies with the sink or the version, so re-running `init` is a
+# no-op and a project's committed docs stop churning.
+AGENTS_POINTER = """\
+# arbite
 
-    An agent reads this guide and then runs `arbite` with no flags, so the prose that
-    describes *behavior* follows `active_info`, and a stale store is called out in
-    bold rather than quietly ignored. A guide that named the wrong store would be
-    worse than no guide at all: the wrong store looks exactly like an empty one.
+This project uses arbite for ticketing, and its documentation is a command rather
+than a file.
 
-    Only what an agent must act on is here: the rules, the workflow, the fields and a
-    one-line index of every command. The per-flag reference for the workspace commands
-    is in WORKSPACE.md (`render_workspace` below), and every other command's flags are
-    a `arbite <cmd> -h` away -- which is what keeps this file small enough to be read
-    on every task."""
-    _disable_color(parser, *subparsers_by_name.values())
+Run `arbite docs` for the overview, `arbite docs list` for every topic, and
+`arbite docs commands <name>` for one command's usage and flags.
 
-    # Behavior prose (folder vs column, how to resume) describes what a plain
-    # command will actually do.
+This file is a pointer written by `arbite init`; edit the package's `docs.py`
+instead."""
+
+
+def install_agents_pointer(path: Path) -> str:
+    """Write the static `.arbite/AGENTS.md` pointer, if it is ours to write.
+
+    Returns what it did, so `arbite init` can report it:
+
+    - 'created'   -- the file did not exist; it is written with the pointer;
+    - 'refreshed' -- the file held the old generated guide (its header is
+      '# arbite -- agent guide'); it is replaced with the pointer;
+    - 'present'   -- the file already holds exactly the pointer; left untouched;
+    - 'kept'      -- the file is something else (a hand-written guide); left
+      untouched rather than clobbered.
+
+    Written once and then left alone: the pointer is constant, so a re-run never
+    dirties the tree the way the old sink-and-version-stamped guide did."""
+    if not path.exists():
+        path.write_text(AGENTS_POINTER + "\n", encoding="utf-8")
+        return "created"
+    existing = path.read_text(encoding="utf-8")
+    if existing == AGENTS_POINTER + "\n":
+        return "present"
+    if existing.lstrip().startswith("# arbite -- agent guide"):
+        path.write_text(AGENTS_POINTER + "\n", encoding="utf-8")
+        return "refreshed"
+    return "kept"
+
+
+@dataclass
+class DocContext:
+    """Everything a topic renderer may branch on: the live parsers and the store the
+    reader's plain `arbite` command will actually touch.
+
+    `sink_kind`/`status_is_location` follow the committed config, not the flags of
+    the invocation that asked for docs: a `--sink` one-off must not describe a
+    different project than the one the reader is in. `standalone` is set when no
+    `.arbite/` was located, in which case the defaults a fresh project would get
+    (the `file` sink) are described so `arbite docs` still reads sensibly anywhere."""
+
+    parser: Any
+    subparsers_by_name: dict
+    active_info: Any = None
+    stale_info: Any = None
+    sink_kind: Optional[str] = None
+    sink_root: Optional[str] = None
+    status_is_location: bool = True
+    has_proxy: bool = True
+    stale_kind: Optional[str] = None
+    stale_root: Optional[str] = None
+    stale_count: int = 0
+    mismatch: bool = False
+    standalone: bool = False
+
+
+def build_context(parser, subparsers_by_name, active_info=None, stale_info=None,
+                  standalone=False) -> DocContext:
+    """Assemble the render context from the parsers and the located stores.
+
+    `active_info` describes the store a *plain* command reads (committed config only);
+    `stale_info`, when given, describes another store in the same project that holds
+    tickets and that nothing selects. `standalone` says no project was located."""
     primary = active_info if active_info is not None else stale_info
-    status_is_location = bool(getattr(primary, "status_is_location", False))
-    sink_kind = getattr(primary, "kind", None)
-    sink_root = getattr(primary, "root", None)
-    stale_kind = getattr(stale_info, "kind", None)
-    stale_root = getattr(stale_info, "root", None)
-    stale_count = getattr(stale_info, "ticket_count", 0)
-    mismatch = active_info is not None and stale_info is not None
-    # The proxy sections describe a capability a sink may not have, so the question is
-    # asked of the authority that builds the store (`open_coordination_store`) rather
-    # than answered here with a second list of kinds.
+    sink_kind = getattr(primary, "kind", None) or "file"
     from .coordination.store import has_coordination_backend
 
-    has_proxy = sink_kind is not None and has_coordination_backend(sink_kind)
+    return DocContext(
+        parser=parser,
+        subparsers_by_name=subparsers_by_name,
+        active_info=active_info,
+        stale_info=stale_info,
+        sink_kind=sink_kind,
+        sink_root=getattr(primary, "root", None),
+        status_is_location=bool(getattr(primary, "status_is_location", sink_kind == "file")),
+        has_proxy=has_coordination_backend(sink_kind),
+        stale_kind=getattr(stale_info, "kind", None),
+        stale_root=getattr(stale_info, "root", None),
+        stale_count=getattr(stale_info, "ticket_count", 0),
+        mismatch=active_info is not None and stale_info is not None,
+        standalone=standalone,
+    )
 
-    lines: list[str] = []
+
+def _topic_overview(ctx: DocContext) -> list:
+    """The always-read half: what arbite is, the mental model, the commands a caller
+    actually types, and where to go deeper. Budgeted by a test -- it is pulled into an
+    agent's context, so length is a design constraint, not a preference."""
+    lines: list = []
     add = lines.append
-
-    add("# arbite -- agent guide")
-    add("")
-    _stamp(
-        add,
-        "Not auto-discovered -- point your project's CLAUDE.md (or similar) at it, e.g. a line "
-        "'read .arbite/AGENTS.md'. The file-proxy and workspace-command reference is "
-        "`.arbite/WORKSPACE.md`",
-    )
-
-    # -- What this is ------------------------------------------------------
-    add("## What this is")
+    add("# arbite")
     add("")
     add(
-        "`arbite` is a low-tech ticketing system that lives inside this git repo, so several AI "
-        "agents (and humans) can pick up tasks, track state, and leave a clean history of what "
-        "happened and when. Use it -- not ad hoc notes or files -- to create, claim, block, "
-        "shelve, close and reopen work, and leave progress with `arbite note` (it appends a "
-        "timestamped, agent-identified entry to the ticket's `## Notes`)."
+        "`arbite` is a low-tech ticketing system that lives inside this git repo, so "
+        "several agents (and humans) can pick up tasks, track state, and leave a clean "
+        "history of what happened and when. It is a command, not a service: no daemon, "
+        "no server, no lock service."
     )
     add("")
-    if status_is_location:
+    if ctx.status_is_location:
         add(
-            "**Where a ticket is filed *is* its state.** Tickets are markdown files with YAML "
-            "frontmatter, and the folder a ticket sits in mirrors its `status`: every command "
-            "makes the move and the frontmatter update together, and when the two disagree **the "
-            "folder is the source of truth**. A claimed ticket is one sitting in `in_progress/` "
-            "with `assignee` set to your id -- your memory of what you were doing is only a hint "
-            "to check against where the ticket actually is."
+            "**A ticket's state is the folder it sits in.** Tickets are markdown files "
+            "with YAML frontmatter; `status` mirrors the folder (`open/`, "
+            "`in_progress/`, `review/`, ...), and when the two disagree **the folder "
+            "wins**. A claimed ticket is one in `in_progress/` with `assignee` set to "
+            "your id."
         )
     else:
         add(
-            "**Status is a field, and that field is the single source of truth** -- there is no "
-            "folder to read as a shortcut. A claimed ticket is one whose `status` is "
-            "`in_progress` with `assignee` set to your id (`arbite show <id> --json`, "
-            "`arbite list --assignee <your-id>`); your memory of what you were doing is only a "
-            "hint to check against the ticket itself."
+            "**A ticket's `status` is a field and the single source of truth** -- there "
+            "is no folder to read as a shortcut. A claimed ticket is one whose `status` "
+            "is `in_progress` with `assignee` set to your id."
         )
     add("")
-
-    # -- Where tickets live ------------------------------------------------
-    add("## Where tickets live (the sink)")
-    add("")
-    add(
-        "Tickets live in a **sink**: a storage backend selected per command. Commands, fields, "
-        "filters and exit codes behave identically whichever one is in use, so only two things "
-        "change: where the data sits, and what `arbite doctor` can check."
-    )
-    add("")
-    if mismatch:
-        add(_stale_store_warning(stale_kind, stale_root, stale_count, sink_kind, sink_root))
+    if ctx.standalone:
+        add(
+            "_No `.arbite/` found here, so this describes the default (`file`) sink. "
+            "Run `arbite docs` inside a project for docs tailored to its sink._"
+        )
         add("")
-    if sink_kind:
-        add(
-            f"- active sink: `{sink_kind}`"
-            + (f" at `{sink_root}`" if sink_root else "")
-            + " -- what a command with no `--sink` flag reads"
-        )
-    else:
-        add("- active sink: see `arbite sink info`")
-    if mismatch:
-        add(
-            f"- also present, but not selected: `{stale_kind}` at `{stale_root}` "
-            f"({stale_count} ticket(s))"
-        )
+    add("## The commands you will type most")
+    add("")
+    add("```")
+    add("arbite list next --tier high                  # next workable ticket")
+    add("arbite list next --tier high --claim <id>     # select and claim in one step")
+    add("arbite claim <id> --agent <your-id>           # take a ticket you already know")
+    add('arbite note <id> <your-id> "what changed"     # log progress as you go')
+    add("arbite submit <id>                            # hand off (review/, or closed)")
+    add("arbite accept <id> --agent <reviewer-id>      # the reviewer closes it")
+    add('arbite bug|feature|request|memo|wish "..."   # quick capture; classify later')
+    add("arbite fetch                                   # oldest raw capture")
+    add("arbite promote <id> --title ... --tier ... --domain ...   # classify in place")
+    add("arbite show <id>                              # read a ticket in full")
+    add("arbite status                                  # backlog counts per status")
+    add("arbite sink info                              # which store am I reading")
+    add("```")
+    add("")
     add(
-        "- confirm it at any time: `arbite sink info --json` -- its `kind` field is the store "
-        "your command will read. Selection, highest precedence first: `--sink <kind>`, "
-        "`ARBITE_SINK`, a `sink:` key in `.arbite/project.yaml`, then the default (`file`); that "
-        "key is the committed choice, and `arbite init`/`arbite migrate` write it for you"
-    )
-    add(
-        "- `--root DIR` runs the command against another project: the project is the nearest "
-        "`.arbite/` at or above DIR, exactly as if arbite were started there (default: the "
-        "current directory). It changes only *which* project is located, not the sink selection"
-    )
-    add(
-        "- `--color WHEN` decides when reports are coloured: `auto` (the default) only when "
-        "stdout is a terminal that will render escapes, `always`, or `never`. `NO_COLOR` turns "
-        "it off and `ARBITE_COLOR` sets an environment's default; colour is decoration, so no "
-        "table says less in plain text and `--json` is never coloured at all. The palette is "
-        "the base 16 colours, with the epic violet and the assignee orange drawn from the "
-        "extended palette only where the terminal says it has one"
-    )
-    add(
-        "- a top-level `review:` key (default `true`) is where a finished ticket goes: `review/` "
-        "when true, `closed/` when false -- it does not remove the `review` status or folder, "
-        "and a value that is not a real boolean is a config error naming the file and the key"
-    )
-    add(
-        "- available kinds: `file` (markdown files under the arbite directory, the default, and "
-        "the one that gives you `git log --follow` history) and `sqlite` (a single database "
-        "file, queryable with real SQL, and not version-control friendly); report or create "
-        "yours with `arbite sink info` / `arbite sink init`"
-    )
-    add(
-        "- `arbite status` counts the *backlog* -- every status in vocabulary order, zeros and a "
-        "total included, narrowed by `--epic`/`--domain`/`--tier`/`--assignee`; `arbite sink "
-        "info` describes the *store* instead (its kind, root and capabilities, not what is in it)"
-    )
-    add(
-        "- `arbite progress` shows what is *in flight*: the epics holding a live ticket (open, "
-        "in_progress or review) and then every ticket of those epics, closed and shelved "
-        "siblings included, in dependency order -- an epic with nothing live never appears, "
-        "live tickets with no epic group under `no epic`, and `--epic` narrows the report"
-    )
-    add(
-        "- `arbite set-status <id> <status>` changes one ticket's status through the same code "
-        "path as `arbite set <id> status <value>`, so the two cannot drift; the vocabulary comes "
-        "from the schema (so `review`, and anything added later, is accepted), a status change "
-        "un-files a ticket held in a bucket, and asking for the status it already has is a no-op"
-    )
-    add(
-        "- `arbite submit <id>` hands finished work off: with `review:` on (the default) the "
-        "ticket becomes `review` in `review/`, **keeping its assignee** -- they are who a "
-        "reviewer sends it back to -- and with `review: false` the same command closes it. "
-        "`arbite accept <id>` closes accepted work, credited to the reviewer; the rejection "
-        "path is `arbite reopen --reason ...`, which is why that reason is mandatory"
+        "Changing a file another agent may touch? Use the proxy (`arbite docs workspace`) "
+        "rather than a shell write: only the proxy records the change against a ticket and "
+        "an attempt, and a shell write is drift the next read reports as an external edit."
     )
     add("")
-    if status_is_location and sink_kind == "file":
+    add("## Go deeper")
+    add("")
+    add("- `arbite docs list` -- every topic, one line each")
+    add("- `arbite docs <topic>` -- one subject in depth")
+    add("- `arbite docs commands [NAME]` -- usage and every flag for a command")
+    add("- `arbite docs all` -- every topic in one stream (e.g. to regenerate a file)")
+    add("- `arbite <command> -h` -- the CLI's own help for that command")
+    add("")
+    return lines
+
+
+def _topic_workflow(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    add("# Workflow: statuses and transitions")
+    add("")
+    add(
+        "A ticket's `status` is one of `" + " | ".join(STATUSES) + "` -- its state in the "
+        "workflow, and on a file sink the folder it sits in. `raw` is an unclassified "
+        "capture (never offered by `list next`); `open` is actionable and unclaimed; "
+        "`in_progress` is claimed; `review` is finished and awaiting a reviewer; "
+        "`blocked` is stalled (`blocked_by`); `shelved` is parked; `closed` is done."
+    )
+    add("")
+    add("## Transitions")
+    add("")
+    add(
+        "- `claim <id> --agent <id>` -- take an open ticket: sets `status: in_progress` "
+        "and the assignee together, and records the *work attempt* (printed as `attempt: "
+        "att-XXXX` -- keep it, every later `arbite file` command presents it)"
+    )
+    add(
+        "- `release <id> --agent <id> --reason TEXT` -- hand back work you stop part-way: "
+        "clears the assignee and any block reason, so `list next` offers it again"
+    )
+    add(
+        "- `block <id> --reason TEXT` / `unblock <id>` -- mark stalled, then clear the "
+        "block and return to `in_progress` (`--open` returns it to `open`)"
+    )
+    add(
+        "- `shelve <id> --reason TEXT` / `unshelve <id> --reason TEXT` -- park for later, "
+        "then bring it back to `open`"
+    )
+    add(
+        "- `close <id>` -- finish and archive (the ticket is kept forever); `delete <id> "
+        "--force` destroys it, and is deliberately gated. Prefer `close`"
+    )
+    add(
+        "- `reopen <id> --reason TEXT` -- reopen (clears the closed date and any block "
+        "reason); the reason is **required**, and is the rejection path out of review"
+    )
+    add(
+        "- `submit <id>` -- hand finished work off: with `review:` on (the default) it "
+        "becomes `review` in `review/`, **keeping its assignee** (they are who a reviewer "
+        "sends it back to); with `review: false` the same command closes it"
+    )
+    add(
+        "- `accept <id> --agent <reviewer-id>` -- close accepted work, credited to the "
+        "reviewer"
+    )
+    add(
+        "- `set-status <id> <status>` -- any status, through the same path as `set <id> "
+        "status <value>`; a change un-files a bucketed ticket, and asking for the status "
+        "it already has is a no-op"
+    )
+    add("")
+    if ctx.status_is_location:
+        add(
+            "Every state-changing command performs the file move and the frontmatter "
+            "update in one operation, so `status` and the folder cannot disagree -- and "
+            "when something outside arbite breaks the pairing, **the folder wins** and "
+            "`arbite doctor --fix` rewrites the frontmatter to match. Use `set-status` in "
+            "preference to `set status`: it is the same path and cannot drift."
+        )
+        add("")
+    add(
+        "`block`, `shelve`, `release`, `unblock`, `reopen` and `unshelve` also append an "
+        "automatic timestamped note explaining the change."
+    )
+    add("")
+    add("## A typical session")
+    add("")
+    add("```")
+    add("arbite list next --tier high                          # next workable open ticket")
+    add("arbite list next --count 3 --tier high                # ...or a batch of three")
+    add("arbite list next --epic mesh-pipeline                 # next in one epic")
+    add('arbite raw feature "add per-mesh LOD"                 # quick capture')
+    add("arbite fetch                                          # oldest raw ticket")
+    add('arbite promote tic-a1b2 --title "Add per-mesh LOD" --tier medium --domain mesh')
+    add("arbite move tic-a1b2 /wishlist                        # file a reclassified wish")
+    add("arbite show tic-a1b2                                  # read it in full")
+    add("arbite claim tic-a1b2 --agent claude.haiku.001        # take it")
+    add("arbite stream write tic-a1b2 -                         # narrate as you work")
+    add('arbite note tic-a1b2 claude.haiku.001 "progress"      # log progress')
+    add('arbite block tic-a1b2 --reason "waiting on tic-c3d4"  # if stalled')
+    add("arbite unblock tic-a1b2 --agent claude.haiku.001      # blocker cleared")
+    add('arbite release tic-a1b2 --agent claude.haiku.001 --reason "wrong tier for me"')
+    add('arbite shelve tic-a1b2 --reason "parked for later"    # if deprioritized')
+    add('arbite unshelve tic-a1b2 --reason "back in scope"     # bring it back to open')
+    add("arbite submit tic-a1b2                                # hand off")
+    add("arbite accept tic-a1b2 --agent claude.opus.001        # the reviewer closes it")
+    add("arbite sink info                                      # where do tickets live")
+    add("arbite migrate --to sqlite                            # copy into another sink")
+    add("```")
+    add("")
+    add(
+        "`arbite bug|feature|request|memo|wish <message>` == `arbite raw <type> "
+        "<message>`: the same raw ticket from a shorter command. Read the `triage` topic "
+        "for capture and classification, and `conventions` for ids, exit codes and JSON."
+    )
+    add("")
+    return lines
+
+
+def _topic_fields(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    title = "# Ticket fields" + (" (YAML frontmatter)" if ctx.status_is_location else "")
+    add(title)
+    add("")
+    for field_name in FIELD_ORDER:
+        add(f"- `{field_name}` -- {FIELD_NOTES.get(field_name, '')}")
+    add("")
+    add(
+        "These axes are independent -- don't collapse them: `depends_on` (structural "
+        "ticket ids) vs `references` (plan documents, root-relative under `.arbite/`) vs "
+        "`blocked_by` (freeform prose); `tier` (capability) vs `domain` (specialization) "
+        "vs `priority` (urgency) -- an urgent low-tier chore is possible, and a low-tier "
+        "ticket can still be audio_gen-only; `domain` (routing) vs `tags` (search). "
+        "Given a choice of workable tickets, take the lowest `priority` number."
+    )
+    add("")
+    add(
+        "Manage `references` one at a time with `arbite ref add <id> <path>...` / `arbite "
+        "ref rm <id> <path>...` / `arbite ref list <id>` (`--json` gives `{id, "
+        "references}`); `set references` and `create --references` take the comma-separated "
+        "form. A referenced plan need not exist yet, so a missing one only **warns** (and "
+        "`doctor` reports `dangling_reference`): write the plan, or drop the reference by "
+        "hand -- `doctor --fix` will not guess which you meant."
+    )
+    add("")
+    return lines
+
+
+def _topic_sinks(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    add("# Where tickets live (the sink)")
+    add("")
+    add(
+        "Tickets live in a **sink**: a storage backend selected per command. Commands, "
+        "fields, filters and exit codes behave identically whichever one is in use, so "
+        "only two things change: where the data sits, and what `arbite doctor` can check."
+    )
+    add("")
+    if ctx.mismatch:
+        add(_stale_store_warning(ctx.stale_kind, ctx.stale_root, ctx.stale_count,
+                                 ctx.sink_kind, ctx.sink_root))
+        add("")
+    add(
+        f"- active sink: `{ctx.sink_kind}`"
+        + (f" at `{ctx.sink_root}`" if ctx.sink_root else "")
+        + " -- what a command with no `--sink` flag reads"
+    )
+    if ctx.mismatch:
+        add(
+            f"- also present, but not selected: `{ctx.stale_kind}` at `{ctx.stale_root}` "
+            f"({ctx.stale_count} ticket(s))"
+        )
+    add(
+        "- selection, highest precedence first: `--sink <kind>`, the `ARBITE_SINK` "
+        "environment variable, a `sink:` key in `.arbite/project.yaml`, then the default "
+        "(`file`). `init`/`migrate` write that key for you, so the store you set up is the "
+        "one a plain command reads"
+    )
+    add(
+        "- available kinds: `file` (markdown files under the arbite directory, the "
+        "default, and the one that gives you `git log --follow` history) and `sqlite` (a "
+        "single database file, queryable with real SQL, and not version-control "
+        "friendly). Report or create yours with `arbite sink info` / `arbite sink init`; "
+        "`arbite sink info --json`'s `kind` field is the store your command will read"
+    )
+    add(
+        "- `--root DIR` runs the command against another project: the project is the "
+        "nearest `.arbite/` at or above DIR, exactly as if arbite were started there. It "
+        "changes only *which* project is located, not the sink selection"
+    )
+    add(
+        "- `--color WHEN` decides when reports are coloured: `auto` (the default, only "
+        "when stdout is a terminal that will render escapes), `always`, or `never`. "
+        "`NO_COLOR` turns it off and `ARBITE_COLOR` sets an environment's default; "
+        "`--json` is never coloured"
+    )
+    add(
+        "- a top-level `review:` key (default `true`) is where a finished ticket goes: "
+        "`review/` when true, `closed/` when false -- it does not remove the `review` "
+        "status or folder, and a value that is not a real boolean is a config error "
+        "naming the file and the key"
+    )
+    add("")
+    if ctx.status_is_location:
+        add("A file-sink project looks like this:")
+        add("")
         add("```")
         add(".arbite/")
         add("  raw/            unclassified captures -- not workable (see Triage)")
@@ -659,205 +816,225 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
         add("")
         add(
             "`raw/`, `open/`, `in_progress/`, `review/`, `blocked/`, `shelved/` and "
-            "`closed/YYYY-MM/` are status folders: the frontmatter `status` mirrors the folder, "
-            "every state-changing command updates both at once, and when something outside "
-            "arbite breaks the pairing the folder wins. `wishlist/` and `plans/` are **buckets**, "
-            "not statuses: a ticket filed in one is out of the status workflow (so `list next` "
-            "never offers it) but keeps the status it had -- `arbite move <id> /plans` files it, "
-            "`arbite move <id> /` un-files it, and what a bucket physically is belongs to the "
-            "sink. Filenames never change on a move, so `git log --follow` traces a ticket's "
-            "whole lifecycle."
+            "`closed/YYYY-MM/` are status folders: the frontmatter `status` mirrors the "
+            "folder, every state-changing command updates both at once, and when something "
+            "outside arbite breaks the pairing **the folder wins**. `wishlist/` and `plans/` "
+            "are **buckets**, not statuses: a ticket filed in one is out of the status "
+            "workflow (so `list next` never offers it) but keeps the status it had -- `arbite "
+            "move <id> /plans` files it, `arbite move <id> /` un-files it. Filenames never "
+            "change on a move, so `git log --follow` traces a ticket's whole lifecycle."
         )
         add("")
         add(
             "`raw/processed/` holds verbatim copies of captures that have since been promoted "
-            "(`<id>.raw.md`, written once and never overwritten). A snapshot is **not** a ticket "
-            "-- it keeps its original `status: raw` frontmatter -- so everything under the "
-            "directory is skipped by path: invisible to `list`, `fetch`, `doctor` and the id "
-            "index, and an already-promoted request is never re-served."
+            "(`<id>.raw.md`, written once). A snapshot is **not** a ticket -- it keeps its "
+            "original `status: raw` frontmatter -- so everything under the directory is "
+            "skipped by path: invisible to `list`, `fetch`, `doctor` and the id index."
+        )
+        add("")
+    else:
+        add(
+            "This project does not store tickets as files, so there is no folder to "
+            "read as state and nothing for `git log --follow` to follow: the sink "
+            "holds the tickets and `status` is held with them. `arbite doctor` checks "
+            "the invariants that still apply (invalid field values, dependency "
+            "cycles, dangling dependencies, claimed tickets with no assignee) plus "
+            "its own storage-specific ones."
+        )
+        add("")
+    add("## Configuration")
+    add("")
+    add("```yaml")
+    add("# .arbite/project.yaml")
+    add("sink: sqlite")
+    add("sinks:")
+    add("  file:   { root: .arbite }            # optional location overrides")
+    add("  sqlite: { path: .arbite/arbite.db }")
+    add("agents: [claude.haiku.001]")
+    add("review: true                           # where 'arbite submit' files finished work")
+    add("```")
+    add("")
+    add(
+        "`arbite init` initialises whichever sink is selected and writes the choice into "
+        "`.arbite/project.yaml` (created if missing, every other key left alone), so no "
+        "later command reads a different store by accident. Creating a database-backed "
+        "project is one flag, not a different command: `arbite init --sink sqlite`. An "
+        "`ARBITE_SINK` selection is this-process-only and is reported rather than written."
+    )
+    add("")
+    add("## Migrating and checking")
+    add("")
+    add(
+        "- `arbite migrate --to <kind>` copies every ticket -- status-managed and bucketed "
+        "-- preserving ids, timestamps, body, tags, dependencies, notes and buckets "
+        "verbatim, leaving the source alone. `--prune` retires the source once the copy is "
+        "verified; `--dry-run` reports without touching either side; `--overwrite` "
+        "replaces destination tickets that share an id"
+    )
+    add(
+        "- coordination records travel with the tickets: attempts, claims, receipts and "
+        "event cursors are copied as one unit, and `migrate` refuses (exit 4, holders "
+        "named) while *either* store holds a live claim or attempt"
+    )
+    if ctx.status_is_location:
+        add(
+            "- `arbite doctor` checks the invariants that mean the same thing anywhere "
+            "(duplicate ids, invalid fields, dependency cycles, dangling dependencies and "
+            "references, `in_progress` without an assignee) plus this sink's own: "
+            "frontmatter/folder drift, a loose ticket in the arbite root, stranded temp "
+            "files, closed tickets archived under the wrong month. `--fix` repairs only "
+            "what is unambiguous and exits 3 while problems remain"
         )
     else:
         add(
-            "This project does not store tickets as files, so there is no folder to read as state "
-            "and nothing for `git log --follow` to follow: the sink holds the tickets and `status` "
-            "is held with them. `arbite doctor` checks the invariants that still apply (invalid "
-            "field values, dependency cycles, dangling dependencies, claimed tickets with no "
-            "assignee) plus its own storage-specific ones."
+            "- `arbite doctor` checks the invariants that mean the same thing anywhere "
+            "(duplicate ids, invalid fields, dependency cycles, dangling dependencies and "
+            "references, `in_progress` without an assignee) plus this sink's own: a note "
+            "index drifted from the ticket body, orphaned index rows, an unexpected schema "
+            "version, structural corruption. `--fix` repairs only what is unambiguous and "
+            "exits 3 while problems remain"
         )
-    add("")
-
-    # -- Fields ------------------------------------------------------------
-    add("## Ticket fields (YAML frontmatter)")
-    add("")
-    for field_name in FIELD_ORDER:
-        add(f"- `{field_name}` -- {FIELD_NOTES.get(field_name, '')}")
-    add("")
     add(
-        "These axes are independent -- don't collapse them: `depends_on` (structural ticket ids) "
-        "vs `references` (plan documents, root-relative under `.arbite/`) vs `blocked_by` "
-        "(freeform prose); `tier` (capability) vs `domain` (specialization) vs `priority` "
-        "(urgency) -- an urgent low-tier chore is possible, and a low-tier ticket can still be "
-        "audio_gen-only; `domain` (routing) vs `tags` (search). Given a choice of workable "
-        "tickets, take the lowest `priority` number."
+        "- keep a sqlite store out of git (it is binary and gives no readable history); "
+        "`arbite init --gitignore` installs the runtime-state entries (coordination/, "
+        "scratch/, streams/, any sqlite store and its sidecars) into `.gitignore` as a "
+        "marked, refreshable section"
     )
     add("")
-    add(
-        "Manage `references` one at a time with `arbite ref add <id> <path>...` / `arbite ref rm "
-        "<id> <path>...` / `arbite ref list <id>` (`--json` gives `{id, references}`); `set "
-        "references` and `create --references` take the comma-separated form. A referenced plan "
-        "need not exist yet, so a missing one only **warns** (and `doctor` reports "
-        "`dangling_reference`): write the plan, or drop the reference by hand -- `doctor --fix` "
-        "will not guess which you meant."
-    )
-    add("")
+    return lines
 
-    # -- Identity ----------------------------------------------------------
-    add("## Agent identity and resuming work")
+
+def _topic_agents(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    add("# Agent identity, resuming, and attempts")
     add("")
     add(
         "Agent ids are `company.model.instance`, e.g. `claude.haiku.001`; each agent has a "
-        "scratchpad at `.arbite/agents/<agent_id>.md`. Know your `tier` before claiming and pass "
-        "it to `arbite list next --tier <tier>` so you are only offered work you can actually do."
+        "scratchpad at `.arbite/agents/<agent_id>.md`. Know your `tier` before claiming "
+        "and pass it to `arbite list next --tier <tier>` so you are only offered work you "
+        "can actually do. Identity assignment, collision avoidance and liveness detection "
+        "belong to the agent harness, not arbite -- arbite only reads a static `agents:` "
+        "list to pre-create scratchpads."
     )
     add("")
-    if status_is_location:
+    if ctx.status_is_location:
         add(
-            "To resume: check your scratchpad for a last-known ticket id, then verify that ticket "
-            "is still where a claimed ticket belongs -- in `in_progress/`, with `assignee` "
-            "matching your own id (`arbite show <id> --json` prints its path). The location is "
-            "ground truth, the scratchpad only a hint; if it is missing, stale or mismatched, "
-            "look for a ticket assigned to you with `arbite list --assignee <your-id>`. Identity "
-            "assignment, collision avoidance and liveness detection belong to the agent harness, "
-            "not arbite."
+            "To resume: check your scratchpad for a last-known ticket id, then verify that "
+            "ticket is still where a claimed ticket belongs -- in `in_progress/`, with "
+            "`assignee` matching your own id (`arbite show <id> --json` prints its path). "
+            "The location is ground truth, the scratchpad only a hint; if it is missing, "
+            "stale or mismatched, find a ticket assigned to you with `arbite list "
+            "--assignee <your-id>`."
         )
     else:
         add(
-            "To resume: check your scratchpad for a last-known ticket id, then verify that ticket "
-            "is still `status: in_progress` with `assignee` matching your own id "
-            "(`arbite show <id> --json`). That is ground truth, the scratchpad only a hint; if it "
-            "is missing, stale or mismatched, look for a ticket assigned to you with "
-            "`arbite list --assignee <your-id>`. Identity assignment, collision avoidance and "
-            "liveness detection belong to the agent harness, not arbite."
+            "To resume: check your scratchpad for a last-known ticket id, then verify that "
+            "ticket is still `status: in_progress` with `assignee` matching your own id "
+            "(`arbite show <id> --json`). That is ground truth, the scratchpad only a "
+            "hint; if it is missing, stale or mismatched, find a ticket assigned to you "
+            "with `arbite list --assignee <your-id>`."
         )
     add("")
-
-    # -- Workflow ----------------------------------------------------------
-    add("## Typical workflow")
-    add("")
-    add("```")
-    add("arbite list next --tier high                          # next workable open ticket")
-    add("arbite list next --count 3 --tier high                # ...or a batch of three")
-    add("arbite list next --epic mesh-pipeline                 # next workable ticket in an epic")
-    add("arbite list next --epic classification                # next raw ticket needing triage")
-    add("arbite list raw                                       # raw backlog as a todo list")
-    add("arbite status                                         # tickets per status (+ total)")
-    add("arbite status --epic mesh-pipeline                    # ...for one epic")
-    add("arbite progress                                       # live epics and their closed siblings")
-    add('arbite search --params title,body "LOD pop-in"        # find tickets by text')
-    add('arbite raw feature "add per-mesh LOD"                 # quick capture; classify later')
-    add('arbite raw request "collapse the toolbar by default"  # a tweak/lateral change request')
-    add('arbite raw wish "fly-through camera preview"          # capture a wish; file it later')
-    add("arbite fetch                                          # oldest raw ticket to classify")
-    add('arbite promote tic-a1b2 --title "Add per-mesh LOD" --tier medium --domain mesh')
-    add("arbite promote tic-a1b2 --agent claude.haiku.001      # ...or classify and claim at once")
-    add("arbite move tic-a1b2 /wishlist                        # file a reclassified wish by hand")
-    add("arbite show tic-a1b2                                  # read it in full")
-    add("arbite claim tic-a1b2 --agent claude.haiku.001        # take it (status -> in_progress)")
-    add("arbite stream write tic-a1b2 -                         # narrate as you work (live tail)")
-    add('arbite note tic-a1b2 claude.haiku.001 "progress"      # ...do the work, log progress...')
-    add('arbite block tic-a1b2 --reason "waiting on tic-c3d4"  # if stalled')
-    add("arbite unblock tic-a1b2 --agent claude.haiku.001      # blocker cleared")
-    add('arbite release tic-a1b2 --agent claude.haiku.001 --reason "wrong tier for me"')
-    add('arbite shelve tic-a1b2 --reason "parked for later"    # if deprioritized')
-    add('arbite unshelve tic-a1b2 --reason "back in scope"     # bring it back to open')
-    add("arbite close tic-a1b2                                 # when done")
-    add('arbite reopen tic-a1b2 --reason "tests fail on ARM"   # --reason is required')
-    add("arbite set-status tic-a1b2 review                     # any status, same path as set status")
-    add("arbite submit tic-a1b2                                # hand it off (review/, or closed when review: false)")
-    add("arbite accept tic-a1b2 --agent claude.opus.001        # the reviewer closes it, credited")
-    add("arbite sink info                                      # where do tickets live, and in what")
-    add("arbite migrate --to sqlite                            # copy every ticket into another sink")
-    add("```")
+    add("## Work attempts")
     add("")
     add(
-        "`arbite bug|feature|request|memo|wish <message>` == `arbite raw <type> <message>`: the "
-        "same raw ticket from a shorter command. Any command takes `-h`/`--help`, which is where "
-        "its flags are documented (the reference below is a name and a purpose, not a flag list)."
+        "Claiming (directly, through `list next --claim`, or with `promote --agent`) "
+        "records the *work attempt* that owns the work and prints it as `attempt: "
+        "att-XXXX`: every later `arbite file` command presents that id, so keep it. "
+        "Acquisition checks the rules a queue only filters on -- every `depends_on` "
+        "closed, the classification real (no `TODO:` placeholders), the ticket `open` and "
+        "unclaimed, no active attempt already -- so naming a ticket directly cannot bypass "
+        "them."
     )
-    add("")
-
-    # -- Narration ---------------------------------------------------------
-    add("## Narration streams")
     add("")
     add(
-        "A worker narrates as it goes with `arbite stream write <id> -` (or a line argument); "
-        "records land in `.arbite/streams/<id>.jsonl`, gitignored, and a dashboard polls them "
-        "with `arbite stream read <id> --after <seq>`. This is per-ticket prose, distinct from "
-        "`arbite events`, which is the coordination fact stream."
+        "`--force` is the administrative takeover and needs `--reason`: it ends the "
+        "holder's attempt as `interrupted`, records the revocation, and starts a fresh "
+        "attempt for you. Work that was already `in_progress` before arbite tracked "
+        "attempts is adopted with `arbite attempt adopt <id> --agent <your-id>`. Release, "
+        "block, shelve and reopen end the attempt they stop, and reopening a ticket other "
+        "work depends on flags the running dependents instead of undoing their work."
     )
     add("")
+    return lines
 
-    # -- Triage ------------------------------------------------------------
-    add("## Triage: raw tickets, wishes, filing")
+
+def _topic_triage(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    add("# Triage: raw tickets, wishes and filing")
     add("")
     add(
         f"A **raw** ticket (`arbite raw <{'|'.join(RAW_TYPE_CHOICES)}> <message>`) is a "
-        f"deliberately unclassified quick capture: status `raw`, never returned by `arbite list "
-        f"next`, carrying only `type` plus a placeholder title (`<type> (raw): Requires "
-        f"Classification`), auto-grouped under the `{CLASSIFICATION_EPIC}` epic (find them with "
-        f"`arbite list next --epic {CLASSIFICATION_EPIC}`). Its body lists what triage must fill "
-        f"in -- a real title, `tier`, `domain`, a real `epic`, `priority`, an expanded "
-        f"description -- before it can be claimed. Raw tickets exist so a thought isn't lost, not "
-        f"as work: classify them before picking them up."
+        f"deliberately unclassified quick capture: status `raw`, never returned by `arbite "
+        f"list next`, carrying only `type` plus a placeholder title, auto-grouped under "
+        f"the `{CLASSIFICATION_EPIC}` epic (find them with `arbite list next --epic "
+        f"{CLASSIFICATION_EPIC}`). Its body lists what triage must fill in -- a real title, "
+        f"`tier`, `domain`, a real `epic`, `priority`, an expanded description -- before "
+        f"it can be claimed. Raw tickets exist so a thought isn't lost, not as work: "
+        f"classify them before picking them up."
     )
     add("")
     add(
-        "`arbite list raw` prints the whole raw backlog as a todo list (grouped by type, one line "
-        "per ticket, oldest first) until a classification run drains it. `arbite fetch [type]` "
-        "pulls the single oldest raw ticket and prints it like `show`, with a `derived_note` "
-        "telling you to classify it -- it never writes anything."
+        "`arbite list raw` prints the whole raw backlog as a todo list (grouped by type, "
+        "one line per ticket, oldest first). `arbite fetch [type]` pulls the single oldest "
+        "raw ticket and prints it like `show`, with a `derived_note` telling you to "
+        "classify it -- it never writes anything."
     )
     add("")
     add(
-        "**`arbite promote <id>`** is the write half: it classifies a raw ticket in one command. "
-        "It snapshots the capture verbatim to `raw/processed/<id>.raw.md` first (exclusive "
-        "create, so promoting the same id twice is an error), then writes the required "
-        "`--title`/`--tier`/`--domain` plus `--epic`/`--priority`/`--description`/`--tags`, **in "
-        "place** through a compare-and-swap -- the id, `created` and any notes carry over, and an "
-        "omitted `--epic` clears the `classification` grouping. It lands at `open`, or at "
-        "`in_progress` assigned to `--agent <id>` when you are about to work it; an "
-        "already-classified ticket is refused."
+        "**`arbite promote <id>`** is the write half: it classifies a raw ticket in one "
+        "command. It snapshots the capture verbatim to `raw/processed/<id>.raw.md` first "
+        "(exclusive create, so promoting the same id twice is an error), then writes the "
+        "required `--title`/`--tier`/`--domain` plus `--epic`/`--priority`/`--description`/"
+        "`--tags`, **in place** through a compare-and-swap -- the id, `created` and any "
+        "notes carry over, and an omitted `--epic` clears the `classification` grouping. "
+        "It lands at `open`, or at `in_progress` assigned to `--agent <id>` when you are "
+        "about to work it; an already-classified ticket is refused."
     )
     add("")
     add(
-        "A **wish** (`arbite wish <message>`) is a wishlist item, not work: `promote` retypes it "
-        "to `feature`, applies the classification and files it in the wishlist bucket, leaving "
-        "its status at `raw` so it leaves the triage queue without becoming work (`--agent` is "
-        "refused). A **request** is a tweak or lateral change to something that already exists "
-        "-- ordinary work once classified, so keep the type and promote it like any other raw "
-        "ticket. A **memo** asks for project notes/docs rather than a code change."
+        "A **wish** (`arbite wish <message>`) is a wishlist item, not work: `promote` "
+        "retypes it to `feature`, applies the classification and files it in the wishlist "
+        "bucket, leaving its status at `raw` so it leaves the triage queue without "
+        "becoming work (`--agent` is refused). A **request** is a tweak or lateral change "
+        "to something that already exists -- ordinary work once classified, so keep the "
+        "type and promote it like any other raw ticket. A **memo** asks for project "
+        "notes/docs rather than a code change."
     )
     add("")
+    add(
+        "Any command that takes a ticket id accepts an exact id or any unique wildcard "
+        "(substring) match: 'f6' resolves to tic-f607, and an exact id always wins. A "
+        "command that modifies a ticket treats an ambiguous match as an error listing the "
+        "candidates; read-only `show` and `deps` take the first alphabetically instead."
+    )
+    add("")
+    return lines
 
-    # -- Conventions -------------------------------------------------------
-    add("## Conventions (scripts and agent loops)")
+
+def _topic_conventions(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    add("# Conventions (scripts and agent loops)")
     add("")
     add(
-        "**Ticket ids.** An id argument is an exact id or any unique wildcard (substring) match: "
-        "'f6' resolves to tic-f607, and an exact id always wins. A command that modifies a ticket "
-        "treats an ambiguous match as an error listing the candidates; read-only `show` and "
-        "`deps` take the first alphabetically instead."
+        "**Ticket ids.** An id argument is an exact id or any unique wildcard (substring) "
+        "match: 'f6' resolves to tic-f607, and an exact id always wins. A command that "
+        "modifies a ticket treats an ambiguous match as an error listing the candidates; "
+        "read-only `show` and `deps` take the first alphabetically instead."
     )
     add("")
     add(
-        "**Exit codes**, so a shell loop can branch without matching on message text: 0 success "
-        "with results; 1 error (bad arguments, ambiguous ticket id, a refused path, a claim "
-        "naming the wrong attempt, ...); 2 the query ran fine but matched nothing (e.g. no "
-        "workable ticket right now); 3 `arbite doctor` found integrity problems; 4 busy -- a live "
-        "claim or attempt holds it and **nothing changed**, so pick other work rather than "
-        "retrying; 5 stale -- a token, digest or generation is no longer current and **nothing "
-        "changed**, so re-read and retry. `arbite cmd` is the one exception: it returns the "
-        "wrapped command's own code."
+        "**Exit codes**, so a shell loop can branch without matching on message text: 0 "
+        "success with results; 1 error (bad arguments, ambiguous ticket id, a refused "
+        "path, a claim naming the wrong attempt); 2 the query ran fine but matched nothing "
+        "(e.g. no workable ticket right now); 3 `arbite doctor` found integrity problems; "
+        "4 busy -- a live claim or attempt holds it and **nothing changed**, so pick other "
+        "work rather than retrying; 5 stale -- a token, digest or generation is no longer "
+        "current and **nothing changed**, so re-read and retry. `arbite cmd` is the one "
+        "exception: it returns the wrapped command's own code."
     )
     add("")
     add("```")
@@ -871,379 +1048,473 @@ def render(parser, subparsers_by_name: dict, active_info=None, stale_info=None) 
     add("")
     add(
         "**Parse JSON, not tables.** `--json` on `list`, `list next`, `list raw`, `fetch`, "
-        "`show`, `search`, `deps`, `doctor`, `sink`, `status` and `delete` emits machine-readable "
-        "output whose field names match the frontmatter; the human table format is not a stable "
-        "interface. The `path` field is whatever the sink calls a ticket's location."
+        "`show`, `search`, `deps`, `doctor`, `sink`, `status` and `delete` emits "
+        "machine-readable output whose field names match the frontmatter; the human table "
+        "format is not a stable interface. The `path` field is whatever the sink calls a "
+        "ticket's location."
     )
     add("")
     add(
-        "**Claim in one step.** `arbite list next --claim <agent_id>` selects the most urgent "
-        "workable ticket *and* claims it in the same write; `arbite claim <id> --agent "
-        "<agent_id>` does the same for a ticket you already know. Either way the claim sets "
-        "`status: in_progress` and the assignee together (on the file sink the ticket moves to "
-        "`in_progress/`), so never follow a claim with a separate `set status` -- and prefer "
-        "`--claim` to running `list next` then `claim`, because between those two commands "
-        "another agent can take the ticket. A claim is a compare-and-swap: it fails if the ticket "
-        "is already assigned to someone else unless you pass `--force`, and it refuses to write "
-        "over a ticket that changed since it was read."
+        "**Claim in one step.** `arbite list next --claim <agent_id>` selects the most "
+        "urgent workable ticket *and* claims it in the same write; `arbite claim <id> "
+        "--agent <agent_id>` does the same for a ticket you already know. Either way the "
+        "claim sets `status: in_progress` and the assignee together, so never follow a "
+        "claim with a separate `set status` -- and prefer `--claim` to running `list next` "
+        "then `claim`, because between those two commands another agent can take the "
+        "ticket. A claim is a compare-and-swap: it fails if the ticket is already assigned "
+        "to someone else unless you pass `--force`, and it refuses to write over a ticket "
+        "that changed since it was read."
     )
     add("")
     add(
-        "**A claim records an attempt, and hands you its id.** Claiming (directly, through `list "
-        "next --claim`, or with `promote --agent`) records the *work attempt* that owns the work "
-        "and prints it as `attempt: att-XXXX`: every later `arbite file` command presents that "
-        "id, so keep it. Acquisition checks the rules a queue only filters on -- every "
-        "`depends_on` closed, the classification real (no `TODO:` placeholders), the ticket "
-        "`open` and unclaimed, no active attempt already -- so naming a ticket directly cannot "
-        "bypass them. `--force` is the administrative takeover and needs `--reason`: it ends the "
-        "holder's attempt as `interrupted`, records the revocation, and starts a fresh attempt "
-        "for you. Work that was already `in_progress` before arbite tracked attempts is adopted "
-        "with `arbite attempt adopt <id> --agent <your-id>`. Release, block, shelve and reopen "
-        "end the attempt they stop, and reopening a ticket other work depends on flags the "
-        "running dependents instead of undoing their work."
+        "**Pull a batch with `--count N`.** `arbite list next --count 3` returns the 3 "
+        "most urgent workable tickets instead of 1, so a dispatcher can fan work out to "
+        "several agents in one query; adding `--claim <agent_id>` claims up to N of them. "
+        "Each claim is individually compared-and-swapped, so if another agent races you "
+        "for one the rest still succeed -- a short batch is a real result, and the count "
+        "actually claimed is reported on stderr. `--count` also caps a plain `list`, "
+        "`--topo` (rows) or `--tree` (top-level roots, never truncating a subtree)."
     )
     add("")
     add(
-        "**Pull a batch with `--count N`.** `arbite list next --count 3` returns the 3 most urgent "
-        "workable tickets instead of 1, so a dispatcher can fan work out to several agents in one "
-        "query; adding `--claim <agent_id>` claims up to N of them. Each claim is individually "
-        "compared-and-swapped, so if another agent races you for one the rest still succeed -- a "
-        "short batch is a real result, and the count actually claimed is reported on stderr. "
-        "`--count` also caps a plain `list`, `--topo` (rows) or `--tree` (top-level roots, never "
-        "truncating a subtree)."
+        "**Removing a ticket is not the same as finishing it.** `arbite close` moves a "
+        "ticket out of the work queues and keeps it forever; `arbite delete <id> --force` "
+        "destroys it, records a note saying so first, and is deliberately gated. Prefer "
+        "`close`."
     )
     add("")
-    add(
-        "**Removing a ticket is not the same as finishing it.** `arbite close` moves a ticket out "
-        "of the work queues and keeps it forever; `arbite delete <id> --force` destroys it, "
-        "records a note saying so first, and is deliberately gated. Prefer `close`."
-    )
-    add("")
-
-    # -- Commands ----------------------------------------------------------
-    add("## Commands")
-    add("")
-    add(
-        "Rendered from the installed version's own parsers, so it always matches the CLI: name "
-        "and purpose here, flags and the longer descriptions in `arbite <cmd> -h` (the README "
-        "documents every command in full). Every command accepts `--sink <kind>`; every status "
-        "command updates `status`/`updated` together, and `block`, `shelve`, `release`, "
-        "`unblock`, `reopen` and `unshelve` also append an automatic timestamped note. The "
-        "workspace commands -- `file`, `scratch`, `receipt`, `changes`, `cmd`, `events`, "
-        "`stream`, `workspace` and `attempt` -- are documented flag by flag in "
-        "`.arbite/WORKSPACE.md`."
-    )
-    add("")
-    lines.extend(_command_index_lines(parser))
-    add("")
-    add(
-        "Notes: `release` hands back work you stop part-way (clears the assignee and any block "
-        "reason, so `list next` offers the ticket again); `unblock` clears `blocked_by` and "
-        "returns the ticket to `in_progress` (`open` with `--open`) -- preferable to `arbite set "
-        "status`, which would leave `blocked_by` populated and the ticket claiming to be "
-        "stalled; `reopen` clears the closed date and any block reason and requires `--reason`, "
-        "recording it as 'Reopened: <reason>.' -- it is the rejection path out of review; "
-        "`unshelve` clears the assignee and any block reason; `set` takes PROPERTY VALUE pairs "
-        "(quote multi-word values, `''` clears a field), is type-aware, cannot set the "
-        "structural `id`, and re-files the ticket when `status` changes; `depend` adds a "
-        "dependency (deduplicated) or, with one argument, clears them all; `search` matches a "
-        "ticket if any selected field matches; `migrate` copies every ticket from one sink into "
-        "another and leaves the source alone; `delete` destroys a ticket and needs `--force`; "
-        "`status` always exits 0 (it is a report, not a query)."
-    )
-    add("")
-
-    # -- The file proxy ----------------------------------------------------
-    if has_proxy:
-        add("## Changing files (the file proxy)")
-        add("")
-        add(
-            "`arbite file` is the proxy for changing a file another agent may also touch: claim "
-            "the paths, read for a version token, mutate under that token, then read the record "
-            "back. **Prefer it to a shell write** for any file in this workspace -- only the "
-            "proxy records the change against a ticket and an attempt, and `arbite changes <id>` "
-            "/ `arbite receipt <op>` read that record back. A shell write is not blocked; it is "
-            "unattributed drift that the next read reports as an external edit."
-        )
-        add("")
-        add(
-            "`arbite cmd -- CMD...` is the compromise when a familiar tool is the only sane "
-            "option: it runs the tool and records what it observed it change (`--claim PATH...` "
-            "adds guarded mode). The contract, the flags and the honest limits -- what arbite "
-            "does *not* guarantee -- are in **`.arbite/WORKSPACE.md`**."
-        )
-        add("")
-    elif sink_kind:
-        add("## Changing files (the file proxy)")
-        add("")
-        add(
-            f"**Not available in this project:** the active `{sink_kind}` sink has no coordination "
-            "backend, so `arbite file ...`, `arbite cmd`, `arbite receipt`, `arbite changes`, "
-            "`arbite events`, `arbite stream`, `arbite workspace` and `arbite attempt` refuse "
-            "rather than pretend (exit 1, naming the sink). Everything outside the proxy -- "
-            "tickets, statuses, the workflow above -- works normally."
-        )
-        add("")
-
-    # Last line of defence: no escape code may reach the file, whatever the
-    # running argparse version decided to colourise.
-    return _ANSI_RE.sub("", "\n".join(lines)) + "\n"
+    return lines
 
 
-def render_workspace(parser, subparsers_by_name: dict, active_info=None, stale_info=None) -> str:
-    """Render the workspace reference for the sink this project will actually use.
-
-    Same inputs and same rule as `render`, and it has to be a separate file for the
-    same reason: this is detail an agent needs when it is about to change a file, and
-    reading it on every task would spend context on flags that task never uses. The
-    guide points here; here the pointer goes back, because the attempts and tickets
-    named by every claim belong to the workflow there.
-
-    A sink with a coordination backend gets the proxy contract and the per-flag
-    reference for `WORKSPACE_COMMANDS`; one without gets a paragraph saying those
-    commands refuse -- never a contract it cannot honour."""
-    _disable_color(parser, *subparsers_by_name.values())
-
-    primary = active_info if active_info is not None else stale_info
-    sink_kind = getattr(primary, "kind", None)
-    sink_root = getattr(primary, "root", None)
-    stale_kind = getattr(stale_info, "kind", None)
-    stale_root = getattr(stale_info, "root", None)
-    stale_count = getattr(stale_info, "ticket_count", 0)
-    mismatch = active_info is not None and stale_info is not None
-    from .coordination.store import has_coordination_backend
-
-    has_proxy = sink_kind is not None and has_coordination_backend(sink_kind)
-
-    lines: list[str] = []
+def _topic_workspace(ctx: DocContext) -> list:
+    lines: list = []
     add = lines.append
-
-    # The JSON flag's boilerplate points at the guide's exit-code table rather than
-    # repeating it: this file is reached from there.
-    json_stub = "JSON output (see 'Conventions' in .arbite/AGENTS.md)"
-
-    add("# arbite -- workspace and file-proxy guide")
-    add("")
-    _stamp(
-        add,
-        "Reached from `.arbite/AGENTS.md`, which owns the ticket workflow (statuses, fields, "
-        "claiming, triage); this file owns everything that changes a file",
-    )
-    add("## What this covers")
-    add("")
-    if not has_proxy:
+    if not ctx.has_proxy:
+        add("# Changing files")
+        add("")
         add(
-            f"**Not available in this project:** the active `{sink_kind}` sink has no coordination "
-            "backend, so `arbite file ...`, `arbite cmd`, `arbite receipt`, `arbite changes`, "
-            "`arbite events`, `arbite stream`, `arbite workspace` and `arbite attempt` refuse "
-            "rather than pretend (exit 1, naming the sink). Everything outside the proxy -- "
-            "tickets, statuses, the workflow in `.arbite/AGENTS.md` -- works normally, so there is "
-            "no workspace contract to describe here."
+            f"**Not available in this project:** the active `{ctx.sink_kind}` sink has no "
+            "coordination backend, so `arbite file ...`, `arbite cmd`, `arbite receipt`, "
+            "`arbite changes`, `arbite events`, `arbite stream`, `arbite workspace` and "
+            "`arbite attempt` refuse rather than pretend (exit 1, naming the sink). "
+            "Everything outside the proxy -- tickets, statuses, the workflow -- works "
+            "normally."
         )
         add("")
-        return _ANSI_RE.sub("", "\n".join(lines)) + "\n"
-    add(
-        "The **workspace** is the set of files arbite manages in this project: the proxy records "
-        "which *work attempt* owns a path, serves bytes with a version token, changes bytes only "
-        "under that token, and keeps the before and after bytes as evidence. This file is the "
-        f"contract, the flags and the honest limits. Active sink: `{sink_kind}`"
-        + (f" at `{sink_root}`" if sink_root else "")
-        + " (`arbite sink info --json` confirms it; the ticket workflow is in `.arbite/AGENTS.md`)."
-    )
-    add("")
-    if mismatch:
-        add(_stale_store_warning(stale_kind, stale_root, stale_count, sink_kind, sink_root))
-        add("")
-    add(
-        "`arbite workspace show` reports the workspace this project derives -- its id, root, the "
-        "store behind it, the coordination state (active claims, events, receipts) and the "
-        "scratch area -- and writes nothing, so two runs on unchanged state print identical "
-        "text. It is derived from the located `.arbite/` directory plus the resolved sink, which "
-        "is why there is no bind command to forget and no conflict path."
-    )
+        return lines
+    heading = "# The file proxy and the record"
+    if ctx.sink_root:
+        heading += f" (sink: `{ctx.sink_kind}`)"
+    add(heading)
     add("")
     add(
-        "A project moved on disk derives a new workspace id while its records keep the old one: "
-        "`arbite doctor --fix` restamps them (and re-records a binding made at another root). "
-        "When leftover attempts and file claims get in the way of a stale project, `arbite "
-        "workspace reset --force` ends every active attempt, releases every claim and restamps, "
-        "keeping all history; without `--force` it only says what it would do. Tickets keep "
-        "their status, so resume an in-progress one with `arbite attempt adopt`."
+        "`arbite file` is the proxy for changing a file another agent may also touch: "
+        "claim the paths, read for a version token, mutate under that token, then read the "
+        "record back. **Prefer it to a shell write** for any file in this workspace -- "
+        "only the proxy records the change against a ticket and an attempt, and `arbite "
+        "changes <id>` / `arbite receipt <op>` read that record back. A shell write is not "
+        "blocked; it is unattributed drift that the next read reports as an external edit."
     )
     add("")
-
-    # -- The contract ------------------------------------------------------
     add("## Claim, read, mutate, release")
     add("")
     add(
-        "The order the proxy exists to enforce: a claim is exclusive writer ownership of a path, "
-        "a read under that claim returns a token, and a mutation presents the token."
+        "The order the proxy exists to enforce: a claim is exclusive writer ownership of a "
+        "path, a read under that claim returns a token, and a mutation presents the token."
     )
     add("")
     add(
         "- claim before you write: `arbite file claim PATH... --ticket T --attempt A` is "
-        "all-or-nothing in canonical path order, so two agents can never hold half of a pair; a "
-        "path another attempt holds refuses the whole request with exit 4 and names the holder"
+        "all-or-nothing in canonical path order, so two agents can never hold half of a "
+        "pair; a path another attempt holds refuses the whole request with exit 4 and "
+        "names the holder"
     )
     add(
-        "- read for a token: `arbite file read PATH --ticket T --attempt A` serves the bytes and "
-        "records a token (`op-XXXX`); one token authorises exactly one mutation. `--lines "
-        "START[:END]` serves a range, and the digest still covers the whole file"
+        "- read for a token: `arbite file read PATH --ticket T --attempt A` serves the "
+        "bytes and records a token (`op-XXXX`); one token authorises exactly one mutation. "
+        "`--lines START[:END]` serves a range, and the digest still covers the whole file"
     )
     add(
-        "- mutate under that token: `arbite file write` (a whole file, from `--input NAME` in "
-        "`.arbite/scratch/` or stdin), `arbite file edit` (an ordered batch of exact "
-        "substitutions, all-or-nothing), `arbite file remove`, `arbite file rename` (both paths "
-        "at one generation). A stale token, moved bytes, a revoked generation or a closed ticket "
-        "exits 5 and changes no bytes"
+        "- mutate under that token: `arbite file write` (a whole file, from `--input NAME` "
+        "in `.arbite/scratch/` or stdin), `arbite file edit` (an ordered batch of exact "
+        "substitutions, all-or-nothing), `arbite file remove`, `arbite file rename` (both "
+        "paths at one generation). A stale token, moved bytes, a revoked generation or a "
+        "closed ticket exits 5 and changes no bytes"
     )
     add(
-        "- hand a claim back without touching the bytes: `arbite file release PATH... --ticket T "
-        "--attempt A --reason TEXT`, so the next worker knows what to re-read"
+        "- hand a claim back without touching the bytes: `arbite file release PATH... "
+        "--ticket T --attempt A --reason TEXT`, so the next worker knows what to re-read"
     )
     add(
-        "- `arbite file claims [--all]` reports what is held right now (or a path's history), and "
-        "`arbite file list` / `arbite file search` are bounded, canonical-order listings that "
-        "never authorise a write"
+        "- `arbite file claims [--all]` reports what is held right now (or a path's "
+        "history); `arbite file list` / `arbite file search` are bounded, canonical-order "
+        "listings that never authorise a write"
     )
     add("")
-
-    # -- Passthrough -------------------------------------------------------
     add("## Keeping your habits: arbite cmd")
     add("")
     add(
-        "`arbite cmd [--ticket T --attempt A] [--shell] -- CMD...` runs a familiar tool (`grep`, "
-        "`sed`, `mv`) and records what it *observed* it change: a digest manifest of the managed "
-        "paths before and after, a receipt and a `passthrough.changed` event per path that "
-        "differed, one `passthrough.exec` event for the run -- and **no exclusivity claimed**, "
-        "because nothing was acquired."
+        "`arbite cmd [--ticket T --attempt A] [--shell] -- CMD...` runs a familiar tool "
+        "(`grep`, `sed`, `mv`) and records what it *observed* it change: a digest manifest "
+        "of the managed paths before and after, a receipt and a `passthrough.changed` event "
+        "per path that differed, one `passthrough.exec` event for the run -- and **no "
+        "exclusivity claimed**, because nothing was acquired."
     )
     add("")
     add(
-        "`--claim PATH...` is guarded mode instead: those paths are acquired all-or-nothing "
-        "*before* the command starts (a busy path refuses the whole run, exit 125, and nothing "
-        "starts), every change is verified against the claimed set afterwards (a change outside "
-        "it is reported as `unclaimed_write` and left exactly where the tool put it, because "
-        "arbite does not roll back a command it did not perform), and the claims are released "
-        "when the run ends, including when the tool fails. The command's own exit code is what "
-        "you get back; arbite's own refusals are 125 (refused before running), 126 (an "
-        "invocation arbite does not support) and 127 (the tool is not on PATH)."
+        "`--claim PATH...` is guarded mode instead: those paths are acquired "
+        "all-or-nothing *before* the command starts (a busy path refuses the whole run, "
+        "exit 125, and nothing starts), every change is verified against the claimed set "
+        "afterwards (a change outside it is reported as `unclaimed_write` and left exactly "
+        "where the tool put it -- arbite does not roll back a command it did not perform), "
+        "and the claims are released when the run ends, including when the tool fails. "
+        "The command's own exit code is what you get back; arbite's own refusals are 125 "
+        "(refused before running), 126 (an invocation arbite does not support) and 127 "
+        "(the tool is not on PATH)."
     )
     add("")
-
-    # -- Reading the record ------------------------------------------------
     add("## Reading the record")
     add("")
     add(
-        "- `arbite changes <id>` -- one row per path, from the version the first operation found "
-        "to the version the last one left; `--all` adds the ordered operation log, where a "
-        "change that was later reverted stays visible"
+        "- `arbite changes <id>` -- one row per path, from the version the first operation "
+        "found to the version the last one left; `--all` adds the ordered operation log, "
+        "where a change that was later reverted stays visible"
     )
     add(
-        "- `arbite receipt <op>` -- one operation's evidence: the version it replaced, the version "
-        "it wrote, where those bytes are kept, all read back and proved against the digests the "
-        "receipt records before anything prints. Missing evidence is refused, not glossed over"
+        "- `arbite receipt <op>` -- one operation's evidence: the version it replaced, the "
+        "version it wrote, where those bytes are kept, all read back and proved against "
+        "the digests the receipt records before anything prints. Missing evidence is "
+        "refused, not glossed over"
     )
     add(
-        "- `arbite receipt --summary [--ticket T]` -- every operation in log order with both "
-        "versions and who did it, plus what the store still holds. Take this *before* anything "
-        "is pruned: the coordination store is ignored by git and dies with the machine, so this "
-        "is the export a devlog is written from"
+        "- `arbite receipt --summary [--ticket T]` -- every operation in log order with "
+        "both versions and who did it, plus what the store still holds. Take this *before* "
+        "anything is pruned: the coordination store is ignored by git and dies with the "
+        "machine, so this is the export a devlog is written from"
     )
     add(
-        "- `arbite events [--tail N] [--after CURSOR] [--include-reads]` -- the coordination event "
-        "stream, one line per event, in cursor order; reads are excluded unless asked for, and "
-        "`--follow` is refused because arbite never blocks -- poll with `--after <cursor>`, where "
-        "'nothing new' is exit 2 rather than an error"
+        "- `arbite events [--tail N] [--after CURSOR] [--include-reads]` -- the "
+        "coordination event stream, one line per event, in cursor order; reads are "
+        "excluded unless asked for, and `--follow` is refused because arbite never blocks "
+        "-- poll with `--after <cursor>`, where 'nothing new' is exit 2"
     )
     add(
-        "- `arbite stream read <id> [--after SEQ | --tail N]` -- the narration stream a worker "
-        "writes as it works, one record per line; poll with `--after`, where 'nothing new' is "
-        "exit 2, and `arbite stream list` / `arbite stream path <id>` show what is recording and "
-        "where the file is"
+        "- `arbite stream write <id> -` / `arbite stream read <id> [--after SEQ | --tail "
+        "N]` -- the per-ticket narration a worker writes as it goes, one record per line; "
+        "poll with `--after`, where 'nothing new' is exit 2. This is per-ticket prose, "
+        "distinct from `arbite events`, which is the coordination fact stream"
     )
     add(
-        "- `arbite scratch list` / `arbite scratch clear [NAME...] [--all]` -- what is staged as "
-        "the payload of a write or an edit, and how to empty it deliberately"
+        "- `arbite scratch list` / `arbite scratch clear [NAME...] [--all]` -- what is "
+        "staged as the payload of a write or an edit, and how to empty it deliberately"
     )
     add(
-        "- `arbite attempt adopt <id> --agent <your-id>` -- record an attempt for work that was "
-        "already `in_progress` when attempt tracking began"
+        "- `arbite attempt adopt <id> --agent <your-id>` -- record an attempt for work "
+        "that was already `in_progress` when attempt tracking began"
     )
     add("")
+    return lines
 
-    # -- Limits ------------------------------------------------------------
-    add("## What arbite does not promise")
+
+def _topic_limits(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    add("# What arbite does not promise")
     add("")
     add(
-        "- **A shell can bypass it.** arbite does not intercept the filesystem: `sed -i`, `> "
-        "file`, or an editor writes bytes arbite never sees. Those bytes are *drift*, reported by "
-        "the next read as an external edit attributable to no ticket, and **arbite cannot prove "
-        "who wrote a file** -- it records attribution (the agent id a command carried, the actor "
-        "in an event), never authentication"
+        "- **A shell can bypass it.** arbite does not intercept the filesystem: `sed -i`, "
+        "`> file`, or an editor writes bytes arbite never sees. Those bytes are *drift*, "
+        "reported by the next read as an external edit attributable to no ticket, and "
+        "**arbite cannot prove who wrote a file** -- it records attribution (the agent id "
+        "a command carried, the actor in an event), never authentication"
     )
     add(
-        "- **Observation is not exclusivity.** `arbite cmd` observed mode claims nothing; guarded "
-        "mode claims before the run and verifies after it, but cannot stop a write *during* it, "
-        "so a takeover mid-run or a foreign writer is reported rather than prevented"
+        "- **Observation is not exclusivity.** `arbite cmd` observed mode claims nothing; "
+        "guarded mode claims before the run and verifies after it, but cannot stop a write "
+        "*during* it, so a takeover mid-run or a foreign writer is reported rather than "
+        "prevented"
     )
     add(
-        "- **Reads are not isolated.** A read can observe a commit in flight; the file sink "
-        "reports that as a `pending_commit` finding instead of hiding it"
+        "- **Reads are not isolated.** A read can observe a commit in flight; the file "
+        "sink reports that as a `pending_commit` finding instead of hiding it"
     )
     add(
-        "- **No daemon, no launcher, no automatic recovery.** Nothing runs in the background, a "
-        "lock dies with its process, a killed guarded run leaves its claim for `arbite doctor` "
-        "(or `--fix`) to release once the attempt is over, and there is no worktree workflow, no "
-        "central database, no factory and no dashboard"
+        "- **No daemon, no launcher, no automatic recovery.** Nothing runs in the "
+        "background, a lock dies with its process, a killed guarded run leaves its claim "
+        "for `arbite doctor` (or `--fix`) to release once the attempt is over, and there "
+        "is no worktree workflow, no central database, no factory and no dashboard"
     )
     add(
-        "- **Evidence is never pruned.** There is no retention policy or garbage collection yet, "
-        "so the store grows with the work (each version is kept once, by digest, and one version "
-        "may be at most 64 MiB); `arbite receipt --summary` prints the pre-pruning export a devlog "
-        "wants. `arbite cmd`'s manifest walks the tree before and after each run, and arbite waits "
-        "for the command it started"
+        "- **Evidence is never pruned.** There is no retention policy or garbage "
+        "collection yet, so the store grows with the work (each version is kept once, by "
+        "digest, and one version may be at most 64 MiB); `arbite receipt --summary` prints "
+        "the pre-pruning export a devlog wants"
     )
-    if sink_kind == "sqlite":
+    if ctx.sink_kind == "sqlite":
         add(
             "- **This sink keeps evidence in the database.** The `sqlite` store holds the "
             "coordination records *and* the artifact bytes in the ticket database, so the "
-            "database is one thing to back up but grows with every mutation; `doctor` adds its "
-            "storage-specific findings (orphaned revision rows) to the shared ones"
+            "database is one thing to back up but grows with every mutation; `doctor` adds "
+            "its storage-specific findings (orphaned revision rows) to the shared ones"
         )
     else:
         add(
-            "- **This sink keeps evidence beside the tickets.** The file sink holds coordination "
-            "state in `.arbite/coordination/` and artifact bytes as files under it (both ignored "
-            "by git), so evidence is local to this checkout; `doctor` adds its storage-specific "
-            "findings (a pending commit journal, orphan revision counters) to the shared ones"
+            "- **This sink keeps evidence beside the tickets.** The file sink holds "
+            "coordination state in `.arbite/coordination/` and artifact bytes as files "
+            "under it (both ignored by git), so evidence is local to this checkout; "
+            "`doctor` adds its storage-specific findings (a pending commit journal, "
+            "orphan revision counters) to the shared ones"
         )
     add(
-        "- **Exit 4 and 5 mean nothing changed**, so neither is worth retrying blind: 4 is busy "
-        "(a live claim or attempt holds the path), 5 is stale (a token, digest or generation is "
-        "no longer current). The full exit-code vocabulary is in `.arbite/AGENTS.md`"
+        "- **Exit 4 and 5 mean nothing changed**, so neither is worth retrying blind: 4 "
+        "is busy (a live claim or attempt holds the path), 5 is stale (a token, digest or "
+        "generation is no longer current)"
     )
     add("")
+    return lines
 
-    # -- Commands ----------------------------------------------------------
-    add("## Commands")
+
+def _topic_design(ctx: DocContext) -> list:
+    lines: list = []
+    add = lines.append
+    add("# Why arbite is built this way")
     add("")
     add(
-        "Every command accepts `--sink <kind>`, `--root DIR` and `--color WHEN`; the sink "
-        "selectors are documented once in `.arbite/AGENTS.md` (`--root` targets another project "
-        "directory, `--color` is `auto`, `always` or `never` and changes only how output is "
-        "painted). Argparse's longer descriptions are omitted here too -- `arbite <cmd> -h` "
-        "prints them."
+        "Agent-driven work tends to leave state in places that don't survive a new "
+        "session: an agent's own memory file, a chat transcript, a stale assumption about "
+        "what it was doing. Since the repo is already the durable, shared, versioned "
+        "medium, arbite puts the tickets there and makes one location the single source of "
+        "truth for a ticket's state -- any other record is a *hint* to verify against the "
+        "ticket, never authority. Two constraints shaped most of the design: **agents, not "
+        "humans, are the primary callers** (every query that matters has a `--json` mode "
+        "with stable field names, and exit codes are meaningful), and **coordinates must "
+        "be honest** (claiming is a compare-and-swap, and an ambiguous id refuses instead "
+        "of guessing)."
     )
     add("")
-    for name in WORKSPACE_COMMANDS:
-        subparser = subparsers_by_name.get(name)
-        if subparser is None:  # pragma: no cover - the parser always defines these
-            continue
-        lines.extend(_command_block_lines(f"arbite {name}", subparser, json_stub))
-        for child_name, child in _nested_choices(subparser):
-            lines.extend(_command_block_lines(f"arbite {name} {child_name}", child, json_stub))
+    add("## Goals")
+    add("")
+    add(
+        "- **Zero infrastructure.** No daemon, no lock service, no server. The default "
+        "sink is a directory of files; the alternative is one SQLite file the stdlib "
+        "already knows how to open. A clone of the repo is a complete working instance"
+    )
+    add(
+        "- **One storage interface, two implementations.** Commands talk to a sink, not "
+        "to files or tables, so claiming, readiness, ordering and exit codes are identical "
+        "whichever store is in use"
+    )
+    add(
+        "- **`ls` as a status board.** With the file sink, what is actionable is legible "
+        "from folder names alone, without opening any file"
+    )
+    add(
+        "- **Safe under concurrency.** Claiming is a compare-and-swap on both sinks; races "
+        "resolve to exactly one winner, and a lost race is reported, not silently "
+        "overwritten"
+    )
+    add(
+        "- **Machine-first interfaces.** JSON output for every read query, distinct exit "
+        "codes for success / error / empty / integrity-problems"
+    )
+    add(
+        "- **Recoverable history.** Plain files plus git, with stable filenames so `git "
+        "log --follow` traces a ticket's whole lifecycle; no proprietary format"
+    )
+    add("")
+    add("## Non-goals (explicitly out of scope)")
+    add("")
+    add(
+        "- **Agent identity, liveness and staleness detection** -- these belong to an "
+        "external agent harness; arbite only reads a static `agents:` list"
+    )
+    add(
+        "- **Scheduling or dispatching work** -- arbite answers \"what is workable\"; "
+        "getting an agent started on it is the caller's job"
+    )
+    add("- **A UI, web service, or notifications** -- the CLI is the interface")
+    add(
+        "- **Enforcing policy beyond data integrity** -- arbite refuses to corrupt state "
+        "and reports drift; it does not police who may do what"
+    )
+    add(
+        "- **A distributed store** -- each sink is a single local store; across machines "
+        "the repo (or the file) is the unit of exchange"
+    )
+    add("")
+    add("## Upgrading (hard cuts, no fallback)")
+    add("")
+    add(
+        "- **The project config is `.arbite/project.yaml`.** The old `arbite.yaml` and "
+        "`.arbite.yaml` are not read at all: a project that still has only one behaves as "
+        "if it had no config, silently falling back to the default `file` sink. Move the "
+        "file into `.arbite/project.yaml`, or let `arbite init --sink <kind>` write it "
+        "fresh"
+    )
+    add(
+        "- **`arbite reopen` requires `--reason`.** It is the rejection path out of "
+        "review, so a rejection with no stated reason is useless to whoever acts on it"
+    )
+    add(
+        "- The default non-status bucket is `plans/` (the old `planning/` is not aliased), "
+        "and `review` is a first-class status reached through `arbite submit` and left "
+        "through `arbite accept` (or `arbite reopen --reason`)"
+    )
+    add("")
+    return lines
 
-    # Last line of defence: no escape code may reach the file, whatever the
-    # running argparse version decided to colourise.
+
+@dataclass(frozen=True)
+class _Topic:
+    """One entry in the registry: a name, a one-line summary for the index, the section
+    it groups under, and the renderer that produces its markdown lines."""
+
+    name: str
+    summary: str
+    section: str
+    render: Callable[["DocContext"], list]
+
+
+#: The topic registry. `overview` is the default (`arbite docs`); `commands` is
+#: reserved and handled separately because it renders from the parser rather than from
+#: prose. The order here is the order `arbite docs list` and `arbite docs all` use.
+TOPICS = (
+    _Topic("overview", "what arbite is, and the commands you will type", "Start here",
+           _topic_overview),
+    _Topic("workflow", "statuses and the transitions between them", "Concepts",
+           _topic_workflow),
+    _Topic("fields", "every ticket field, and the independent axes", "Concepts",
+           _topic_fields),
+    _Topic("sinks", "where tickets live: file vs sqlite, selection, config, migration",
+           "Concepts", _topic_sinks),
+    _Topic("agents", "agent ids, tiers, scratchpads, resuming and work attempts",
+           "Concepts", _topic_agents),
+    _Topic("triage", "raw captures, wishes, fetch and promote", "Concepts", _topic_triage),
+    _Topic("conventions", "ticket ids, exit codes, --json and atomic claims", "Concepts",
+           _topic_conventions),
+    _Topic("workspace", "the file proxy, arbite cmd, and the recorded evidence",
+           "Workspace", _topic_workspace),
+    _Topic("limits", "what arbite does not promise", "Workspace", _topic_limits),
+    _Topic("design", "why arbite is built this way, goals and non-goals", "Background",
+           _topic_design),
+)
+
+TOPIC_BY_NAME = {topic.name: topic for topic in TOPICS}
+TOPIC_NAMES = tuple(topic.name for topic in TOPICS)
+#: Names the docs command itself owns; they are not topics and are dispatched first.
+RESERVED = ("list", "all", "search", "commands")
+
+
+def _join(lines) -> str:
     return _ANSI_RE.sub("", "\n".join(lines)) + "\n"
+
+
+def render_overview(ctx: DocContext) -> str:
+    return _join(_topic_overview(ctx))
+
+
+def render_topic(ctx: DocContext, name: str) -> str:
+    """One topic by name. `overview` and the registry names resolve here; `commands`
+    is dispatched by the caller (`render_commands`), and an unknown name raises
+    `KeyError` for the CLI to turn into a listing."""
+    if name in (None, "", "overview"):
+        return render_overview(ctx)
+    topic = TOPIC_BY_NAME.get(name)
+    if topic is None:
+        raise KeyError(name)
+    return _join(topic.render(ctx))
+
+
+def render_index(ctx: DocContext) -> str:
+    lines: list = []
+    add = lines.append
+    add("# arbite docs -- topics")
+    add("")
+    add("Fetch one with `arbite docs <topic>`; fetch a command's flags with `arbite "
+        "docs commands <name>`.")
+    add("")
+    sections: dict = {}
+    for topic in TOPICS:
+        sections.setdefault(topic.section, []).append(topic)
+    for section, topics in sections.items():
+        add(f"## {section}")
+        add("")
+        for topic in topics:
+            add(f"- `{topic.name}` -- {topic.summary}")
+        add("")
+    add("## Reference")
+    add("")
+    add("- `commands [NAME]` -- usage and every flag for a command, or the index of all")
+    add("")
+    add("Also: `arbite docs all` (every topic in one stream), `arbite docs search TERM`.")
+    add("")
+    return _join(lines)
+
+
+def render_all(ctx: DocContext) -> str:
+    parts = [render_overview(ctx)]
+    for topic in TOPICS:
+        if topic.name == "overview":
+            continue
+        parts.append(_join(topic.render(ctx)))
+    parts.append(render_commands(ctx))
+    return "\n".join(parts)
+
+
+def render_commands(ctx: DocContext, name: Optional[str] = None) -> str:
+    """The command reference, rendered from the live parser.
+
+    With no name: every command and the parser's own one-line purpose. With a name:
+    that command's usage line and every flag, plus a block per nested sub-command
+    (`arbite file edit`), so a group is documented in its own right rather than
+    collapsed into `{claim,read,write,...}`. An unknown name raises `KeyError`."""
+    if name is None:
+        add = [
+            "# Commands",
+            "",
+            "Every command, with the parser's own one-line purpose. "
+            "`arbite docs commands <name>` adds its usage and every flag; "
+            "`arbite <name> -h` prints the full help.",
+            "",
+        ]
+        add.extend(_command_index_lines(ctx.parser))
+        add.append("")
+        return _join(add)
+    subparser = ctx.subparsers_by_name.get(name)
+    if subparser is None:
+        raise KeyError(name)
+    add = [f"# `arbite {name}`", ""]
+    add.extend(_command_block_lines(f"arbite {name}", subparser, _JSON_STUB))
+    for child_name, child in _nested_choices(subparser):
+        add.extend(_command_block_lines(f"arbite {name} {child_name}", child, _JSON_STUB))
+    return _join(add)
+
+
+def topic_index() -> list:
+    """`[{name, summary, section}]` for the JSON form of `arbite docs list`."""
+    return [
+        {"name": topic.name, "summary": topic.summary, "section": topic.section}
+        for topic in TOPICS
+    ]
+
+
+def search(ctx: DocContext, term: str) -> dict:
+    """Case-insensitive search across topic bodies plus the command index.
+
+    Returns `{term, matches: [{topic, summary, lines}]}` so the CLI can print either a
+    readable report or JSON. Bodies are rendered through the same context, so the
+    hits match the sink-specific text the reader would actually see."""
+    needle = term.casefold()
+    matches = []
+    for topic in TOPICS:
+        lines = [line for line in topic.render(ctx) if needle in line.casefold()]
+        if lines or needle in topic.name.casefold() or needle in topic.summary.casefold():
+            matches.append({"topic": topic.name, "summary": topic.summary, "lines": lines[:8]})
+    command_lines = [
+        line for line in _command_index_lines(ctx.parser) if needle in line.casefold()
+    ]
+    if command_lines:
+        matches.append(
+            {"topic": "commands", "summary": "the command index", "lines": command_lines[:12]}
+        )
+    return {"term": term, "matches": matches}

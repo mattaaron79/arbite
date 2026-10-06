@@ -690,37 +690,28 @@ def cmd_init(args):
     if recorded.lines:
         print(recorded.to_text())
 
-    parser, subparsers_by_name = build_parser()
+    # The docs are a command now (`arbite docs`), so `init` writes exactly one static
+    # pointer instead of regenerating a sink-and-version-stamped guide on every run.
+    # The pointer never varies, so re-running `init` no longer dirties the tree.
     agents_md = arbite_dir / "AGENTS.md"
-    workspace_md = arbite_dir / "WORKSPACE.md"
-    # The guide is committed and read by processes other than this one, so it
-    # describes the sink a *plain* command will use (committed config only, no
-    # --sink, no environment) -- and names any other store here that holds tickets
-    # but that nothing selects.
-    active = build_sink(config.configured_sink_spec(project_root), arbite_dir)
-    active_info = _describe_safely(active)
-    stale_info = _find_stale_store(sink, active, arbite_dir)
-    # Two documents, one pass: the guide an agent reads at the start of every task,
-    # and the workspace reference it reads when it is about to change a file. Both
-    # come from these parsers and this sink info, so neither can claim anything the
-    # CLI or the active store would contradict.
-    agents_md.write_text(
-        docs.render(parser, subparsers_by_name, active_info, stale_info),
-        encoding="utf-8",
-    )
-    workspace_md.write_text(
-        docs.render_workspace(parser, subparsers_by_name, active_info, stale_info),
-        encoding="utf-8",
-    )
-    print(
-        f"AGENTS.md refreshed at {agents_md} -- this is not auto-discovered, so point your "
-        f"project's CLAUDE.md (or similar) at it explicitly, e.g. a line like "
-        f"'read {config.ARBITE_DIRNAME}/AGENTS.md', if you want agents to find arbite"
-    )
-    print(
-        f"WORKSPACE.md refreshed at {workspace_md} -- the file-proxy and workspace-command "
-        f"reference the guide points at"
-    )
+    outcome = docs.install_agents_pointer(agents_md)
+    if outcome == "created":
+        print(
+            f"AGENTS.md pointer written at {agents_md} -- point your project's CLAUDE.md "
+            f"(or similar) at it, and a harness reading it will run 'arbite docs'"
+        )
+    elif outcome == "refreshed":
+        print(
+            f"AGENTS.md refreshed at {agents_md} -- the generated guide is now a pointer "
+            f"to 'arbite docs'"
+        )
+    elif outcome == "present":
+        print(f"AGENTS.md pointer already present at {agents_md}")
+    else:
+        print(
+            f"AGENTS.md at {agents_md} is not arbite's; left unchanged "
+            f"(run 'arbite docs' for the guide)"
+        )
 
     # --agents-doc / --claude-doc install the short instructions block into the
     # project's own doc files, so a harness that auto-reads AGENTS.md / CLAUDE.md
@@ -773,6 +764,122 @@ def cmd_init(args):
                 f"{gitignore_path} already contains the arbite runtime-state entries; "
                 "left unchanged"
             )
+
+
+def _docs_context(args):
+    """Build the render context for `arbite docs`: the live parsers, plus the store
+    the reader's own `arbite` command will read.
+
+    Tolerant of being run outside a project -- a pointer tells a harness to run
+    `arbite docs` before `.arbite/` may exist -- in which case the default sink is
+    described and `standalone` is set. `--sink` is honoured so the docs can be read
+    as another store would see them; a stale store is reported exactly as the old
+    generated guide did."""
+    parser, subparsers_by_name = build_parser()
+    project_root = _project_root(args)
+    arbite_dir = project_root / config.ARBITE_DIRNAME
+    if config.find_arbite_dir(project_root) is None:
+        return docs.build_context(parser, subparsers_by_name, standalone=True)
+    spec = config.sink_spec(getattr(args, "sink", None), project_root)
+    active = build_sink(spec, arbite_dir)
+    active_info = _describe_safely(active)
+    stale_info = _find_stale_store(active, active, arbite_dir)
+    return docs.build_context(parser, subparsers_by_name, active_info, stale_info)
+
+
+def _print_search(result) -> None:
+    """The human form of `arbite docs search`: a header per matching topic, then the
+    matching lines."""
+    if not result["matches"]:
+        print(f"no topics mention '{result['term']}'")
+        return
+    print(f"# `{result['term']}`")
+    print("")
+    for match in result["matches"]:
+        print(f"## {match['topic']} -- {match['summary']}")
+        if match["lines"]:
+            for line in match["lines"]:
+                print(f"    {line}")
+        else:
+            print("    (the name or summary matched)")
+        print("")
+
+
+def cmd_docs(args):
+    """Print the command-line documentation: the overview, a topic, the index, a
+    search, or the parser-rendered command reference.
+
+    `arbite docs` with no argument is the token-light overview; `--json` wraps the
+    same text in a machine-readable envelope so an agent can fetch exactly the body it
+    needs. Nothing is written, so it is safe to run anywhere -- outside a project it
+    describes the default sink."""
+    words = list(getattr(args, "topic", None) or [])
+    ctx = _docs_context(args)
+
+    term = args.search
+    if term is None and words and words[0] == "search":
+        term = " ".join(words[1:]).strip()
+        if not term:
+            raise TicketError("'arbite docs search' needs a term")
+    if term is not None:
+        result = docs.search(ctx, term)
+        if args.json:
+            _print_json(result)
+        else:
+            _print_search(result)
+        if not result["matches"]:
+            sys.exit(EXIT_EMPTY)
+        return
+
+    what = words[0] if words else "overview"
+    rest = words[1:]
+
+    if what == "list":
+        if rest:
+            raise TicketError("'arbite docs list' takes no further arguments")
+        if args.json:
+            _print_json({"topic": "list", "topics": docs.topic_index()})
+        else:
+            print(docs.render_index(ctx), end="")
+        return
+    if what == "all":
+        if rest:
+            raise TicketError("'arbite docs all' takes no further arguments")
+        text = docs.render_all(ctx)
+        if args.json:
+            _print_json({"topic": "all", "body": text})
+        else:
+            print(text, end="")
+        return
+    if what == "commands":
+        name = rest[0] if rest else None
+        if len(rest) > 1:
+            raise TicketError("'arbite docs commands' takes at most one command name")
+        try:
+            text = docs.render_commands(ctx, name)
+        except KeyError:
+            raise TicketError(f"unknown command '{name}' (see 'arbite docs commands')")
+        if args.json:
+            _print_json({"topic": "commands", "command": name, "body": text})
+        else:
+            print(text, end="")
+        return
+    if what in docs.TOPIC_BY_NAME:
+        if rest:
+            raise TicketError(f"'arbite docs {what}' takes no further arguments")
+        topic = docs.TOPIC_BY_NAME[what]
+        text = docs.render_topic(ctx, what)
+        if args.json:
+            _print_json(
+                {"topic": what, "summary": topic.summary, "section": topic.section, "body": text}
+            )
+        else:
+            print(text, end="")
+        return
+    raise TicketError(
+        f"unknown topic '{what}' (run 'arbite docs list' for every topic, or "
+        f"'arbite docs commands {what}' if it is a command)"
+    )
 
 
 def cmd_sink(args):
@@ -3229,11 +3336,11 @@ def _target_exists(target) -> bool:
 
 
 def build_parser():
-    """Returns (parser, subparsers_by_name). The dict is used by `arbite init` to
-    render the two generated docs straight from these parsers: the one-line command
-    index in .arbite/AGENTS.md, and the per-flag reference in .arbite/WORKSPACE.md
-    (every usage line and flag, compacted rather than dumped as --help text). Both
-    are rendered rather than hand-kept, so neither can drift from the real CLI."""
+    """Returns (parser, subparsers_by_name). The dict is used by `arbite docs` to
+    render the command reference straight from these parsers: the one-line command
+    index, and each command's usage line and flags (compacted rather than dumped as
+    --help text). It is rendered rather than hand-kept, so it cannot drift from the
+    real CLI."""
     parser = argparse.ArgumentParser(prog="arbite", description="Ticket sink CLI")
     parser.add_argument("--version", action="version", version=f"arbite {__version__}")
     _sink_flag(parser, suppress=False)
@@ -3246,21 +3353,20 @@ def build_parser():
         help="create the arbite directory and initialise the selected sink",
         description="Create .arbite/ in the current directory (like 'git init'), initialise "
         "the selected sink (status folders and buckets for the file sink; the database and "
-        "its schema for the sqlite sink), write .arbite/AGENTS.md (the guide: workflow, rules "
-        "and a one-line index of every command; not auto-discovered -- point your project's "
-        "CLAUDE.md or similar at it explicitly if you want agents to find arbite, or pass "
-        "--agents-doc/--claude-doc to have the instructions block installed into those files "
-        "for you) and .arbite/WORKSPACE.md (the file-proxy and workspace-command reference the "
-        "guide points at), and pre-create a scratchpad file under .arbite/agents/ "
-        "for every id listed in an 'agents:' list in .arbite/project.yaml, if present. Pass "
-        "--gitignore to also install the runtime-state entries (coordination/, scratch/, "
-        "streams/, any sqlite store) into ./.gitignore. Which sink is "
-        "initialised follows the usual precedence: --sink, then ARBITE_SINK, then a 'sink:' key "
-        "in .arbite/project.yaml, then file. The store it creates then becomes the project default -- "
-        "'sink:' is written to .arbite/project.yaml, created if it does not exist, so no later command "
-        "reads a different store by accident (an ARBITE_SINK selection is reported instead, "
-        "since that was this process's decision rather than the project's). Running it again is "
-        "safe: it never destroys data.",
+        "its schema for the sqlite sink), leave a static pointer at .arbite/AGENTS.md "
+        "('run arbite docs'; not auto-discovered -- point your project's CLAUDE.md or "
+        "similar at it, or pass --agents-doc/--claude-doc to have the instructions block "
+        "installed into those files for you), and pre-create a scratchpad file under "
+        ".arbite/agents/ for every id listed in an 'agents:' list in .arbite/project.yaml, "
+        "if present. The documentation itself is a command ('arbite docs'), so nothing is "
+        "regenerated here. Pass --gitignore to also install the runtime-state entries "
+        "(coordination/, scratch/, streams/, any sqlite store) into ./.gitignore. Which sink "
+        "is initialised follows the usual precedence: --sink, then ARBITE_SINK, then a "
+        "'sink:' key in .arbite/project.yaml, then file. The store it creates then becomes "
+        "the project default -- 'sink:' is written to .arbite/project.yaml, created if it "
+        "does not exist, so no later command reads a different store by accident (an "
+        "ARBITE_SINK selection is reported instead, since that was this process's decision "
+        "rather than the project's). Running it again is safe: it never destroys data.",
     )
     p_init.add_argument(
         "--agents-doc",
@@ -3287,6 +3393,36 @@ def build_parser():
     )
     _sink_flag(p_init)
     p_init.set_defaults(func=cmd_init)
+
+    p_docs = sub.add_parser(
+        "docs",
+        help="print the documentation: the overview, a topic, the index, or a command's flags",
+        description="Print arbite's documentation from the installed version, so it cannot "
+        "drift from the CLI. With no argument: the token-light overview -- what arbite is, "
+        "the commands a caller actually types, and where to go deeper. With a topic: that "
+        "subject in depth (see 'arbite docs list'). Reserved words: 'list' (the topic "
+        "index), 'all' (every topic in one stream), 'search TERM', and 'commands [NAME]' "
+        "(usage and every flag for a command, rendered from the live parser). The prose "
+        "follows the sink a plain command reads, so a database-backed project is never told "
+        "'the folder is the source of truth', and a sink with no coordination backend is "
+        "never handed a file-proxy contract. Nothing is written, and the command works "
+        "outside a project (it then describes the default sink).",
+    )
+    p_docs.add_argument(
+        "topic",
+        nargs="*",
+        metavar="TOPIC",
+        help="a topic name, or 'list' / 'all' / 'search TERM' / 'commands [NAME]'",
+    )
+    p_docs.add_argument(
+        "--search",
+        metavar="TERM",
+        default=None,
+        help="print the topics and lines that mention TERM (case-insensitive)",
+    )
+    _json_flag(p_docs)
+    _sink_flag(p_docs)
+    p_docs.set_defaults(func=cmd_docs)
 
     p_sink = sub.add_parser(
         "sink",

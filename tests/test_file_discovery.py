@@ -50,13 +50,13 @@ def paths_of(text: str) -> list:
 def test_the_generated_guide_list_is_the_file_sinks_own(tmp_path):
     """Two modules name the generated documents; this is what stops them drifting."""
     assert coordination_discovery.GENERATED_FILES == file_sink.GENERATED_FILES
-    assert "WORKSPACE.md" in file_sink.GENERATED_FILES
+    assert "AGENTS.md" in file_sink.GENERATED_FILES
 
 
 def test_the_generated_documents_are_not_tickets(tmp_path):
-    """`arbite init` leaves both documents in the arbite root, where a ticket file may
-    also sit: the scan has to skip them by name, or `doctor` would report a stray ticket
-    for a file the guide tells an agent to read and no one can claim."""
+    """`arbite init` leaves the AGENTS.md pointer in the arbite root, where a ticket
+    file may also sit: the scan has to skip it by name, or `doctor` would report a stray
+    ticket for a file the guide tells an agent to read and no one can claim."""
     from arbite.sinks import SinkSpec, build_sink
 
     arbite_dir = tmp_path / ".arbite"

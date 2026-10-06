@@ -70,8 +70,8 @@ RESERVED_DIRS = ("agents", "coordination", "scratch", "streams")
 DEFAULT_BUCKETS = ("wishlist", "plans")
 
 # Generated files that merely live under the root: never tickets. `arbite init`
-# writes both (the guide, and the workspace reference it points at).
-GENERATED_FILES = ("AGENTS.md", "WORKSPACE.md")
+# writes one, the pointer that tells a harness to run `arbite docs`.
+GENERATED_FILES = ("AGENTS.md",)
 
 # The snapshot area: `raw/processed/`, nested under the raw status folder, holds
 # verbatim snapshots of raw captures that have since been promoted. A snapshot is
