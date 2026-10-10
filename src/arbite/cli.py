@@ -162,12 +162,23 @@ def _print_json(payload):
     print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
 
+def _ticket_json(sink, ticket) -> dict:
+    """One ticket as the `show --json` document, with its location and bucket."""
+    return ticket.to_dict(sink.location(ticket.id), sink.bucket(ticket.id))
+
+
+def _tickets_json(sink, rows) -> list:
+    """`_ticket_json` for a batch, asking the sink for locations and buckets once."""
+    locations = sink.location_map(rows)
+    buckets = sink.bucket_map(rows)
+    return [t.to_dict(locations.get(t.id), buckets.get(t.id)) for t in rows]
+
+
 def _emit_tickets(rows, as_json, sink):
     """Emit a ticket list as JSON or a table, exiting EXIT_EMPTY when empty so a
     caller can branch on 'nothing to do' without matching on message text."""
     if as_json:
-        locations = sink.location_map(rows)
-        _print_json([t.to_dict(locations.get(t.id)) for t in rows])
+        _print_json(_tickets_json(sink, rows))
     elif rows:
         _print_flat(rows)
     else:
@@ -1188,6 +1199,10 @@ def cmd_progress(args):
         groups.append(("no epic", [by_id[tid] for tid in order if tid in ungrouped]))
 
     if not groups:
+        if args.json:
+            # JSON stays a document when the answer is "nothing" (tic-e8ed).
+            _print_json([])
+            sys.exit(EXIT_EMPTY)
         qualifier = f" in epic '{args.epic}'" if args.epic else ""
         print(
             f"no live tickets{qualifier} (live = {' | '.join(schema.LIVE_STATUSES)})"
@@ -1198,9 +1213,10 @@ def cmd_progress(args):
     _warn_cycles(by_id, selected)
 
     if args.json:
-        locations = sink.location_map(
-            [t for _, members in groups for t in members]
-        )
+        documents = {
+            d["id"]: d
+            for d in _tickets_json(sink, [t for _, members in groups for t in members])
+        }
         payload = []
         for heading, members in groups:
             counts = count_by_status(members, vocabulary=True)
@@ -1212,7 +1228,7 @@ def cmd_progress(args):
                     "counts": counts,
                     "live": sum(counts[status] for status in schema.LIVE_STATUSES),
                     "total": len(members),
-                    "tickets": [t.to_dict(locations.get(t.id)) for t in members],
+                    "tickets": [documents[t.id] for t in members],
                 }
             )
         _print_json(payload)
@@ -1402,7 +1418,7 @@ def cmd_fetch(args):
     t = candidates[0]
     note = schema.derived_note(t.id, t.type)
     if args.json:
-        data = t.to_dict(sink.location(t.id))
+        data = _ticket_json(sink, t)
         data["derived_note"] = note
         _print_json(data)
     else:
@@ -1639,6 +1655,12 @@ def _filter_labels(args) -> list:
     return labels
 
 
+def _bucket_scope(args) -> tuple:
+    """The `buckets` part of a query: with --buckets, tickets filed in a bucket are
+    included alongside the ones at their status location (tic-0dca)."""
+    return ("*",) if getattr(args, "buckets", False) else ()
+
+
 def _filter_query(args) -> TicketQuery:
     """The structured filters shared by every list view.
 
@@ -1653,6 +1675,7 @@ def _filter_query(args) -> TicketQuery:
         epic=getattr(args, "epic", None),
         assignee=getattr(args, "assignee", None),
         priority=getattr(args, "priority", None),
+        buckets=_bucket_scope(args),
     ).normalized()
 
 
@@ -1733,15 +1756,16 @@ def _cmd_list_raw(args, sink):
     that `arbite fetch` pulls from -- a stable, chronological backlog a human
     or triage run can scan top to bottom. Exits 2 when nothing is raw yet,
     mirroring the other list views."""
-    raw = sink.query(TicketQuery(status=("raw",), order="created_asc"))
+    raw = sink.query(
+        TicketQuery(status=("raw",), order="created_asc", buckets=_bucket_scope(args))
+    )
 
     if args.json:
         # JSON mode keeps the list contract: an array of ticket dicts whose
         # field names match the frontmatter. The derived 'request' field comes
         # from `Ticket.to_dict`, the one writer every --json ticket payload
         # shares (tic-e5b9), rather than a second injection here.
-        locations = sink.location_map(raw)
-        _print_json([t.to_dict(locations.get(t.id)) for t in raw])
+        _print_json(_tickets_json(sink, raw))
     elif raw:
         _print_raw_summary(raw)
     else:
@@ -1938,6 +1962,11 @@ def cmd_list(args):
     tic_ids = set(resolve_terms(list(by_id), _split_csv(args.tic))) if args.tic else set()
 
     if args.subcommand == "next":
+        if args.buckets:
+            raise TicketError(
+                "--buckets does not apply to 'next': a ticket filed in a bucket is out "
+                "of the status workflow, so it is never workable"
+            )
         _cmd_list_next(args, sink, every)
         return
 
@@ -1979,7 +2008,7 @@ def cmd_list(args):
             expand_once=not args.full,
         )
         if args.json:
-            _print_json(_tree_payload(rows, by_id))
+            _print_json(_tree_payload(rows, by_id, sink))
         else:
             _print_tree(by_id, rows)
         return
@@ -2014,7 +2043,7 @@ def _tree_glyphs(stream):
     return TREE_BOX
 
 
-def _tree_payload(rows, by_id):
+def _tree_payload(rows, by_id, sink):
     """Fold flat display rows into the nested document `--json` publishes.
 
     Every row becomes a node -- the ticket's own fields, plus `edge`, plus its mark
@@ -2023,11 +2052,13 @@ def _tree_payload(rows, by_id):
     a leaf instead of repeating a subtree: `repeat` means the node was already
     expanded above, `cycle` that the edge closes a loop, and a dangling id becomes
     `{"id": ..., "missing": true}` with no ticket behind it."""
+    buckets = sink.bucket_map([by_id[row.id] for row in rows if row.id in by_id])
+
     def node_of(row):
         ticket = by_id.get(row.id)
         if ticket is None:
             return {"id": row.id, "missing": True, "edge": row.edge, "depends": []}
-        data = ticket.to_dict()
+        data = ticket.to_dict(bucket=buckets.get(ticket.id))
         data["path"] = None
         data["edge"] = row.edge
         data["depends"] = []
@@ -2706,7 +2737,7 @@ def cmd_show(args):
     sink = _require_sink(args)
     t = sink.get(args.id)
     if args.json:
-        _print_json(t.to_dict(sink.location(t.id)))
+        _print_json(_ticket_json(sink, t))
         return
     print(sink.render(t), end="")
 
@@ -2730,7 +2761,7 @@ def cmd_deps(args):
         by_id, [start.id], dependents=args.dependents, expand_once=not args.full
     )
     if args.json:
-        _print_json(_tree_payload(rows, by_id)[0])
+        _print_json(_tree_payload(rows, by_id, sink)[0])
         return
     _warn_cycles(by_id, graph.dependency_closure(by_id, [start.id]))
     _print_tree(by_id, rows)
@@ -3070,6 +3101,7 @@ def cmd_search(args):
         status=tuple(args.status or ()),
         text=text,
         order="flat",
+        buckets=_bucket_scope(args),
     )
     _emit_tickets(sink.query(q), args.json, sink)
 
@@ -3216,6 +3248,7 @@ def cmd_delete(args):
         )
     note = f"Deleted by {args.agent}" + (f": {args.reason}" if args.reason else ".")
     location = sink.location(t.id)
+    bucket = sink.bucket(t.id)
     if not args.dry_run:
         expect = _expect_from(t)
         schema.append_note(t, args.agent, note)
@@ -3223,7 +3256,7 @@ def cmd_delete(args):
         sink.update(t, expect=expect)
         sink.remove(t.id)
     if args.json:
-        payload = t.to_dict(location)
+        payload = t.to_dict(location, bucket)
         payload.update({"deleted": not args.dry_run, "note": note})
         _print_json(payload)
     else:
@@ -4421,7 +4454,8 @@ def build_parser():
         "blank line with a rule under its heading; the table is coloured when stdout "
         "can render escapes (see '--color'). Tickets filed in a bucket "
         "(wishlist/plans) are out of the status workflow, so they are not live and cannot "
-        "put an epic in scope. This is not 'arbite status' (which counts the whole backlog "
+        "put an epic in scope. With no live ticket the command exits 2, printing '[]' "
+        "under --json. This is not 'arbite status' (which counts the whole backlog "
         "per status) and not 'arbite list --topo' (which shows a filtered selection rather "
         "than an epic's full membership).",
     )
@@ -4738,6 +4772,15 @@ def build_parser():
         "take the ticket you were just handed. If another agent wins the race, the next "
         "workable ticket is claimed instead",
     )
+    p_list.add_argument(
+        "--buckets",
+        action="store_true",
+        help="also list tickets filed in a bucket ('arbite move <id> /plans', a promoted "
+        "wish in /wishlist), which are otherwise left out because they are out of the "
+        "status workflow. --status still applies to the status a filed ticket retains; "
+        "with --json each ticket's 'bucket' key says where it is filed (null when it is "
+        "not). Not accepted with 'next'",
+    )
     _json_flag(p_list)
     _sink_flag(p_list)
     p_list.set_defaults(func=cmd_list)
@@ -4785,6 +4828,15 @@ def build_parser():
         metavar="SEARCH_TEXT",
         nargs="+",
         help="text to search for (joined with spaces if multiple words)",
+    )
+    p_search.add_argument(
+        "--buckets",
+        action="store_true",
+        help="also search tickets filed in a bucket ('arbite move <id> /plans', a promoted "
+        "wish in /wishlist), which are otherwise left out because they are out of the "
+        "status workflow. --status still applies to the status a filed ticket retains; "
+        "with --json each ticket's 'bucket' key says where it is filed (null when it is "
+        "not)",
     )
     _json_flag(p_search)
     _sink_flag(p_search)

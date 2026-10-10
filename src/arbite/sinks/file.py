@@ -376,6 +376,15 @@ class FileSink(TicketSink):
                 found.setdefault(ticket.id, str(path))
         return found
 
+    def bucket_map(self, tickets) -> dict:
+        """Every ticket's bucket, from a single walk of the tree."""
+        wanted = {t.id for t in tickets}
+        found = {}
+        for path, ticket, _error in self._scan():
+            if ticket is not None and ticket.id in wanted:
+                found.setdefault(ticket.id, self._bucket_for(path))
+        return found
+
     def exists(self, ticket_id: str) -> bool:
         return bool([p for p, t, _e in self._scan() if t is not None and t.id == ticket_id])
 

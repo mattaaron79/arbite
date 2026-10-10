@@ -1879,6 +1879,56 @@ def test_init_creates_the_plans_bucket_and_move_files_there(project, cli):
     assert (project / ".arbite" / "open" / f"{tid}.md").exists()
 
 
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_buckets_flag_shows_filed_tickets_and_json_names_the_bucket(cli, tmp_project, sink_kind):
+    """A ticket filed in a bucket is left out of `list` and `search` unless `--buckets`
+    is given, and every `--json` ticket carries `bucket`: the path `move` took, or null
+    (tic-0dca)."""
+    cli("init", sink=sink_kind)
+    filed = create(cli, "a filed plan", sink=sink_kind)
+    kept = create(cli, "a plan still open", sink=sink_kind)
+    cli("move", filed, "/plans", sink=sink_kind)
+
+    def rows(*args, expect=0):
+        return json.loads(cli(*args, "--json", expect=expect, sink=sink_kind).stdout)
+
+    for command in (("list",), ("search", "plan"), ("list", "--topo"), ("list", "--tree")):
+        assert {t["id"]: t["bucket"] for t in rows(*command)} == {kept: None}, command
+        assert {t["id"]: t["bucket"] for t in rows(*command, "--buckets")} == {
+            filed: "/plans",
+            kept: None,
+        }, command
+
+    # --status still filters on the status a filed ticket retains.
+    assert rows("list", "--buckets", "--status", "closed", expect=2) == []
+    assert filed in cli("list", "--buckets", sink=sink_kind).stdout
+    assert filed not in cli("list", sink=sink_kind).stdout
+
+    assert rows("show", filed)["bucket"] == "/plans"
+    assert rows("show", kept)["bucket"] is None
+    assert rows("deps", filed)["bucket"] == "/plans"
+
+    cli("move", filed, "/plans/ideas", sink=sink_kind)
+    assert rows("show", filed)["bucket"] == "/plans/ideas"
+    cli("move", filed, "/", sink=sink_kind)
+    assert rows("show", filed)["bucket"] is None
+
+    assert "--buckets does not apply" in cli(
+        "list", "next", "--buckets", expect=1, sink=sink_kind
+    ).stderr
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_list_raw_buckets_includes_a_wish_filed_in_the_wishlist(cli, tmp_project, sink_kind):
+    cli("init", sink=sink_kind)
+    wish = raw_capture(cli, "wish", "a camera fly-through", sink=sink_kind)
+    cli("promote", wish, "--title", "Fly-through", "--tier", "low", "--domain", "ui", sink=sink_kind)
+
+    assert json.loads(cli("list", "raw", "--json", expect=2, sink=sink_kind).stdout) == []
+    listed = json.loads(cli("list", "raw", "--buckets", "--json", sink=sink_kind).stdout)
+    assert [(t["id"], t["bucket"]) for t in listed] == [(wish, "/wishlist")]
+
+
 def test_delete_needs_force_and_leaves_a_receipt(project, cli):
     tid = create(cli, "doomed")
     cli("delete", tid, expect=1)
@@ -3029,6 +3079,12 @@ def test_progress_exits_empty_when_nothing_is_live(cli, tmp_project, sink_kind):
 
     proc = cli("progress", expect=2, sink=sink_kind)
     assert "no live tickets" in proc.stdout
+    # --json stays a document: `[]`, as `list` and `search` print (tic-e8ed).
+    assert json.loads(cli("progress", "--json", expect=2, sink=sink_kind).stdout) == []
+    assert (
+        json.loads(cli("progress", "--json", "--epic", "workflow", expect=2, sink=sink_kind).stdout)
+        == []
+    )
 
     cli("progress", "--epic", "workflow", expect=2, sink=sink_kind)
     cli("progress", "--epic", "not-an-epic", expect=2, sink=sink_kind)

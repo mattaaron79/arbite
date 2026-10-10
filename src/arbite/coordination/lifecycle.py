@@ -1323,7 +1323,7 @@ class TicketLifecycle:
         stream = self.stream_hint(ticket.id)
         lines.append(self.stream_line(ticket.id))
         data = {
-            **ticket.to_dict(self._location(ticket.id)),
+            **ticket.to_dict(self._location(ticket.id), self.sink.bucket(ticket.id)),
             "attempt": attempt_payload(attempt),
             "stream": stream,
         }

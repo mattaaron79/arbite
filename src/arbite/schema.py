@@ -310,7 +310,7 @@ class Ticket:
         tickets sort after every explicit priority so they are picked up last."""
         return self.priority if self.priority is not None else PRIORITY_MAX
 
-    def to_dict(self, path: Optional[str] = None) -> dict:
+    def to_dict(self, path: Optional[str] = None, bucket: Optional[str] = None) -> dict:
         """Plain JSON-serialisable form: every frontmatter field, plus the
         markdown body, plus the `description` derived from that body, plus the
         `request` a raw ticket was captured from (null in any other status,
@@ -322,7 +322,11 @@ class Ticket:
 
         The key stays `path` because it is part of the agent-facing contract;
         for the file sink the value is a filesystem path, for any other sink it
-        is whatever `TicketSink.describe_location()` reports."""
+        is whatever `TicketSink.describe_location()` reports.
+
+        `bucket` is always present (tic-0dca): the root-relative path a ticket is
+        filed under, in the form `arbite move` takes (`/plans`), from the sink's
+        `bucket()`; null for a ticket at its status location."""
         data = {name: getattr(self, name) for name in FIELD_ORDER}
         data["body"] = self.body
         data["description"] = description_body(self.body)
@@ -334,6 +338,7 @@ class Ticket:
         # `description` reports a missing heading.
         captured = raw_captured_request(self) if self.status == "raw" else ""
         data["request"] = captured or None
+        data["bucket"] = None if bucket is None else f"/{bucket}"
         if path is not None:
             data["path"] = str(path)
         return data

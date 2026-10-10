@@ -271,6 +271,11 @@ class TicketSink(ABC):
         time, and a per-row scan would make that quadratic."""
         return {t.id: self.location(t.id) for t in tickets}
 
+    def bucket_map(self, tickets) -> dict:
+        """`{ticket_id: bucket_or_None}` for a batch of tickets; batched for the
+        same reason `location_map` is."""
+        return {t.id: self.bucket(t.id) for t in tickets}
+
     @abstractmethod
     def notes(self, ticket_id: str) -> list:
         """The ticket's `## Notes` entries, in body order, as `schema.Note`.

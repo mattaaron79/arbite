@@ -67,8 +67,8 @@ TICKET_ID_HELP_READONLY = (
 JSON_HELP = (
     "emit machine-readable JSON on stdout instead of a formatted table "
     "(ticket payloads carry the frontmatter fields plus `body` plus the "
-    "derived `description` and `request`); exit code 2 means the query ran but "
-    "matched nothing"
+    "derived `description`, `request` and `bucket`); exit code 2 means the query ran "
+    "but matched nothing"
 )
 
 MESSAGE_HELP = (
@@ -286,6 +286,10 @@ FIELD_NOTES = {
     "from (the body's 'Original request:' line). Every `--json` ticket payload reports it -- "
     "null for any other status, and null for a `raw` ticket whose body no longer carries the "
     "line (`arbite list raw` prints a placeholder for that case)",
+    "bucket": "derived, not a frontmatter field: where the ticket is filed, as the "
+    "root-relative path `arbite move` takes (e.g. `/plans`). Every `--json` ticket payload "
+    "reports it -- null for a ticket at its status location, which is every ticket `list` "
+    "and `search` show without `--buckets`",
 }
 
 # ---------------------------------------------------------------------------
@@ -744,6 +748,7 @@ def _topic_fields(ctx: DocContext) -> list:
         add(f"- `{field_name}` -- {FIELD_NOTES.get(field_name, '')}")
     add(f"- `description` -- {FIELD_NOTES['description']}")
     add(f"- `request` -- {FIELD_NOTES['request']}")
+    add(f"- `bucket` -- {FIELD_NOTES['bucket']}")
     add("")
     add(
         "These axes are independent -- don't collapse them: `depends_on` (structural "
@@ -847,7 +852,9 @@ def _topic_sinks(ctx: DocContext) -> list:
             "outside arbite breaks the pairing **the folder wins**. `wishlist/` and `plans/` "
             "are **buckets**, not statuses: a ticket filed in one is out of the status "
             "workflow (so `list next` never offers it) but keeps the status it had -- `arbite "
-            "move <id> /plans` files it, `arbite move <id> /` un-files it. Filenames never "
+            "move <id> /plans` files it, `arbite move <id> /` un-files it. `list` and "
+            "`search` leave filed tickets out unless given `--buckets`; `show <id>` always "
+            "finds one, and `--json` reports where it is filed as `bucket`. Filenames never "
             "change on a move, so `git log --follow` traces a ticket's whole lifecycle."
         )
         add("")
@@ -1084,7 +1091,10 @@ def _topic_conventions(ctx: DocContext) -> list:
         "plus `body`, plus `description` -- the text under the body's "
         f"`{DESCRIPTION_HEADING}` heading, or the text before the first '## ' line when "
         "the heading is absent (null when there is none) -- plus `request`, the brief "
-        "text a `raw` ticket was captured from, null for any other status. `create` and "
+        "text a `raw` ticket was captured from, null for any other status -- plus "
+        "`bucket`, the path a ticket is filed under (`/plans`), null when it is not in "
+        "a bucket. A query that matches nothing still prints a document (`[]` from "
+        "`list`, `search` and `progress`) and exits 2. `create` and "
         "`raw --json` print exactly the document `show --json` prints, so a caller "
         "learns the new ticket's id without parsing the creation line; the human table "
         "format is not a stable interface. The `path` field is whatever the sink calls "

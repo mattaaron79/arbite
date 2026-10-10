@@ -433,6 +433,12 @@ class SqliteSink(TicketSink):
             raise TicketNotFound(f"no ticket found matching '{ticket_id}'")
         return row["bucket"]
 
+    def bucket_map(self, tickets) -> dict:
+        wanted = {t.id for t in tickets}
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id, bucket FROM tickets").fetchall()
+        return {row["id"]: row["bucket"] for row in rows if row["id"] in wanted}
+
     def move_to_bucket(self, ticket_id: str, bucket: Optional[str]) -> Ticket:
         """File a ticket in a bucket, or with None return it to the status
         workflow. Changes no field: filing is not a state change."""
