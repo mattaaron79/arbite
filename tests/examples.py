@@ -10,8 +10,10 @@ that checkable rather than decorative:
 - **Both sides are normalised** before comparison, because ids, times and paths
   differ on every machine and in every checkout: `normalise()` substitutes
   `tic/ws/att/op/clm/art/evt-XXXX` ids, `HH:MM:SS` times, RFC 3339 UTC timestamps,
-  dates, the project root and any path below an `.arbite` directory -- the same idea
-  the existing suite uses for ticket ids.
+  dates, the project root, any path below an `.arbite` directory and the month
+  folder of an archived ticket (`closed/2026-09/` becomes `closed/YYYY-MM/`; the
+  `closed/` bucket stays literal, so a close filing into the wrong place still
+  fails) -- the same idea the existing suite uses for ticket ids.
 
 Text scenarios are compared byte for byte after normalisation. A scenario whose
 output is a JSON document is compared as *parsed* JSON with its string leaves
@@ -108,6 +110,14 @@ DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 #: milliseconds a real `sed` took on the machine the block was written on.
 DURATION_RE = re.compile(r"\(\d+ ms\)")
 ARBITE_PATH_RE = re.compile(r"(?:[^\s\"'()]*[/\\])?\.arbite((?:[/\\][^\s\"'(),]*)?)")
+#: The month folder the file sink archives closed tickets into (`closed/2026-09/` is
+#: named after the close month -- that product behaviour is pinned in
+#: tests/test_file_sink.py, so the transcripts must not also pin the calendar, or LC1
+#: breaks on the first of every month). Only the month inside the `closed/` bucket
+#: folds: the bucket, the id and the rest of the path stay literal, so a close that
+#: files into `shelved/`, into the wrong bucket, or leaves the ticket in place, still
+#: fails the scenario.
+ARCHIVE_MONTH_RE = re.compile(r"\bclosed[/\\]\d{4}-\d{2}(?=[/\\])")
 
 
 @dataclass(frozen=True)
@@ -325,12 +335,16 @@ def normalise(text: str, root=None) -> str:
     """`text` with ids, times and paths replaced by stable placeholders.
 
     Applied to *both* the transcript and the real output, which is what lets one
-    frozen block be asserted on any machine."""
+    frozen block be asserted on any machine -- and in any month: the folder a closed
+    ticket is archived into is named after the month of the close, so `closed/<YYYY-MM>/`
+    folds to `closed/YYYY-MM/` while the bucket, the ids and the rest of the path
+    stay literal."""
     result = str(text)
     if root is not None:
         result = result.replace(str(root), "<ROOT>")
     result = result.replace(DOC_ROOT, "<ROOT>")
     result = ARBITE_PATH_RE.sub(lambda m: "<ARBITE>" + m.group(1).replace("\\", "/"), result)
+    result = ARCHIVE_MONTH_RE.sub("closed/YYYY-MM", result)
     result = ID_RE.sub(lambda m: f"{m.group(1)}-XXXX", result)
     result = DIGEST_RE.sub("sha256:<DIGEST>", result)
     result = UTC_TIMESTAMP_RE.sub("YYYY-MM-DDTHH:MM:SSZ", result)

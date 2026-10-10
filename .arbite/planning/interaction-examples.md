@@ -120,7 +120,11 @@ coordination store.
 
 `tests/test_examples.py` asserts exit code, stdout and stderr per scenario, with a
 helper substituting `tic-XXXX`/`att-XXXX`/`op-XXXX` ids, `HH:MM:SS` times and
-absolute paths, exactly as the existing suite normalises ticket ids. Scenario IDs
+absolute paths, exactly as the existing suite normalises ticket ids. It also folds
+the month folder of an archived ticket: the file sink files a closed ticket in
+`closed/<close month>/`, so LC1's `.arbite/closed/2026-09/tic-cf9f.md` asserts the
+`closed/` bucket and the ticket file but *not* the calendar (the month behaviour is
+pinned in `tests/test_file_sink.py`). Scenario IDs
 name the tests: `test_FC3_claim_multi_busy_all_or_nothing`.
 
 ---

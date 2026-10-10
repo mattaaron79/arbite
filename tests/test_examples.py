@@ -284,6 +284,25 @@ def test_normalisation_keeps_utc_stamps_distinct_from_local_times():
     assert normalised == "started YYYY-MM-DDTHH:MM:SSZ, printed HH:MM:SS"
 
 
+def test_normalisation_folds_the_closed_archive_month_and_nothing_else():
+    """The file sink files a closed ticket under `closed/<close month>/` (pinned by
+    tests/test_file_sink.py), so without the fold LC1 breaks on the first of every
+    month. The contrasts are the real content of this test: a normalise() that
+    folded *everything* would pass the fold check alone."""
+    closed_sept = examples.normalise(".arbite/closed/2026-09/tic-cf9f.md")
+
+    assert closed_sept == "<ARBITE>/closed/YYYY-MM/tic-XXXX.md"
+    assert examples.normalise(".arbite/closed/2031-01/tic-cf9f.md") == closed_sept
+
+    assert examples.normalise(".arbite/shelved/tic-cf9f.md") != closed_sept
+    assert examples.normalise(".arbite/open/2026-09/tic-cf9f.md") != closed_sept
+    assert examples.normalise(".arbite/closed/2026-09/att-91bd.md") != closed_sept
+    assert examples.normalise(
+        ".arbite/closed/2026-09/tic-cf9f.md sha256:1f3a9c04b2d8"
+    ) == closed_sept + " sha256:<DIGEST>"
+    assert examples.normalise("sha256:1f3a9c04b2d8") != examples.normalise("2026-09")
+
+
 def test_the_harness_rejects_output_that_differs(tmp_path):
     """A transcript that does not match fails, rather than passing quietly: the
     scenarios above are only worth something if this one fails."""

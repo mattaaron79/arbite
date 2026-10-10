@@ -30,15 +30,26 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
 
+def child_env() -> dict:
+    """The environment an arbite subprocess runs with.
+
+    What the developer's shell says about the store and about this terminal's colour is
+    dropped rather than inherited: every test states what it is testing, including "the
+    default is files" and "the terminal advertises 256 colours", so one run of this file
+    means the same thing in every shell."""
+    environment = dict(os.environ, PYTHONPATH=str(SRC_DIR))
+    never_inherited = ("ARBITE_SINK", "COLORTERM", "NO_COLOR", "ARBITE_COLOR", "TERM")
+    for name in never_inherited:
+        environment.pop(name, None)
+    return environment
+
+
 @pytest.fixture
 def cli(tmp_project):
     """Run the CLI in a throwaway project and assert its exit code."""
 
     def run(*args, expect=0, sink=None, env=None):
-        environment = dict(os.environ, PYTHONPATH=str(SRC_DIR))
-        # Never inherit a sink from the developer's shell: every test states what
-        # it is testing, including "the default is files".
-        environment.pop("ARBITE_SINK", None)
+        environment = child_env()
         if sink:
             environment["ARBITE_SINK"] = sink
         if env:
@@ -65,8 +76,7 @@ def run_cli(cwd: Path, *args):
     The `cli` fixture always runs in the project root; the tests that care about
     resolution *below* the root -- "the config is inside .arbite/, which is what
     gets located first" -- need to start somewhere else."""
-    environment = dict(os.environ, PYTHONPATH=str(SRC_DIR))
-    environment.pop("ARBITE_SINK", None)
+    environment = child_env()
     proc = subprocess.run(
         [sys.executable, "-m", "arbite.cli", *args],
         cwd=str(cwd),
@@ -2942,9 +2952,10 @@ def test_progress_help_distinguishes_it_from_status_and_list_topo(cli, tmp_proje
     assert "not 'arbite list --topo'" in help_text
 
 
-#: A report is read by eye and by program, so the colour tests must not depend on what
-#: the developer's shell exported: `auto` pointed at a pipe, with an empty NO_COLOR
-#: neutralising one inherited from the environment (empty means 'unset').
+#: A report is read by eye and by program, so the default-mode colour tests state their
+#: own environment instead of relying on the shell's: `auto` pointed at a pipe, with an
+#: empty NO_COLOR meaning 'unset'. Nothing else about the terminal is inherited at all --
+#: `child_env` forwards no colour announcement.
 PLAIN_ENV = {"ARBITE_COLOR": "auto", "NO_COLOR": ""}
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -3031,21 +3042,35 @@ def test_arbite_color_sets_the_default_and_no_color_outranks_it(cli, project):
 
 def test_the_epic_and_the_assignee_carry_their_own_accents(cli, project):
     """A grouping and an owner each read as themselves: the epic violet and the
-    assignee orange are accents a 256-colour terminal gets exactly, and a terminal that
-    knows only the base palette gets the nearest plain colour instead of a code it
-    would render as something arbitrary."""
+    assignee orange are accents a 256-colour terminal gets exactly, a terminal that
+    announces 24-bit colour gets the violet the 256 palette can only approximate, and a
+    terminal that knows only the base palette gets the nearest plain colour instead of a
+    code it would render as something arbitrary. Every rung is one the test states."""
     cli("init")
     tid = create(cli, "alpha work", epic="alpha")
     cli("claim", tid, "--agent", "claude.haiku.001")
 
+    truecolor = cli(
+        "progress",
+        "--color",
+        "always",
+        env={"TERM": "xterm-256color", "COLORTERM": "truecolor"},
+    ).stdout
     rich = cli("progress", "--color", "always", env={"TERM": "xterm-256color"}).stdout
     base = cli("progress", "--color", "always", env={"TERM": "xterm"}).stdout
 
+    assert term.EPIC_TRUECOLOR in truecolor
+    assert term.ASSIGNEE_256 in truecolor, "the orange has no higher rung to climb"
+    assert term.EPIC_256 not in truecolor, "one rung per terminal"
+
     assert term.EPIC_256 in rich and term.ASSIGNEE_256 in rich
+    assert term.EPIC_TRUECOLOR not in rich, "24-bit is not assumed from 256 colours"
+
     assert term.EPIC_16 in base and term.ASSIGNEE_16 in base
     assert term.EPIC_256 not in base and term.ASSIGNEE_256 not in base
-    # The accent is the only difference: the words are the same either way.
-    assert ANSI.sub("", rich) == ANSI.sub("", base)
+    assert "\x1b[38;" not in base, "no extended code reaches a 16-colour terminal"
+    # The accent is the only difference: the words are the same on every rung.
+    assert ANSI.sub("", truecolor) == ANSI.sub("", rich) == ANSI.sub("", base)
 
 
 def test_an_unknown_color_mode_is_refused_before_anything_is_read(cli, project):
