@@ -1322,6 +1322,128 @@ that would have filled the gap. `close` and `accept` do not gate at all.
 
 ---
 
+# DP — dependency edges
+
+`arbite depend` edits one ticket's `depends_on`: two ids add an edge, `--remove` with two
+ids drops that one edge, and a bare id clears the whole list. Both two-id forms are a
+single compare-and-swap write, which is what `--remove` is for: without it, dropping one
+dependency is a `show` then `set depends_on <the rest>` read-modify-write, and a dependency
+another agent added in between is silently lost by it.
+
+## DP1 · drop one dependency and keep the rest
+
+```sh
+$ arbite depend tic-cf9f tic-9b57 --remove
+tic-cf9f no longer depends on tic-9b57
+# exit 0
+```
+
+*target:* `tic-cf9f` depended on `tic-9b57` and `tic-e9ed`; it now depends on `tic-e9ed`
+alone, still in the order the two edges were made, and it is the only ticket written --
+`tic-9b57` keeps its own `updated` stamp. `list --topo`, `list --tree` and `list next` all
+see the edge gone, so nothing downstream has to be told about it.
+
+## DP2 · refuse to remove a dependency the ticket does not have
+
+```sh
+$ arbite depend tic-cf9f tic-e9ed --remove
+error: ticket tic-cf9f does not depend on tic-e9ed; it depends on tic-9b57
+# exit 1
+```
+
+*target:* the asymmetry `ref rm` already keeps -- re-adding an existing dependency is a
+no-op success, while removing one that is not there is exit 1, naming the absent id and
+printing the dependencies the ticket really has. Nothing is written, so the ticket keeps
+its `updated` stamp and a retry sees no drift. `--remove` with no second id is refused for
+the same reason: replacing the whole list is the bare `arbite depend <tic>` form.
+
+---
+
+# CR — ticket creation and capture
+
+`create`, `raw` and the five shortcut commands mint tickets, and their `--json` is the
+machine contract for that act: one document, exactly what `arbite show <id> --json`
+prints for the ticket just created, so a caller takes the id from `id` instead of
+parsing prose. `created` and `updated` are the run's wall-clock second -- the only two
+fields a frozen block cannot pin -- so the CR tests assert the blocks field by field
+with the stamps taken from the run itself, plus `created == updated` (a ticket that has
+never been rewritten). `path` is whatever the sink calls a location: a `.arbite/...`
+file path here, `sqlite:<db>#<id>` in the sqlite store; each form is pinned per sink in
+the tests.
+
+## CR1 · `create --json` prints the new ticket as the show document
+
+```sh
+$ arbite create --title "Add per-mesh LOD" --type feature --tier high --domain mesh --description "Add a per-mesh LOD ladder to the mesh importer." --json
+{
+  "id": "tic-cf9f",
+  "title": "Add per-mesh LOD",
+  "status": "open",
+  "type": "feature",
+  "tier": "high",
+  "domain": "mesh",
+  "epic": null,
+  "priority": null,
+  "tags": [],
+  "assignee": null,
+  "depends_on": [],
+  "references": [],
+  "blocked_by": null,
+  "created": "2026-09-21T13:12:04",
+  "updated": "2026-09-21T13:12:04",
+  "closed": null,
+  "body": "## Description\nAdd a per-mesh LOD ladder to the mesh importer.\n\n## Notes\n",
+  "description": "Add a per-mesh LOD ladder to the mesh importer.",
+  "path": ".arbite/open/tic-cf9f.md"
+}
+# exit 0
+```
+
+*target:* one JSON document on stdout, nothing else, exit 0. The document is what
+`arbite show tic-cf9f --json` prints a moment later for the same ticket -- the same
+keys, the same `description` derived from the body's `## Description` section, the same
+`path` the creation line would have named. Without `--json` the command still prints
+its `created tic-cf9f at .arbite/open/tic-cf9f.md` line; nothing about the text path
+moves.
+
+## CR2 · a shortcut's `--json` is the long form's document
+
+```sh
+$ arbite feature "add per-mesh LOD" --json
+{
+  "id": "tic-cf9f",
+  "title": "feature (raw): Requires Classification",
+  "status": "raw",
+  "type": "feature",
+  "tier": "TODO: low|medium|high|frontier",
+  "domain": "TODO: e.g. mesh, image_gen, audio_gen, ui, io",
+  "epic": "classification",
+  "priority": null,
+  "tags": [],
+  "assignee": null,
+  "depends_on": [],
+  "references": [],
+  "blocked_by": null,
+  "created": "2026-09-21T13:12:04",
+  "updated": "2026-09-21T13:12:04",
+  "closed": null,
+  "body": "## Description\nThis is a **raw** ticket: it was captured from a brief request without proper classification. It must be filled out before it can be worked.\n\nOriginal request: add per-mesh LOD\n\nWhat still needs to be done -- human or agent triage, which `arbite fetch` starts and `arbite promote <id>` finishes in one write:\n- title -- replace \"Requires Classification\" with a short human-readable summary\n- tier -- low | medium | high | frontier (agent capability tier required to work it; how capable the agent must be, not how urgent the work is)\n- domain -- e.g. mesh, image_gen, audio_gen, ui, io (drives routing)\n- epic -- this raw ticket is auto-grouped under the 'classification' epic (so triage can find it with `arbite list next --epic classification`); pass the real epic this work belongs to (e.g. mesh-pipeline) to `arbite promote` and it replaces that grouping\n- priority -- numeric urgency index, lower = more urgent\n- description -- expand this body into a proper task description based on the original request, including any acceptance criteria\n- status -- `arbite promote <id> ...` classifies these fields in place and moves the ticket to `open` (or claims it in the same command with `--agent <your-id>`) so it becomes workable via `arbite list next`; the same fields can still be written by hand with `arbite set`\n\n## Notes\n",
+  "description": "This is a **raw** ticket: it was captured from a brief request without proper classification. It must be filled out before it can be worked.\n\nOriginal request: add per-mesh LOD\n\nWhat still needs to be done -- human or agent triage, which `arbite fetch` starts and `arbite promote <id>` finishes in one write:\n- title -- replace \"Requires Classification\" with a short human-readable summary\n- tier -- low | medium | high | frontier (agent capability tier required to work it; how capable the agent must be, not how urgent the work is)\n- domain -- e.g. mesh, image_gen, audio_gen, ui, io (drives routing)\n- epic -- this raw ticket is auto-grouped under the 'classification' epic (so triage can find it with `arbite list next --epic classification`); pass the real epic this work belongs to (e.g. mesh-pipeline) to `arbite promote` and it replaces that grouping\n- priority -- numeric urgency index, lower = more urgent\n- description -- expand this body into a proper task description based on the original request, including any acceptance criteria\n- status -- `arbite promote <id> ...` classifies these fields in place and moves the ticket to `open` (or claims it in the same command with `--agent <your-id>`) so it becomes workable via `arbite list next`; the same fields can still be written by hand with `arbite set`",
+  "path": ".arbite/raw/tic-cf9f.md"
+}
+# exit 0
+```
+
+*target:* the shortcut is `arbite raw feature "add per-mesh LOD" --json` under another
+name, and the two documents are the same apart from the minted id and its stamps:
+`status` `raw`, grouped under the `classification` epic, `tier` and `domain` still the
+capture-time TODOs, the full triage checklist in `body` and mirrored into
+`description`. The ticket is `raw`, so `arbite list raw`, `arbite fetch --json` and
+`arbite show <id> --json` all see it unchanged -- `--json` at capture adds a
+machine-readable form of the same ticket, not a different ticket.
+
+---
+
 # Scenario to ticket map
 
 | Ticket | Key | Scenarios that must pass |
@@ -1342,6 +1464,8 @@ that would have filled the gap. `close` and `accept` do not gate at all.
 | Add passthrough guarded mode | C14 | PC2, PC3, PC4 |
 | Validate and document the shared-directory proxy workflow | C15 | BY1, BY3, all exit codes, full-suite conformance |
 | Add per-ticket narration streams (`arbite stream`) | — | ST1, ST2, ST3, ST4, ST5, ST6 |
+| Drop one dependency without rewriting the list (`arbite depend --remove`) | — | DP1, DP2 |
+| Print the new ticket as the show document (`--json` on `create`, `raw` and the five shortcut commands) | — | CR1, CR2 |
 
 The wishlist ticket for mandating passthrough carries no scenarios yet by design;
 it is a policy question, not a behaviour.

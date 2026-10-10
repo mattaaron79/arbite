@@ -1296,6 +1296,11 @@ def cmd_create(args):
 
     sink.create(new_ticket)
     location = sink.location(new_ticket.id)
+    if args.json:
+        # The ticket-document shape (cmd_delete's precedent): exactly what
+        # `show --json` prints, so the caller never parses the creation line.
+        _print_json(new_ticket.to_dict(location))
+        return
     if args.blank:
         print(
             f"created blank template {new_ticket.id} at {location} -- fill in the TODOs "
@@ -1353,8 +1358,14 @@ def cmd_raw(args):
     )
 
     sink.create(new_ticket)
+    location = sink.location(new_ticket.id)
+    if args.json:
+        # Same ticket document as `show --json`; a raw-status ticket has no
+        # status filter anywhere in the read path, so it prints unchanged.
+        _print_json(new_ticket.to_dict(location))
+        return
     print(
-        f"created raw {args.type} ticket {new_ticket.id} at {sink.location(new_ticket.id)} -- "
+        f"created raw {args.type} ticket {new_ticket.id} at {location} -- "
         "classify it (title/tier/domain/epic/priority/description) before it can be worked; "
         f"it is grouped under the '{CLASSIFICATION_EPIC}' epic until then. "
         "Pull it for classification with 'arbite fetch'."
@@ -1636,6 +1647,7 @@ def _filter_query(args) -> TicketQuery:
     predicate here."""
     return TicketQuery(
         status=tuple(getattr(args, "status", None) or ()),
+        type=getattr(args, "type", None),
         tier=getattr(args, "tier", None),
         domain=getattr(args, "domain", None),
         epic=getattr(args, "epic", None),
@@ -1774,8 +1786,8 @@ def _cmd_list_next(args, sink, every):
     """Print the next open ticket(s) that are actually workable -- every ticket
     they depend on is closed -- most urgent (lowest priority number) first.
     Readiness is decided against the complete ticket set, so an unmet
-    dependency holds a ticket back whatever tier/domain/epic its blocker sits
-    at; --tier/--domain/--epic then narrow the workable candidates, and
+    dependency holds a ticket back whatever type/tier/domain/epic its blocker sits
+    at; --type/--tier/--domain/--epic then narrow the workable candidates, and
     anything that isn't `open` is never considered. If nothing workable matches
     the filters, that's an answer with the reason and the exit code 2 (CL4).
 
@@ -1789,6 +1801,7 @@ def _cmd_list_next(args, sink, every):
     open_matching = sink.query(
         TicketQuery(
             status=("open",),
+            type=args.type,
             tier=args.tier,
             domain=args.domain,
             epic=args.epic,
@@ -1902,7 +1915,7 @@ def _report_nothing_workable(args, by_id, open_matching):
         sys.exit(EXIT_EMPTY)
     labels = [
         f"{name}={value}"
-        for name, value in (("tier", args.tier), ("domain", args.domain), ("epic", args.epic))
+        for name, value in (("type", args.type), ("tier", args.tier), ("domain", args.domain), ("epic", args.epic))
         if value
     ]
     print("no workable open tickets" + (f" matching {' '.join(labels)}" if labels else ""))
@@ -2729,13 +2742,28 @@ def cmd_deps(args):
 
 
 def cmd_depend(args):
-    """Set or clear a ticket's depends_on. With two arguments, <tic_a> is made to
-    depend on <tic_b> (added to its depends_on, deduplicated). With a single
+    """Set, un-set or clear a ticket's depends_on.
+
+    With two arguments, <tic_a> is made to depend on <tic_b>: <tic_b> is added to
+    its depends_on, deduplicated. With `--remove` and the same two arguments, that
+    one dependency is dropped and the others keep their order. Both are one write
+    through the sink's own compare-and-swap, so a dependency another agent added
+    between reading the list and writing it back is refused rather than silently
+    lost -- which is what `show` then `set depends_on <the rest>` would cost.
+    Removing a dependency the ticket does not have is an error that changes nothing,
+    exactly as `ref rm` refuses a path the ticket does not reference. With a single
     argument, all of <tic_a>'s dependencies are cleared."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     expect = _expect_from(t)
+    listed = ", ".join(t.depends_on) if t.depends_on else "(nothing)"
     if args.dep is None:
+        if args.remove:
+            raise TicketError(
+                f"depend --remove needs TIC_B as well as TIC_A; {t.id} depends on "
+                f"{listed} -- drop one with 'arbite depend {t.id} <tic> --remove', or "
+                f"clear them all with 'arbite depend {t.id}'"
+            )
         t.depends_on = []
         t.updated = schema.now()
         sink.update(t, expect=expect)
@@ -2743,7 +2771,20 @@ def cmd_depend(args):
         return
     dep = sink.get(args.dep, unique=True)
     if dep.id == t.id:
-        raise TicketError(f"ticket {t.id} cannot depend on itself")
+        raise TicketError(
+            f"ticket {t.id} cannot depend on itself"
+            + (", so it has no such dependency to remove" if args.remove else "")
+        )
+    if args.remove:
+        if dep.id not in t.depends_on:
+            raise TicketError(
+                f"ticket {t.id} does not depend on {dep.id}; it depends on {listed}"
+            )
+        t.depends_on = [other for other in t.depends_on if other != dep.id]
+        t.updated = schema.now()
+        sink.update(t, expect=expect)
+        print(f"{t.id} no longer depends on {dep.id}")
+        return
     if dep.id not in t.depends_on:
         t.depends_on.append(dep.id)
         t.updated = schema.now()
@@ -2904,7 +2945,13 @@ def cmd_set(args):
     'closed' when a ticket is set to closed. Setting 'status' is the same change
     as `arbite set-status <id> <status>`, through one shared code path, so the
     two front doors cannot drift; `set-status` is the dedicated front door for
-    the statuses no work-flow command reaches (the escape hatch)."""
+    the statuses no work-flow command reaches (the escape hatch).
+
+    'description' is body text, not a frontmatter field: setting it rewrites
+    only the body's '## Description' section -- the notes and every other line
+    survive byte-for-byte, and the section is inserted at the top when the
+    heading is absent. An empty quoted value empties the section; unlike a
+    clearable frontmatter field it never becomes None."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     assignments = args.assignments
@@ -2945,6 +2992,12 @@ def cmd_set(args):
             # ticket's *previous* status is still readable when deciding whether
             # to date `closed`.
             new_status = value
+            continue
+        if prop == "description":
+            # Body text, not a Ticket attribute: rewrite only the
+            # '## Description' section, bypassing coerce_field_value --
+            # empty means an empty section, never a cleared field.
+            t.body = schema.replace_description(t.body, value)
             continue
         if prop == "updated":
             updated_given = True
@@ -4439,6 +4492,7 @@ def build_parser():
         "TODO placeholders if not given, and adds a body warning telling agents not to claim it "
         "until it's been filled in and saved",
     )
+    _json_flag(p_create)
     _sink_flag(p_create)
     p_create.set_defaults(func=cmd_create)
 
@@ -4469,6 +4523,7 @@ def build_parser():
         help=f"kind of raw ticket: {' | '.join(schema.RAW_TYPE_CHOICES)}",
     )
     p_raw.add_argument("message", metavar="MESSAGE", nargs="+", help=docs.MESSAGE_HELP)
+    _json_flag(p_raw)
     _sink_flag(p_raw)
     p_raw.set_defaults(func=cmd_raw)
 
@@ -4487,6 +4542,7 @@ def build_parser():
             "before it can be claimed or worked.",
         )
         p_shortcut.add_argument("message", metavar="MESSAGE", nargs="+", help=docs.MESSAGE_HELP)
+        _json_flag(p_shortcut)
         _sink_flag(p_shortcut)
         p_shortcut.set_defaults(func=cmd_raw, type=_name)
 
@@ -4597,6 +4653,13 @@ def build_parser():
         "status instead, see 'arbite status'",
     )
     p_list.add_argument(
+        "--type",
+        choices=schema.TYPES,
+        help="filter by ticket type; one value, e.g. 'bug' (not a comma-separated list like "
+        "--status). Visibility stays governed by --status, so a raw capture of a "
+        "chosen type is not surfaced by this filter alone",
+    )
+    p_list.add_argument(
         "--tier",
         choices=TIERS,
         help="filter by agent capability tier; with 'next', pass your own tier so you "
@@ -4649,8 +4712,8 @@ def build_parser():
         metavar="SUBCOMMAND",
         help="'next' prints the next workable open ticket -- one whose depends_on "
         "tickets are all closed -- most urgent (lowest priority number) first; combine "
-        "with --tier/--domain/--epic to restrict to a capability tier, a domain or an "
-        "epic, --count to hand a batch of work to several agents at once, and --claim to "
+        "with --type/--tier/--domain/--epic to restrict to a ticket type, a capability "
+        "tier, a domain or an epic, --count to hand a batch of work to several agents at once, and --claim to "
         "take it in the same command. 'raw' prints the whole raw backlog (every status "
         "'raw' ticket) as a running todo list until a classification run drains it: "
         "grouped by type (memo/feature/request/bug/wish), one line per ticket showing its id "
@@ -4996,11 +5059,14 @@ def build_parser():
 
     p_depend = sub.add_parser(
         "depend",
-        help="add a dependency to a ticket's depends_on, or clear all of its dependencies",
+        help="add or drop one dependency of a ticket's depends_on, or clear them all",
         description="Declare that one ticket depends on another. With two arguments, "
         "<tic_a> is made to depend on <tic_b>: <tic_b> is added to <tic_a>'s "
-        "depends_on (deduplicated, existing dependencies are kept). With a single "
-        "argument, all of <tic_a>'s dependencies are cleared.",
+        "depends_on (deduplicated, existing dependencies are kept). With --remove and "
+        "the same two arguments, <tic_b> is dropped from <tic_a>'s depends_on and the "
+        "others keep their order; a dependency <tic_a> does not have is an error "
+        "(exit 1) that writes nothing, and --remove needs both ids. With a single "
+        "argument and no --remove, all of <tic_a>'s dependencies are cleared.",
     )
     p_depend.add_argument("id", metavar="TIC_A", help=TICKET_ID_HELP)
     p_depend.add_argument(
@@ -5008,7 +5074,15 @@ def build_parser():
         metavar="TIC_B",
         nargs="?",
         default=None,
-        help="ticket that <TIC_A> depends on; omit to clear all of <TIC_A>'s dependencies",
+        help="the ticket <TIC_A> depends on, or with --remove the one to drop; omit "
+        "to clear all of <TIC_A>'s dependencies",
+    )
+    p_depend.add_argument(
+        "--remove",
+        action="store_true",
+        help="drop <TIC_B> from <TIC_A>'s depends_on instead of adding it, keeping the "
+        "other dependencies in order; an error (exit 1) if <TIC_A> does not depend on "
+        "<TIC_B>",
     )
     _sink_flag(p_depend)
     p_depend.set_defaults(func=cmd_depend)
@@ -5116,6 +5190,11 @@ def build_parser():
         "re-filed to match (moving to 'closed' auto-dates 'closed'); 'arbite set-status "
         "<id> <status>' is the dedicated front door for the same change, through the same "
         "code path, and is the escape hatch for the statuses no work-flow command reaches. "
+        "'description' is body text, not a frontmatter field: setting it "
+        "rewrites only the body's '## Description' section -- notes and every "
+        "other line survive byte-for-byte, an empty quoted value leaves the "
+        "section empty rather than clearing it, and every `--json` payload "
+        "reports the section back as 'description'. "
         "'id' is structural "
         "and cannot be set. This changes one ticket; to count tickets per status across the "
         "whole backlog, use 'arbite status'.",

@@ -125,6 +125,51 @@ def snapshot_path(project: Path, tid: str) -> Path:
     return project / ".arbite" / "raw" / "processed" / f"{tid}.raw.md"
 
 
+def stamp_updated(project: Path, sink_kind: str, tid: str, stamp: str = "2020-01-01T00:00:00") -> str:
+    """Backdate one ticket's `updated` through the sink, so a test can assert that a
+    write re-stamped it rather than betting on a wall clock with one-second
+    granularity: `schema.now()` can land in the same second the ticket was created."""
+    store = build_sink(SinkSpec(kind=sink_kind), project / ".arbite")
+    ticket = store.get(tid)
+    ticket.updated = stamp
+    store.update(ticket, expect=arbite_cli._expect_from(ticket))
+    return stamp
+
+
+def dependency_mesh(cli, tmp_project, sink_kind):
+    """`(dependent, dropped, late, kept, spare)` in a fresh project of `sink_kind`:
+    `dependent` holds three dependencies added in that order -- urgent `dropped` first,
+    then `late` (p6) and `kept` (p3) -- so the list a removal leaves behind is in the
+    order the edges were made rather than one a rebuilt list could have sorted. `spare`
+    depends on nothing and nothing depends on it."""
+    cli("init", sink=sink_kind)
+    dependent = create(cli, "dependent", priority=1, sink=sink_kind)
+    dropped = create(cli, "dropped", priority=9, sink=sink_kind)
+    late = create(cli, "late", priority=6, sink=sink_kind)
+    kept = create(cli, "kept", priority=3, sink=sink_kind)
+    spare = create(cli, "spare", priority=7, sink=sink_kind)
+    for dependency in (dropped, late, kept):
+        cli("depend", dependent, dependency, sink=sink_kind)
+    return dependent, dropped, late, kept, spare
+
+
+def tree_children(tree, tid: str):
+    """The ids beneath `tid` in a `list --tree --json` payload, in printed order."""
+    root = next(node for node in tree if node["id"] == tid)
+    return [child["id"] for child in root["depends"]]
+
+
+def unique_prefix(tid: str, others) -> str:
+    """The shortest prefix of `tid` that no id in `others` also starts with, so a test
+    of wildcard resolution does not bet on randomly minted ids staying distinct."""
+    length = next(
+        size
+        for size in range(4, len(tid) + 1)
+        if all(not other.startswith(tid[:size]) for other in others)
+    )
+    return tid[:length]
+
+
 # --- init and the sink surface --------------------------------------------
 
 
@@ -677,7 +722,8 @@ def test_commands_without_a_store_tell_you_to_init(cli, tmp_project):
 
 
 def test_show_json_exposes_the_frontmatter_contract(project, cli):
-    tid = create(cli, "Fix LOD", priority=2, tags="lod,mesh")
+    tid = create(cli, "Fix LOD", priority=2, tags="lod,mesh",
+                 description="The LOD ramp skips levels.")
     payload = json.loads(cli("show", tid, "--json").stdout)
     assert payload["id"] == tid
     assert payload["priority"] == 2
@@ -685,6 +731,10 @@ def test_show_json_exposes_the_frontmatter_contract(project, cli):
     assert payload["status"] == "open"
     assert "body" in payload and "path" in payload
     assert payload["path"].endswith(f"{tid}.md")
+    # The payload is the frontmatter fields plus `body`, plus the derived
+    # `description` -- the text of the body's `## Description` section.
+    assert payload["description"] == "The LOD ramp skips levels."
+    assert payload["description"] in payload["body"]
 
 
 def test_a_wildcard_id_resolves_but_a_mutation_refuses_an_ambiguous_one(project, cli):
@@ -700,6 +750,30 @@ def test_create_requires_its_fields_unless_blank(project, cli):
     cli("create", "--title", "no type", expect=1)
     blank = ticket_id(cli("create", "--blank").stdout)
     assert json.loads(cli("show", blank, "--json").stdout)["title"].startswith("TODO:")
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_create_json_prints_the_show_document(cli, tmp_project, sink_kind):
+    """`create --json` prints one `show --json` document -- the caller learns the
+    id, the path and the derived description without parsing the creation line or
+    a second round trip."""
+    cli("init", sink=sink_kind)
+    out = cli("create", "--title", "json me", "--type", "feature", "--tier", "low",
+              "--domain", "io", "--description", "read me back", "--json",
+              sink=sink_kind).stdout
+    payload = json.loads(out)  # exit 0, one JSON document, nothing else
+    assert payload["id"].startswith("tic-")
+    assert payload == json.loads(cli("show", payload["id"], "--json", sink=sink_kind).stdout)
+    assert payload["description"] == "read me back"
+
+    blank = json.loads(cli("create", "--blank", "--json", sink=sink_kind).stdout)
+    assert blank["title"].startswith("TODO:")
+    assert blank == json.loads(cli("show", blank["id"], "--json", sink=sink_kind).stdout)
+
+    # The text line is unchanged when --json is absent.
+    text = cli("create", "--title", "plain", "--type", "feature", "--tier", "low",
+               "--domain", "io", sink=sink_kind).stdout
+    assert text.startswith("created tic-")
 
 
 # --- triage flow ----------------------------------------------------------
@@ -756,6 +830,30 @@ def test_the_shortcuts_are_the_raw_command(cli, tmp_project):
     assert payload["type"] == "bug"
     assert payload["status"] == "raw"
     assert "the thing broke" in payload["body"]
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_raw_and_the_shortcuts_json_print_the_show_document(cli, tmp_project, sink_kind):
+    """`raw --json` -- and each of the five shortcuts' --json, the long form's
+    twin -- prints exactly the `show --json` document, while `fetch` and the raw
+    backlog keep seeing the capture."""
+    cli("init", sink=sink_kind)
+    captured = json.loads(cli("raw", "feature", "add per-mesh LOD", "--json",
+                              sink=sink_kind).stdout)
+    assert captured["status"] == "raw" and captured["epic"] == "classification"
+    assert captured == json.loads(cli("show", captured["id"], "--json", sink=sink_kind).stdout)
+    assert captured["id"] in cli("list", "raw", sink=sink_kind).stdout
+    assert json.loads(cli("fetch", "--json", sink=sink_kind).stdout)["id"] == captured["id"]
+
+    for shortcut in ("bug", "feature", "request", "memo", "wish"):
+        twin = json.loads(cli(shortcut, f"{shortcut} memo text", "--json",
+                              sink=sink_kind).stdout)
+        assert twin["type"] == shortcut and twin["status"] == "raw"
+        assert twin == json.loads(cli("show", twin["id"], "--json", sink=sink_kind).stdout)
+
+    # The text capture line is unchanged when --json is absent.
+    assert cli("bug", "text one", sink=sink_kind).stdout.startswith(
+        "created raw bug ticket tic-")
 
 
 def test_a_request_is_a_raw_change_request(cli, tmp_project):
@@ -1171,6 +1269,151 @@ def test_list_next_prefers_urgency_and_skips_unmet_dependencies(project, cli):
     assert ticket_id(cli("list", "next").stdout) == dependent
 
 
+# --- depend: one edge at a time -------------------------------------------
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_removing_one_dependency_keeps_the_rest_of_the_list_and_the_views(
+    cli, tmp_project, sink_kind
+):
+    """`depend <a> <b> --remove` is the atomic half of the pair: the removal is the
+    sink's own compare-and-swap write, so it cannot lose a dependency another agent
+    added between a `show` and a `set depends_on`. The dropped edge disappears from
+    every dependency view, the two that survive keep the order they were added in, and
+    the tickets the removal never names are the same documents they were."""
+    dependent, dropped, late, kept, spare = dependency_mesh(cli, tmp_project, sink_kind)
+    stamp_updated(tmp_project, sink_kind, dependent)
+    untouched = {
+        tid: json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+        for tid in (dropped, spare)
+    }
+    bytes_before = (
+        {tid: Path(ticket["path"]).read_bytes() for tid, ticket in untouched.items()}
+        if sink_kind == "file"
+        else {}
+    )
+
+    def topo_order():
+        listing = json.loads(cli("list", "--topo", "--json", sink=sink_kind).stdout)
+        return [ticket["id"] for ticket in listing]
+
+    assert topo_order() == [kept, late, spare, dropped, dependent]
+    tree = json.loads(cli("list", "--tree", "--json", sink=sink_kind).stdout)
+    assert dropped not in {root["id"] for root in tree}, "it hangs beneath the ticket that needs it"
+    assert tree_children(tree, dependent) == [kept, late, dropped]
+
+    removed = cli("depend", dependent, dropped, "--remove", sink=sink_kind).stdout
+    assert removed == f"{dependent} no longer depends on {dropped}\n"
+
+    payload = json.loads(cli("show", dependent, "--json", sink=sink_kind).stdout)
+    assert payload["depends_on"] == [late, kept], "the rest of the list keeps its order"
+    assert payload["updated"] > "2020-01-01T00:00:00", "the write re-stamped the ticket"
+    for tid, snapshot in untouched.items():
+        assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout) == snapshot
+        if sink_kind == "file":
+            assert Path(snapshot["path"]).read_bytes() == bytes_before[tid]
+
+    # The edge is gone from the mesh, not just from the printed line: `dropped` is a
+    # dependency-free ticket now, and the urgent `dependent` no longer waits behind it.
+    assert topo_order() == [kept, late, dependent, spare, dropped]
+    after = json.loads(cli("list", "--tree", "--json", sink=sink_kind).stdout)
+    assert dropped in {root["id"] for root in after}
+    assert tree_children(after, dependent) == [kept, late]
+    cli("doctor", sink=sink_kind)
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_the_dropped_dependency_stops_holding_the_ticket_back_in_list_next(
+    cli, tmp_project, sink_kind
+):
+    """The queue is where a dropped edge has to show up. Both surviving dependencies are
+    closed first, so `dropped` is the only thing still holding `dependent` back: the
+    queue refuses it until the removal, and offers it -- most urgent -- straight after."""
+    dependent, dropped, late, kept, spare = dependency_mesh(cli, tmp_project, sink_kind)
+    cli("close", kept, sink=sink_kind)
+    cli("close", late, sink=sink_kind)
+    assert ticket_id(cli("list", "next", sink=sink_kind).stdout) == spare
+
+    cli("depend", dependent, dropped, "--remove", sink=sink_kind)
+
+    assert ticket_id(cli("list", "next", sink=sink_kind).stdout) == dependent
+    assert dropped in cli("list", sink=sink_kind).stdout, "still open -- just no longer a gate"
+    assert json.loads(cli("show", dependent, "--json", sink=sink_kind).stdout)["depends_on"] == [
+        late,
+        kept,
+    ]
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_removing_a_dependency_the_ticket_does_not_have_is_refused_and_writes_nothing(
+    cli, tmp_project, sink_kind
+):
+    """The asymmetry `ref rm` already keeps: re-adding what is there is a no-op success,
+    removing what is not there is an error naming the id and the dependencies the ticket
+    really has -- and it writes nothing at all, so a retry sees no drift in `updated`. A
+    self-dependency cannot be present either, because adding one is refused."""
+    dependent, dropped, late, kept, spare = dependency_mesh(cli, tmp_project, sink_kind)
+    stamp_updated(tmp_project, sink_kind, dependent)
+
+    proc = cli("depend", dependent, spare, "--remove", sink=sink_kind, expect=1)
+    assert f"does not depend on {spare}" in proc.stderr
+    assert f"it depends on {dropped}, {late}, {kept}" in proc.stderr
+    payload = json.loads(cli("show", dependent, "--json", sink=sink_kind).stdout)
+    assert payload["depends_on"] == [dropped, late, kept]
+    assert payload["updated"] == "2020-01-01T00:00:00"
+
+    self_refusal = cli("depend", dependent, dependent, "--remove", sink=sink_kind, expect=1)
+    assert "cannot depend on itself" in self_refusal.stderr
+    assert (
+        cli("depend", dependent, dropped, sink=sink_kind).stdout
+        == f"{dependent} already depends on {dropped}\n"
+    )
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_remove_demands_a_second_ticket_id_while_bare_depend_still_clears_all(
+    cli, tmp_project, sink_kind
+):
+    """`--remove` with nothing named is refused -- the way `ref rm` refuses an empty path
+    list -- because clearing everything is the bare form, and an option that quietly meant
+    "all" would be the rewrite-in-one-write this command exists to make unnecessary."""
+    dependent, dropped, late, kept, spare = dependency_mesh(cli, tmp_project, sink_kind)
+    stamp_updated(tmp_project, sink_kind, dependent)
+
+    proc = cli("depend", dependent, "--remove", sink=sink_kind, expect=1)
+    assert "needs TIC_B" in proc.stderr
+    assert f"{dropped}, {late}, {kept}" in proc.stderr
+    payload = json.loads(cli("show", dependent, "--json", sink=sink_kind).stdout)
+    assert payload["depends_on"] == [dropped, late, kept]
+    assert payload["updated"] == "2020-01-01T00:00:00"
+
+    assert (
+        cli("depend", dependent, sink=sink_kind).stdout
+        == f"cleared dependencies of {dependent}\n"
+    )
+    assert json.loads(cli("show", dependent, "--json", sink=sink_kind).stdout)["depends_on"] == []
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_a_dependency_can_be_removed_through_the_shortest_unique_id_prefix(
+    cli, tmp_project, sink_kind
+):
+    """Both ids go through the resolution every other mutating command uses -- an exact
+    id, or a wildcard match that has to be unique -- so `--remove` reads prefixes the
+    same way, and the receipt still names the tickets in full."""
+    dependent, dropped, late, kept, spare = dependency_mesh(cli, tmp_project, sink_kind)
+    first = unique_prefix(dependent, [dropped, late, kept, spare])
+    second = unique_prefix(dropped, [dependent, late, kept, spare])
+
+    removed = cli("depend", first, second, "--remove", sink=sink_kind).stdout
+
+    assert removed == f"{dependent} no longer depends on {dropped}\n"
+    assert json.loads(cli("show", dependent, "--json", sink=sink_kind).stdout)["depends_on"] == [
+        late,
+        kept,
+    ]
+
+
 def test_list_next_claims_in_one_step_and_reports_a_dry_queue(project, cli):
     first = create(cli, "one", priority=1)
     second = create(cli, "two", priority=2)
@@ -1440,6 +1683,10 @@ def test_set_validates_and_reports_what_it_changed(project, cli):
     assert payload["title"] == "after"
     assert payload["tags"] == ["a", "b"]
     assert payload["priority"] == 4
+    cli("set", tid, "description", "plain text, not comma-split", "title", "after2")
+    payload = json.loads(cli("show", tid, "--json").stdout)
+    assert payload["description"] == "plain text, not comma-split"
+    assert payload["title"] == "after2"
     cli("set", tid, "tier", "impossible", expect=1)
     cli("set", tid, "nosuchfield", "x", expect=1)
     cli("set", tid, "title", expect=1)  # odd number of arguments
@@ -1455,6 +1702,51 @@ def test_move_files_and_unfiles_a_ticket(project, cli):
     assert (project / ".arbite" / "open" / f"{tid}.md").exists()
     cli("move", tid, "wishlist", expect=1)  # must be root-relative
     cli("move", tid, "/../escape", expect=1)
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_set_description_rewrites_only_the_description_section(cli, tmp_project, sink_kind):
+    """`description` is the body text under `## Description`: setting it rewrites
+    exactly that section, every `--json` payload reports it back, and the file
+    and sqlite sinks behave identically."""
+    cli("init", sink=sink_kind)
+    tid = ticket_id(cli("create", "--title", "keep the notes", "--type", "bug",
+                        "--tier", "low", "--domain", "ui", sink=sink_kind).stdout)
+    cli("note", tid, "qa.bot", "keep me", sink=sink_kind)
+    before = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+
+    out = cli("set", tid, "description", "new text", sink=sink_kind).stdout
+    assert f"set description on {tid}" in out
+    after = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert after["description"] == "new text"
+    assert schema.notes_body(after["body"]) == schema.notes_body(before["body"])
+
+    # A body with no `## Description` heading reports null; setting the
+    # description inserts the section at the top and the old text survives
+    # below it.
+    cli("set", tid, "body", "prose that predates the heading\n\n## Notes\n- keep\n",
+        sink=sink_kind)
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["description"] is None
+    cli("set", tid, "description", "x", sink=sink_kind)
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["description"].startswith("x")
+    assert "prose that predates the heading" in payload["body"]
+
+    # An empty value leaves the heading with an empty section -- and the
+    # canonical markdown (identical for both sinks) gains no frontmatter key.
+    cli("set", tid, "description", "", sink=sink_kind)
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["description"] == ""
+    assert "## Description" in payload["body"]
+    markdown = cli("show", tid, sink=sink_kind).stdout
+    assert "description:" not in markdown.split("## Description")[0]
+
+    # A description that quotes the heading itself: the extractor stays on
+    # the FIRST heading.
+    cli("set", tid, "body",
+        "## Description\nwe quote the\n## Description\nline inside the section\n\n## Notes\n- n\n",
+        sink=sink_kind)
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["description"] == "we quote the"
 
 
 def test_init_creates_the_plans_bucket_and_move_files_there(project, cli):
@@ -2269,6 +2561,111 @@ def test_status_filters_agree_with_list_per_status(cli, tmp_project, sink_kind, 
         )
         assert len(json.loads(proc.stdout)) == rows[status], f"{status} {flags}"
     assert rows["total"] == sum(rows[status] for status in schema.STATUSES)
+
+
+def create_type(cli, title, type_, **flags) -> str:
+    """`create` with the ticket's type spelled out; the other defaults match `create`."""
+    args = ["create", "--title", title, "--type", type_, "--tier", "medium", "--domain", "mesh"]
+    for key, value in flags.items():
+        args += [f"--{key.replace('_', '-')}", str(value)]
+    return ticket_id(cli(*args).stdout)
+
+
+def seed_typed_backlog(cli, sink: str) -> dict:
+    """Bugs and features spread across the filterable fields, so `--type` can be tested
+    alone, combined with every other filter, and against the `--domain` it must match.
+
+    `bug_claimed` depends on `bug_open` so the filtered selections have a real edge for
+    --tree/--topo to walk without ever leaving the filtered set."""
+    ids = {
+        "bug_open": create_type(
+            cli, "open bug in the epic", "bug", tier="high", domain="mesh",
+            epic="workflow", priority=1, sink=sink,
+        ),
+        "bug_io": create_type(cli, "open bug in io", "bug", domain="io", sink=sink),
+        "bug_claimed": create_type(cli, "claimed bug", "bug", tier="high", domain="mesh", sink=sink),
+        "feature_open": create_type(
+            cli, "open feature in the epic", "feature", tier="high", domain="mesh",
+            epic="workflow", priority=2, sink=sink,
+        ),
+        "feature_io": create_type(cli, "open feature in io", "feature", domain="io", sink=sink),
+    }
+    cli("claim", ids["bug_claimed"], "--agent", "claude.haiku.001", sink=sink)
+    cli("depend", ids["bug_claimed"], ids["bug_open"], sink=sink)
+    return ids
+
+
+def walked_ids(nodes):
+    """Every id in a `--tree --json` document, nested nodes included (a tree's rows are
+    the whole scope, not just its roots)."""
+    for node in nodes:
+        yield node["id"]
+        yield from walked_ids(node.get("depends", []))
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+@pytest.mark.parametrize(
+    "other, expected",
+    [
+        ((), {"bug_open", "bug_io", "bug_claimed"}),
+        (("--status", "open"), {"bug_open", "bug_io"}),
+        (("--tier", "high"), {"bug_open", "bug_claimed"}),
+        (("--domain", "mesh"), {"bug_open", "bug_claimed"}),
+        (("--epic", "workflow"), {"bug_open"}),
+        (("--priority", "1"), {"bug_open"}),
+        (("--assignee", "claude.haiku.001"), {"bug_claimed"}),
+    ],
+)
+def test_list_type_filter_agrees_with_the_other_filters(cli, tmp_project, sink_kind, other, expected):
+    """`list --type <type>` narrows exactly like every other filter: alone it is the named
+    type's own set, combined it is the intersection of the two results (the agreement
+    `status` and `list` already show for the older filters), and --topo and --tree select
+    the same ids as the flat table -- the filter is scope, not an after-the-graph filter."""
+    cli("init", sink=sink_kind)
+    ids = seed_typed_backlog(cli, sink_kind)
+    wanted = {ids[key] for key in expected}
+
+    rows = json.loads(cli("list", "--type", "bug", *other, "--json", sink=sink_kind).stdout)
+    assert {t["id"] for t in rows} == wanted, other
+    if other:
+        alone = json.loads(cli("list", *other, "--json", sink=sink_kind).stdout)
+        bugs = json.loads(cli("list", "--type", "bug", "--json", sink=sink_kind).stdout)
+        assert {t["id"] for t in rows} == {t["id"] for t in alone} & {t["id"] for t in bugs}
+    for view in ("--topo", "--tree"):
+        rows = json.loads(cli("list", view, "--type", "bug", *other, "--json", sink=sink_kind).stdout)
+        assert set(walked_ids(rows)) == wanted, f"{view} {other}"
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_list_next_filters_by_type(cli, tmp_project, sink_kind):
+    """`list next --type <type>` offers only that type's work, and when none of it is
+    workable the blocked report names the type among the supplied filters."""
+    cli("init", sink=sink_kind)
+    feature = create_type(cli, "urgent feature", "feature", priority=1, sink=sink_kind)
+    bug = create_type(cli, "less urgent bug", "bug", priority=2, sink=sink_kind)
+
+    assert ticket_id(cli("list", "next", sink=sink_kind).stdout) == feature
+    assert ticket_id(cli("list", "next", "--type", "bug", sink=sink_kind).stdout) == bug
+
+    # Make the bug unworkable behind a feature: only the type-filtered queue dead-ends.
+    blocker = create_type(cli, "open blocker", "feature", sink=sink_kind)
+    cli("depend", bug, blocker, sink=sink_kind)
+    proc = cli("list", "next", "--type", "bug", sink=sink_kind, expect=2)
+    assert "no workable open tickets matching type=bug" in proc.stdout
+    assert "blocked by dependencies: 1" in proc.stdout
+    assert ticket_id(cli("list", "next", sink=sink_kind).stdout) == feature
+
+
+def test_list_rejects_an_unknown_type_from_the_vocabulary(cli, project):
+    """`--type` validates against `schema.TYPES` through argparse choices, so an unknown
+    value is refused at the command line -- exit 2, the vocabulary named, nothing run --
+    exactly how an unknown `--tier` value is refused, on `next` as on the plain list."""
+    tier = cli("list", "--tier", "nonsense", expect=2)
+    assert "invalid choice" in tier.stderr
+    for flags in (("--type", "nonsense"), ("next", "--type", "nonsense")):
+        proc = cli("list", *flags, expect=2)
+        assert "invalid choice" in proc.stderr and "'nonsense'" in proc.stderr
+        assert "bug" in proc.stderr  # the vocabulary it is choosing from
 
 
 @pytest.mark.parametrize("sink_kind", ["file", "sqlite"])

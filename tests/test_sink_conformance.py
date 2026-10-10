@@ -21,7 +21,7 @@ import pytest
 
 from arbite.errors import AmbiguousTicketId, Conflict, TicketError, TicketNotFound
 from arbite.query import TicketQuery, TextMatch, sort_tickets
-from arbite.schema import parse_notes, parse_ticket
+from arbite.schema import description_body, parse_notes, parse_ticket
 from arbite.sinks.base import Expect, filter_tickets
 from helpers import make_ticket
 
@@ -47,6 +47,16 @@ def test_body_survives_a_round_trip(sink):
     body = "## Description\nNormalize the retry layer.\n\n## Notes\n- 2026-01-01 a.1: hi\n"
     sink.create(make_ticket("tic-a1b2", body=body))
     assert sink.get("tic-a1b2").body == body
+
+
+def test_description_survives_a_round_trip(sink):
+    """`--json` derives `description` from the body through the storage-neutral
+    `description_body`, so every sink must report the same value for the same
+    body -- here the reference value itself."""
+    body = "## Description\nNormalize the retry layer.\n\n## Notes\n- 2026-01-01 a.1: hi\n"
+    sink.create(make_ticket("tic-a1b2", body=body))
+    got = sink.get("tic-a1b2").to_dict()
+    assert got["description"] == description_body(body) == "Normalize the retry layer."
 
 
 def test_lists_preserve_order(sink):

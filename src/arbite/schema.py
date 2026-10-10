@@ -105,8 +105,6 @@ FIELD_ORDER = [
 # Sentinels so unset priorities sort after every explicit numeric priority.
 PRIORITY_MAX = float("inf")
 
-DEFAULT_BODY = "## Description\n{description}\n\n## Notes\n"
-
 BLANK_TITLE = "TODO: replace with a short title"
 BLANK_TYPE = "TODO: bug|feature|refactor|chore"
 BLANK_TIER = "TODO: " + "|".join(TIERS)
@@ -222,8 +220,19 @@ DERIVED_NOTE_WISH = (
     "'open' and do not claim it (promote refuses `--agent` for a wish)."
 )
 
+# The markdown heading the ticket's description lives under. The section
+# below it is body text, not frontmatter: `Ticket.to_dict` derives the
+# `description` key from it and `arbite set <id> description <text>`
+# rewrites only that section (see description_body/replace_description).
+DESCRIPTION_HEADING = "## Description"
+
 # The markdown heading the append-only audit trail lives under.
 NOTES_HEADING = "## Notes"
+
+# The body a new ticket starts with. One writer for the description
+# section: `create`/`promote` format it from here, and the two helpers
+# beside notes_body below read and rewrite the same shape.
+DEFAULT_BODY = f"{DESCRIPTION_HEADING}\n{{description}}\n\n{NOTES_HEADING}\n"
 
 # One note entry as `append_note` writes it: `- <timestamp> <agent>: <message>`.
 # The agent and even the timestamp are optional so that hand-written notes and
@@ -303,15 +312,19 @@ class Ticket:
 
     def to_dict(self, path: Optional[str] = None) -> dict:
         """Plain JSON-serialisable form: every frontmatter field, plus the
-        markdown body and (when known) the ticket's location from the active
-        sink. Used for `--json` output so agents get the same field names as
-        the frontmatter instead of parsing a formatted table.
+        markdown body, plus the `description` derived from that body, plus
+        (when known) the ticket's location from the active sink. Used for
+        `--json` output so agents get the same field names as the frontmatter
+        instead of parsing a formatted table; `description` is body text under
+        '## Description' (null when the body has no such heading), not a
+        frontmatter field.
 
         The key stays `path` because it is part of the agent-facing contract;
         for the file sink the value is a filesystem path, for any other sink it
         is whatever `TicketSink.describe_location()` reports."""
         data = {name: getattr(self, name) for name in FIELD_ORDER}
         data["body"] = self.body
+        data["description"] = description_body(self.body)
         if path is not None:
             data["path"] = str(path)
         return data
@@ -426,6 +439,53 @@ def notes_body(body: str) -> str:
     return body[idx + len(NOTES_HEADING) :]
 
 
+def _description_heading_index(lines: list) -> Optional[int]:
+    """The index of the first line that is the '## Description' heading
+    (trailing spaces tolerated), or None when the body has none."""
+    for index, line in enumerate(lines):
+        if line.rstrip() == DESCRIPTION_HEADING:
+            return index
+    return None
+
+
+def description_body(body: str) -> Optional[str]:
+    """The text of the first '## Description' section, up to the next line
+    starting '## ' or the end of the body; None when the body has no heading.
+
+    The FIRST heading is used because the notes may quote it -- notes_body
+    deliberately takes the last, for the opposite reason. The heading and the
+    blank padding around the section are not part of the text; lines inside
+    it are kept as they are."""
+    lines = (body or "").split("\n")
+    start = _description_heading_index(lines)
+    if start is None:
+        return None
+    stop = start + 1
+    while stop < len(lines) and not lines[stop].startswith("## "):
+        stop += 1
+    return "\n".join(lines[start + 1 : stop]).strip("\n")
+
+
+def replace_description(body: str, text: str) -> str:
+    """`body` with the '## Description' section's text swapped, every other
+    line byte-for-byte. When the heading is absent the section is inserted at
+    the top of the body and all existing text survives below it. An empty
+    `text` leaves the heading with an empty section: an empty description is
+    an empty section, never a cleared field."""
+    body = body or ""
+    lines = body.split("\n")
+    section = [DESCRIPTION_HEADING] + (text.split("\n") if text else [])
+    start = _description_heading_index(lines)
+    if start is None:
+        return "\n".join(section) + ("\n\n" + body if body else "\n")
+    stop = start + 1
+    while stop < len(lines) and not lines[stop].startswith("## "):
+        stop += 1
+    if stop == len(lines):
+        return "\n".join(section) + "\n"
+    return "\n".join(section) + "\n\n" + "\n".join(lines[stop:])
+
+
 def parse_notes(body: str) -> list:
     """The `## Notes` entries of a body, as `Note` objects in body order.
 
@@ -500,8 +560,10 @@ def derived_note(ticket_id: str, ticket_type: Optional[str] = None) -> str:
 
 # Fields `arbite set` accepts: every frontmatter field except the structural id
 # (the id is generated by `arbite create` and never changed), plus 'body' for
-# the freeform markdown body.
-SETTABLE_PROPERTIES = (set(FIELD_ORDER) | {"body"}) - {"id"}
+# the freeform markdown body, plus 'description' -- body text like 'body' (not
+# in FIELD_ORDER, not a Ticket attribute), so cmd_set rewrites the
+# '## Description' section through replace_description instead of setattr.
+SETTABLE_PROPERTIES = (set(FIELD_ORDER) | {"body", "description"}) - {"id"}
 
 # Optional text fields: an empty quoted value clears them back to None.
 CLEARABLE_TEXT_FIELDS = {"epic", "assignee", "blocked_by", "closed"}

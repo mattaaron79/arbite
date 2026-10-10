@@ -38,6 +38,7 @@ from typing import Any, Callable, Optional
 
 from .schema import (
     CLASSIFICATION_EPIC,
+    DESCRIPTION_HEADING,
     FIELD_ORDER,
     RAW_TYPE_CHOICES,
     STATUSES,
@@ -65,8 +66,9 @@ TICKET_ID_HELP_READONLY = (
 
 JSON_HELP = (
     "emit machine-readable JSON on stdout instead of a formatted table "
-    "(field names match the ticket frontmatter); exit code 2 means the query "
-    "ran but matched nothing"
+    "(ticket payloads carry the frontmatter fields plus `body` plus the "
+    "derived `description`); exit code 2 means the query ran but matched "
+    "nothing"
 )
 
 MESSAGE_HELP = (
@@ -252,7 +254,7 @@ FIELD_NOTES = {
     "offered by `list next`, and a file sink keeps this in sync with the ticket's folder",
     "type": f"{' | '.join(TYPES)} -- 'memo' = update project notes/docs rather than code; "
     "'request' = a tweak or lateral change, ordinary work once classified; a wish is "
-    "reclassified to 'feature' and filed, never worked",
+    "reclassified to 'feature' and filed, never worked; filterable (`list [next] --type`)",
     "tier": f"{TIER_VALUES} -- **agent capability tier** needed to work it, ascending: your "
     "harness tells you yours, or self-assess from your model class (the company.model prefix "
     "of your id, e.g. claude.haiku sits below claude.opus). Claim only at or below your tier",
@@ -273,6 +275,12 @@ FIELD_NOTES = {
     "created": "creation timestamp (YYYY-MM-DDTHH:MM:SS); a bare YYYY-MM-DD also validates",
     "updated": "timestamp of the most recent change",
     "closed": "close timestamp, null until closed",
+    # Body text, not a frontmatter field -- keyed here so `docs fields` can
+    # list it beside the fields it renders from FIELD_ORDER.
+    "description": f"text under the body's `{DESCRIPTION_HEADING}` heading, not a "
+    "frontmatter field -- every `--json` ticket payload reports it (null when the body "
+    "has no such heading) and `set <id> description <text>` rewrites only that section; "
+    "notes and every other line survive byte-for-byte",
 }
 
 # ---------------------------------------------------------------------------
@@ -729,6 +737,7 @@ def _topic_fields(ctx: DocContext) -> list:
     add("")
     for field_name in FIELD_ORDER:
         add(f"- `{field_name}` -- {FIELD_NOTES.get(field_name, '')}")
+    add(f"- `description` -- {FIELD_NOTES['description']}")
     add("")
     add(
         "These axes are independent -- don't collapse them: `depends_on` (structural "
@@ -983,8 +992,12 @@ def _topic_triage(ctx: DocContext) -> list:
         f"the `{CLASSIFICATION_EPIC}` epic (find them with `arbite list next --epic "
         f"{CLASSIFICATION_EPIC}`). Its body lists what triage must fill in -- a real title, "
         f"`tier`, `domain`, a real `epic`, `priority`, an expanded description -- before "
-        f"it can be claimed. Raw tickets exist so a thought isn't lost, not as work: "
-        f"classify them before picking them up."
+        f"it can be claimed. That description is the body section under "
+        f"`{DESCRIPTION_HEADING}`: `arbite set <id> description <text>` rewrites just "
+        f"that section, and `show <id> --json` reports it as `description`. Raw tickets "
+        f"exist so a thought isn't lost, not as work: classify them before picking "
+        f"them up. `--json` on `raw` or a shortcut prints the new ticket as exactly "
+        f"the `show --json` document -- take the id from `id`, not from prose."
     )
     add("")
     add(
@@ -1058,11 +1071,16 @@ def _topic_conventions(ctx: DocContext) -> list:
     add("```")
     add("")
     add(
-        "**Parse JSON, not tables.** `--json` on `list`, `list next`, `list raw`, `fetch`, "
-        "`show`, `search`, `deps`, `doctor`, `sink`, `status` and `delete` emits "
-        "machine-readable output whose field names match the frontmatter; the human table "
-        "format is not a stable interface. The `path` field is whatever the sink calls a "
-        "ticket's location."
+        "**Parse JSON, not tables.** `--json` on `create`, `raw` (and its "
+        "`bug|feature|request|memo|wish` shortcuts), `list`, `list next`, `list raw`, "
+        "`fetch`, `show`, `search`, `deps`, `doctor`, `sink`, `status` and `delete` "
+        "emits machine-readable output: ticket payloads carry the frontmatter fields "
+        "plus `body`, plus `description` -- the text under the body's "
+        f"`{DESCRIPTION_HEADING}` heading, null when the body has none. `create` and "
+        "`raw --json` print exactly the document `show --json` prints, so a caller "
+        "learns the new ticket's id without parsing the creation line; the human table "
+        "format is not a stable interface. The `path` field is whatever the sink calls "
+        "a ticket's location."
     )
     add("")
     add(

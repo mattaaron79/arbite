@@ -12,15 +12,18 @@ import pytest
 from arbite.errors import TicketError
 from arbite.schema import (
     BLANK_TITLE,
+    DEFAULT_BODY,
     FIELD_ORDER,
     RAW_TITLE_FORMAT,
     RAW_TYPE_CHOICES,
     SETTABLE_PROPERTIES,
     STATUSES,
     coerce_field_value,
+    description_body,
     is_placeholder,
     is_raw_title_placeholder,
     parse_ticket,
+    replace_description,
     validate_field,
     validate_ticket,
 )
@@ -78,6 +81,74 @@ def test_references_sits_next_to_depends_on_in_field_order():
 
 def test_references_is_a_settable_property():
     assert "references" in SETTABLE_PROPERTIES
+
+
+# --- the description section ------------------------------------------------
+
+
+def test_description_is_a_settable_property_but_not_a_frontmatter_field():
+    """`set` writes it like the fields, yet adding it to FIELD_ORDER would put
+    a `description:` line into the frontmatter -- it is body text, like `body`."""
+    assert "description" in SETTABLE_PROPERTIES
+    assert "description" not in FIELD_ORDER
+
+
+def test_default_body_and_the_helpers_agree_on_the_section_shape():
+    """`create`/`promote` write through DEFAULT_BODY; the extract/replace
+    helpers must read and rewrite exactly what that template produces."""
+    assert description_body(DEFAULT_BODY.format(description="do the thing")) == "do the thing"
+
+
+def test_description_body_extracts_the_first_section_only():
+    body = "## Description\nfirst para\n\nsecond para\n\n## Notes\n- 2026-01-01 a.1: hi\n"
+    assert description_body(body) == "first para\n\nsecond para"
+
+
+def test_description_body_is_none_when_the_heading_is_absent():
+    assert description_body("just prose\n") is None
+    assert description_body("") is None
+
+
+def test_description_body_tolerates_trailing_spaces_and_a_final_bare_heading():
+    assert description_body("## Description  \nthe text\n") == "the text"
+    assert description_body("prose\n## Description") == ""
+
+
+def test_description_body_takes_the_first_heading_not_the_last():
+    """notes_body deliberately takes the LAST '## Notes' heading because a
+    description may quote it; the hazard is mirrored here -- a description
+    that quotes '## Description', or a note line spelled exactly like the
+    heading, must not move the section."""
+    assert description_body(
+        "## Description\nthe real text\n## Description\nquoted inside the section\n\n## Notes\n"
+    ) == "the real text"
+    assert description_body(
+        "## Description\nreal\n\n## Notes\n## Description\n- a note quoting it\n"
+    ) == "real"
+
+
+def test_replace_description_swaps_only_the_section():
+    body = "## Description\nold\n\n## Notes\n- 2026-01-01 a.1: hi\n"
+    assert replace_description(body, "new") == (
+        "## Description\nnew\n\n## Notes\n- 2026-01-01 a.1: hi\n"
+    )
+
+
+def test_replace_description_when_the_section_runs_to_the_end_of_the_body():
+    assert replace_description("## Description\nold\n", "new") == "## Description\nnew\n"
+
+
+def test_replace_description_inserts_the_section_when_the_heading_is_absent():
+    assert replace_description("prose that predates the heading\n", "new") == (
+        "## Description\nnew\n\nprose that predates the heading\n"
+    )
+
+
+def test_replace_description_keeps_the_heading_when_the_text_is_empty():
+    """An empty description is an empty section, never a removed heading."""
+    out = replace_description("## Description\nold\n\n## Notes\n", "")
+    assert out == "## Description\n\n## Notes\n"
+    assert description_body(out) == ""
 
 
 def test_validate_field_accepts_the_comma_separated_and_list_forms():
