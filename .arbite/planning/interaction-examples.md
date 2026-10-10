@@ -1398,6 +1398,7 @@ $ arbite create --title "Add per-mesh LOD" --type feature --tier high --domain m
   "closed": null,
   "body": "## Description\nAdd a per-mesh LOD ladder to the mesh importer.\n\n## Notes\n",
   "description": "Add a per-mesh LOD ladder to the mesh importer.",
+  "request": null,
   "path": ".arbite/open/tic-cf9f.md"
 }
 # exit 0
@@ -1406,7 +1407,8 @@ $ arbite create --title "Add per-mesh LOD" --type feature --tier high --domain m
 *target:* one JSON document on stdout, nothing else, exit 0. The document is what
 `arbite show tic-cf9f --json` prints a moment later for the same ticket -- the same
 keys, the same `description` derived from the body's `## Description` section, the same
-`path` the creation line would have named. Without `--json` the command still prints
+`path` the creation line would have named. `request` is null: only a `raw` ticket
+carries the text it was captured from. Without `--json` the command still prints
 its `created tic-cf9f at .arbite/open/tic-cf9f.md` line; nothing about the text path
 moves.
 
@@ -1433,6 +1435,7 @@ $ arbite feature "add per-mesh LOD" --json
   "closed": null,
   "body": "## Description\nThis is a **raw** ticket: it was captured from a brief request without proper classification. It must be filled out before it can be worked.\n\nOriginal request: add per-mesh LOD\n\nWhat still needs to be done -- human or agent triage, which `arbite fetch` starts and `arbite promote <id>` finishes in one write:\n- title -- replace \"Requires Classification\" with a short human-readable summary\n- tier -- low | medium | high | frontier (agent capability tier required to work it; how capable the agent must be, not how urgent the work is)\n- domain -- e.g. mesh, image_gen, audio_gen, ui, io (drives routing)\n- epic -- this raw ticket is auto-grouped under the 'classification' epic (so triage can find it with `arbite list next --epic classification`); pass the real epic this work belongs to (e.g. mesh-pipeline) to `arbite promote` and it replaces that grouping\n- priority -- numeric urgency index, lower = more urgent\n- description -- expand this body into a proper task description based on the original request, including any acceptance criteria\n- status -- `arbite promote <id> ...` classifies these fields in place and moves the ticket to `open` (or claims it in the same command with `--agent <your-id>`) so it becomes workable via `arbite list next`; the same fields can still be written by hand with `arbite set`\n\n## Notes\n",
   "description": "This is a **raw** ticket: it was captured from a brief request without proper classification. It must be filled out before it can be worked.\n\nOriginal request: add per-mesh LOD\n\nWhat still needs to be done -- human or agent triage, which `arbite fetch` starts and `arbite promote <id>` finishes in one write:\n- title -- replace \"Requires Classification\" with a short human-readable summary\n- tier -- low | medium | high | frontier (agent capability tier required to work it; how capable the agent must be, not how urgent the work is)\n- domain -- e.g. mesh, image_gen, audio_gen, ui, io (drives routing)\n- epic -- this raw ticket is auto-grouped under the 'classification' epic (so triage can find it with `arbite list next --epic classification`); pass the real epic this work belongs to (e.g. mesh-pipeline) to `arbite promote` and it replaces that grouping\n- priority -- numeric urgency index, lower = more urgent\n- description -- expand this body into a proper task description based on the original request, including any acceptance criteria\n- status -- `arbite promote <id> ...` classifies these fields in place and moves the ticket to `open` (or claims it in the same command with `--agent <your-id>`) so it becomes workable via `arbite list next`; the same fields can still be written by hand with `arbite set`",
+  "request": "add per-mesh LOD",
   "path": ".arbite/raw/tic-cf9f.md"
 }
 # exit 0
@@ -1442,7 +1445,8 @@ $ arbite feature "add per-mesh LOD" --json
 name, and the two documents are the same apart from the minted id and its stamps:
 `status` `raw`, grouped under the `classification` epic, `tier` and `domain` still the
 capture-time TODOs, the full triage checklist in `body` and mirrored into
-`description`. The ticket is `raw`, so `arbite list raw`, `arbite fetch --json` and
+`description`, and `request` holding the captured text on one line. The ticket is
+`raw`, so `arbite list raw`, `arbite fetch --json` and
 `arbite show <id> --json` all see it unchanged -- `--json` at capture adds a
 machine-readable form of the same ticket, not a different ticket.
 

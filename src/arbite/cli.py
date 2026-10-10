@@ -1737,16 +1737,11 @@ def _cmd_list_raw(args, sink):
 
     if args.json:
         # JSON mode keeps the list contract: an array of ticket dicts whose
-        # field names match the frontmatter, plus a derived 'request' field
-        # (like `fetch` injects 'derived_note') so a caller can group or
-        # display the captured text without parsing the body itself.
+        # field names match the frontmatter. The derived 'request' field comes
+        # from `Ticket.to_dict`, the one writer every --json ticket payload
+        # shares (tic-e5b9), rather than a second injection here.
         locations = sink.location_map(raw)
-        payload = []
-        for t in raw:
-            data = t.to_dict(locations.get(t.id))
-            data["request"] = schema.raw_captured_request(t)
-            payload.append(data)
-        _print_json(payload)
+        _print_json([t.to_dict(locations.get(t.id)) for t in raw])
     elif raw:
         _print_raw_summary(raw)
     else:
@@ -2947,11 +2942,13 @@ def cmd_set(args):
     two front doors cannot drift; `set-status` is the dedicated front door for
     the statuses no work-flow command reaches (the escape hatch).
 
-    'description' is body text, not a frontmatter field: setting it rewrites
-    only the body's '## Description' section -- the notes and every other line
-    survive byte-for-byte, and the section is inserted at the top when the
-    heading is absent. An empty quoted value empties the section; unlike a
-    clearable frontmatter field it never becomes None."""
+    'description' is body text, not a frontmatter field: it is the text under
+    the body's '## Description' heading, or -- when there is no such heading --
+    the text before the first '## ' line, and setting it replaces exactly that
+    text with a '## Description' section at the top of the body. Every other
+    heading block (the notes) survives byte-for-byte. An empty quoted value
+    empties the section; unlike a clearable frontmatter field it never becomes
+    None."""
     sink = _require_sink(args)
     t = sink.get(args.id, unique=True)
     assignments = args.assignments
@@ -5190,11 +5187,13 @@ def build_parser():
         "re-filed to match (moving to 'closed' auto-dates 'closed'); 'arbite set-status "
         "<id> <status>' is the dedicated front door for the same change, through the same "
         "code path, and is the escape hatch for the statuses no work-flow command reaches. "
-        "'description' is body text, not a frontmatter field: setting it "
-        "rewrites only the body's '## Description' section -- notes and every "
-        "other line survive byte-for-byte, an empty quoted value leaves the "
-        "section empty rather than clearing it, and every `--json` payload "
-        "reports the section back as 'description'. "
+        "'description' is body text, not a frontmatter field: it is the text "
+        "under the body's '## Description' heading, or -- when the heading is "
+        "absent -- the text before the first '## ' line, and setting it replaces "
+        "exactly that text with the section at the top of the body, leaving "
+        "every other heading block byte-for-byte. An empty quoted value leaves "
+        "the section empty rather than clearing it, and every `--json` payload "
+        "reports it back as 'description'. "
         "'id' is structural "
         "and cannot be set. This changes one ticket; to count tickets per status across the "
         "whole backlog, use 'arbite status'.",

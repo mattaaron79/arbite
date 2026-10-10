@@ -52,11 +52,35 @@ def test_body_survives_a_round_trip(sink):
 def test_description_survives_a_round_trip(sink):
     """`--json` derives `description` from the body through the storage-neutral
     `description_body`, so every sink must report the same value for the same
-    body -- here the reference value itself."""
+    body -- both when the body carries the heading and when the description is
+    the prose before the first heading."""
     body = "## Description\nNormalize the retry layer.\n\n## Notes\n- 2026-01-01 a.1: hi\n"
     sink.create(make_ticket("tic-a1b2", body=body))
     got = sink.get("tic-a1b2").to_dict()
     assert got["description"] == description_body(body) == "Normalize the retry layer."
+
+    prose = "Normalize the retry layer.\n\n## Notes\n- 2026-01-01 a.1: hi\n"
+    sink.create(make_ticket("tic-c3d4", body=prose))
+    got = sink.get("tic-c3d4").to_dict()
+    assert got["description"] == description_body(prose) == "Normalize the retry layer."
+
+    # A body that starts with a heading has no description text at all, and
+    # every sink says so the same way.
+    notes_only = "## Notes\n- 2026-01-01 a.1: hi\n"
+    sink.create(make_ticket("tic-e5f6", body=notes_only))
+    assert sink.get("tic-e5f6").to_dict()["description"] is None
+
+
+def test_request_survives_the_storage_round_trip(sink):
+    """`request` is derived from the body by the storage-neutral projection, so
+    both sinks must report the same value for the same capture (tic-e5b9): a sink
+    that mangled the body would show up here as a null or a different string."""
+    body = "## Description\nprose\n\nOriginal request: fix the door\n\n## Notes\n"
+    sink.create(make_ticket("tic-a1b2", status="raw", body=body))
+    assert sink.get("tic-a1b2").to_dict()["request"] == "fix the door"
+
+    sink.create(make_ticket("tic-c3d4", status="open", body=body))
+    assert sink.get("tic-c3d4").to_dict()["request"] is None
 
 
 def test_lists_preserve_order(sink):

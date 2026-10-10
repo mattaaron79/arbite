@@ -180,6 +180,21 @@ def unique_prefix(tid: str, others) -> str:
     return tid[:length]
 
 
+# --- the command surface ---------------------------------------------------
+
+
+def test_version_is_the_one_pyproject_packages(tmp_path):
+    """Two surfaces carry the version and either can drift: `--version` prints the
+    constant `cli.py` imports from `__init__.py`, while the packaged metadata comes
+    from `pyproject.toml`. Milieu 1.0 names the oldest arbite it works with, so both
+    have to name the same release (tic-0870)."""
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+    packaged = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
+    assert packaged, "pyproject.toml names no version"
+    assert arbite_cli.__version__ == packaged.group(1)
+    assert run_cli(tmp_path, "--version").stdout.strip() == f"arbite {arbite_cli.__version__}"
+
+
 # --- init and the sink surface --------------------------------------------
 
 
@@ -864,6 +879,71 @@ def test_raw_and_the_shortcuts_json_print_the_show_document(cli, tmp_project, si
     # The text capture line is unchanged when --json is absent.
     assert cli("bug", "text one", sink=sink_kind).stdout.startswith(
         "created raw bug ticket tic-")
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_every_json_payload_carries_the_captured_request(cli, tmp_project, sink_kind):
+    """A derived `request` key travels with every --json payload that prints a raw
+    ticket (tic-e5b9): it is the text the ticket was captured from, so a caller can
+    group or show the backlog in one line instead of digging the 'Original
+    request:' line out of the body. One projection writes it -- `Ticket.to_dict` --
+    so `list raw --json` and every other surface cannot drift apart."""
+    cli("init", sink=sink_kind)
+    tid = ticket_id(cli("bug", "fix the door", sink=sink_kind).stdout)
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["request"] == "fix the door"
+
+    # Every other JSON view of the same ticket carries the same value.
+    for args in (
+        ("list", "--json"),
+        ("list", "--status", "raw", "--json"),
+        ("list", "raw", "--json"),
+        ("search", "fix the door", "--json"),
+    ):
+        payload = json.loads(cli(*args, sink=sink_kind).stdout)
+        rows = payload if isinstance(payload, list) else [payload]
+        assert [t["request"] for t in rows if t["id"] == tid] == ["fix the door"], args
+
+    # The long form and each of the five shortcuts report their own capture text.
+    for raw_type in ("bug", "feature", "request", "memo", "wish"):
+        message = f"{raw_type} capture text"
+        captured = json.loads(cli("raw", raw_type, message, "--json", sink=sink_kind).stdout)
+        assert captured["request"] == message
+        twin = json.loads(cli(raw_type, message, "--json", sink=sink_kind).stdout)
+        assert twin["request"] == message
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_a_non_raw_ticket_reports_a_null_request_everywhere(cli, tmp_project, sink_kind):
+    """The key is always present and null once a ticket is not `raw` any more (the
+    one consistent choice, stated in tic-e5b9), so a caller tests the value rather
+    than probing for the key."""
+    cli("init", sink=sink_kind)
+    tid = ticket_id(
+        cli("create", "--title", "ordinary work", "--type", "feature", "--tier", "low",
+            "--domain", "io", sink=sink_kind).stdout
+    )
+    for args in (("show", tid, "--json"), ("list", "--json"),
+                 ("search", "ordinary work", "--json")):
+        payload = json.loads(cli(*args, sink=sink_kind).stdout)
+        rows = payload if isinstance(payload, list) else [payload]
+        assert [t["request"] for t in rows if t["id"] == tid] == [None], args
+
+
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_a_raw_ticket_whose_capture_line_is_gone_reports_null(cli, tmp_project, sink_kind):
+    """A description rewritten by hand (which a half-done classification may
+    legitimately do) drops the 'Original request:' line: `request` is then null
+    rather than '' or an error, the JSON twin of the placeholder the human
+    backlog line prints (tic-e5b9)."""
+    cli("init", sink=sink_kind)
+    tid = raw_capture(cli, "feature", "add per-mesh LOD", sink=sink_kind)
+    cli("set", tid, "description", "rewritten by hand", sink=sink_kind)
+
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["request"] is None
+    listed = json.loads(cli("list", "raw", "--json", sink=sink_kind).stdout)
+    assert [t["request"] for t in listed] == [None]
+    # The human view still prints its placeholder line, and still exits 0.
+    assert "request text no longer in body" in cli("list", "raw", sink=sink_kind).stdout
 
 
 def test_a_request_is_a_raw_change_request(cli, tmp_project):
@@ -1731,16 +1811,42 @@ def test_set_description_rewrites_only_the_description_section(cli, tmp_project,
     assert after["description"] == "new text"
     assert schema.notes_body(after["body"]) == schema.notes_body(before["body"])
 
-    # A body with no `## Description` heading reports null; setting the
-    # description inserts the section at the top and the old text survives
-    # below it.
+    # A body with no `## Description` heading reads the prose before its first
+    # '## ' line as the description -- so setting the description replaces
+    # exactly that prose, and the heading block below it survives byte-for-byte.
     cli("set", tid, "body", "prose that predates the heading\n\n## Notes\n- keep\n",
         sink=sink_kind)
-    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["description"] is None
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["description"] == "prose that predates the heading"
     cli("set", tid, "description", "x", sink=sink_kind)
     payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
-    assert payload["description"].startswith("x")
-    assert "prose that predates the heading" in payload["body"]
+    assert payload["description"] == "x"
+    assert payload["body"] == "## Description\nx\n\n## Notes\n- keep\n"
+
+    # A heading-less body that is all prose has no other block to keep: the
+    # write leaves exactly the section, and nothing of the old text below it.
+    cli("set", tid, "body", "plain old text", sink=sink_kind)
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["description"] == "plain old text"
+    cli("set", tid, "description", "new desc", sink=sink_kind)
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["description"] == "new desc"
+    assert payload["body"] == "## Description\nnew desc\n"
+
+    # A body that starts with another heading reads no description at all; the
+    # write inserts the section above the block it leaves intact.
+    cli("set", tid, "body", "## Notes\n- n1\n", sink=sink_kind)
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["description"] is None
+    cli("set", tid, "description", "top", sink=sink_kind)
+    payload = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    assert payload["body"] == "## Description\ntop\n\n## Notes\n- n1\n"
+
+    # Read then write-back is a no-op: the value just read is exactly what the
+    # write replaces.
+    cli("set", tid, "body", "## Description\nsteady\n\n## Notes\n- n\n", sink=sink_kind)
+    read = json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)
+    cli("set", tid, "description", read["description"], sink=sink_kind)
+    assert json.loads(cli("show", tid, "--json", sink=sink_kind).stdout)["body"] == read["body"]
 
     # An empty value leaves the heading with an empty section -- and the
     # canonical markdown (identical for both sinks) gains no frontmatter key.

@@ -312,12 +312,13 @@ class Ticket:
 
     def to_dict(self, path: Optional[str] = None) -> dict:
         """Plain JSON-serialisable form: every frontmatter field, plus the
-        markdown body, plus the `description` derived from that body, plus
-        (when known) the ticket's location from the active sink. Used for
-        `--json` output so agents get the same field names as the frontmatter
-        instead of parsing a formatted table; `description` is body text under
-        '## Description' (null when the body has no such heading), not a
-        frontmatter field.
+        markdown body, plus the `description` derived from that body, plus the
+        `request` a raw ticket was captured from (null in any other status,
+        tic-e5b9), plus (when known) the ticket's location from the active sink.
+        Used for `--json` output so agents get the same field names as the
+        frontmatter instead of parsing a formatted table; `description` is body
+        text under '## Description' (null when the body has no such heading and
+        no text before its first heading), not a frontmatter field.
 
         The key stays `path` because it is part of the agent-facing contract;
         for the file sink the value is a filesystem path, for any other sink it
@@ -325,6 +326,14 @@ class Ticket:
         data = {name: getattr(self, name) for name in FIELD_ORDER}
         data["body"] = self.body
         data["description"] = description_body(self.body)
+        # Derived, not frontmatter (tic-e5b9): the short text a raw ticket was
+        # captured from, so every --json payload that prints a ticket carries it
+        # without a caller digging the 'Original request:' line out of the body.
+        # null whenever there is no captured text -- any non-raw ticket, or a raw
+        # ticket whose body no longer carries the line -- matching how
+        # `description` reports a missing heading.
+        captured = raw_captured_request(self) if self.status == "raw" else ""
+        data["request"] = captured or None
         if path is not None:
             data["path"] = str(path)
         return data
@@ -448,9 +457,25 @@ def _description_heading_index(lines: list) -> Optional[int]:
     return None
 
 
+def _first_heading_index(lines: list) -> int:
+    """The index of the first line that starts a '## ' heading, or len(lines)
+    when the body has none. The block from here on is the one that survives a
+    heading-absent `replace_description` untouched."""
+    for index, line in enumerate(lines):
+        if line.startswith("## "):
+            return index
+    return len(lines)
+
+
 def description_body(body: str) -> Optional[str]:
     """The text of the first '## Description' section, up to the next line
-    starting '## ' or the end of the body; None when the body has no heading.
+    starting '## ' or the end of the body.
+
+    When the heading is absent the description is the text before the first
+    '## ' line -- the whole body when it has no headings, and None when there
+    is no such text (a body that starts with a heading, or is empty or blank).
+    That is exactly the text `replace_description` replaces, so what a caller
+    reads is always what the next write overwrites.
 
     The FIRST heading is used because the notes may quote it -- notes_body
     deliberately takes the last, for the opposite reason. The heading and the
@@ -459,7 +484,7 @@ def description_body(body: str) -> Optional[str]:
     lines = (body or "").split("\n")
     start = _description_heading_index(lines)
     if start is None:
-        return None
+        return "\n".join(lines[: _first_heading_index(lines)]).strip("\n") or None
     stop = start + 1
     while stop < len(lines) and not lines[stop].startswith("## "):
         stop += 1
@@ -468,16 +493,22 @@ def description_body(body: str) -> Optional[str]:
 
 def replace_description(body: str, text: str) -> str:
     """`body` with the '## Description' section's text swapped, every other
-    line byte-for-byte. When the heading is absent the section is inserted at
-    the top of the body and all existing text survives below it. An empty
-    `text` leaves the heading with an empty section: an empty description is
-    an empty section, never a cleared field."""
+    line byte-for-byte.
+
+    When the heading is absent the text before the first '## ' line -- what
+    `description_body` read as the description -- is replaced, and the section
+    is emitted at the top of the body: any heading block below it (the notes)
+    survives untouched, and no heading is invented or dropped. An empty `text`
+    leaves the heading with an empty section: an empty description is an empty
+    section, never a cleared field."""
     body = body or ""
     lines = body.split("\n")
     section = [DESCRIPTION_HEADING] + (text.split("\n") if text else [])
     start = _description_heading_index(lines)
     if start is None:
-        return "\n".join(section) + ("\n\n" + body if body else "\n")
+        rest = lines[_first_heading_index(lines) :]
+        tail = "\n".join(rest)
+        return "\n".join(section) + "\n" + ("\n" + tail if tail else "")
     stop = start + 1
     while stop < len(lines) and not lines[stop].startswith("## "):
         stop += 1

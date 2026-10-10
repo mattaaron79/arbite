@@ -67,8 +67,8 @@ TICKET_ID_HELP_READONLY = (
 JSON_HELP = (
     "emit machine-readable JSON on stdout instead of a formatted table "
     "(ticket payloads carry the frontmatter fields plus `body` plus the "
-    "derived `description`); exit code 2 means the query ran but matched "
-    "nothing"
+    "derived `description` and `request`); exit code 2 means the query ran but "
+    "matched nothing"
 )
 
 MESSAGE_HELP = (
@@ -277,10 +277,15 @@ FIELD_NOTES = {
     "closed": "close timestamp, null until closed",
     # Body text, not a frontmatter field -- keyed here so `docs fields` can
     # list it beside the fields it renders from FIELD_ORDER.
-    "description": f"text under the body's `{DESCRIPTION_HEADING}` heading, not a "
-    "frontmatter field -- every `--json` ticket payload reports it (null when the body "
-    "has no such heading) and `set <id> description <text>` rewrites only that section; "
-    "notes and every other line survive byte-for-byte",
+    "description": f"body text, not a frontmatter field: the text under the body's "
+    f"`{DESCRIPTION_HEADING}` heading, or -- when the heading is absent -- the text before "
+    "the first '## ' line (null when there is none). Every `--json` ticket payload reports "
+    "it, and `set <id> description <text>` replaces exactly that text with the section at "
+    "the top of the body; every other heading block survives byte-for-byte",
+    "request": "derived, not a frontmatter field: the brief text a `raw` ticket was captured "
+    "from (the body's 'Original request:' line). Every `--json` ticket payload reports it -- "
+    "null for any other status, and null for a `raw` ticket whose body no longer carries the "
+    "line (`arbite list raw` prints a placeholder for that case)",
 }
 
 # ---------------------------------------------------------------------------
@@ -738,6 +743,7 @@ def _topic_fields(ctx: DocContext) -> list:
     for field_name in FIELD_ORDER:
         add(f"- `{field_name}` -- {FIELD_NOTES.get(field_name, '')}")
     add(f"- `description` -- {FIELD_NOTES['description']}")
+    add(f"- `request` -- {FIELD_NOTES['request']}")
     add("")
     add(
         "These axes are independent -- don't collapse them: `depends_on` (structural "
@@ -1076,7 +1082,9 @@ def _topic_conventions(ctx: DocContext) -> list:
         "`fetch`, `show`, `search`, `deps`, `doctor`, `sink`, `status` and `delete` "
         "emits machine-readable output: ticket payloads carry the frontmatter fields "
         "plus `body`, plus `description` -- the text under the body's "
-        f"`{DESCRIPTION_HEADING}` heading, null when the body has none. `create` and "
+        f"`{DESCRIPTION_HEADING}` heading, or the text before the first '## ' line when "
+        "the heading is absent (null when there is none) -- plus `request`, the brief "
+        "text a `raw` ticket was captured from, null for any other status. `create` and "
         "`raw --json` print exactly the document `show --json` prints, so a caller "
         "learns the new ticket's id without parsing the creation line; the human table "
         "format is not a stable interface. The `path` field is whatever the sink calls "

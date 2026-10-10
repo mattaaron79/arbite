@@ -23,6 +23,7 @@ from arbite.schema import (
     is_placeholder,
     is_raw_title_placeholder,
     parse_ticket,
+    raw_captured_request,
     replace_description,
     validate_field,
     validate_ticket,
@@ -104,9 +105,17 @@ def test_description_body_extracts_the_first_section_only():
     assert description_body(body) == "first para\n\nsecond para"
 
 
-def test_description_body_is_none_when_the_heading_is_absent():
-    assert description_body("just prose\n") is None
+def test_description_body_with_no_heading_is_the_prose_before_the_first_heading():
+    """With no `## Description` heading the description is the text before the
+    first '## ' line -- the whole body when there are no headings, and None
+    when there is no such text (a body that starts with a heading, or is empty
+    or blank). It is the same text `replace_description` replaces, so what a
+    caller reads is always what the next write overwrites."""
+    assert description_body("just prose\n") == "just prose"
+    assert description_body("para one\n\npara two") == "para one\n\npara two"
     assert description_body("") is None
+    assert description_body("\n\n") is None
+    assert description_body("## Notes\n- n1\n") is None
 
 
 def test_description_body_tolerates_trailing_spaces_and_a_final_bare_heading():
@@ -138,10 +147,34 @@ def test_replace_description_when_the_section_runs_to_the_end_of_the_body():
     assert replace_description("## Description\nold\n", "new") == "## Description\nnew\n"
 
 
-def test_replace_description_inserts_the_section_when_the_heading_is_absent():
-    assert replace_description("prose that predates the heading\n", "new") == (
-        "## Description\nnew\n\nprose that predates the heading\n"
+def test_replace_description_replaces_the_whole_heading_less_body():
+    """A body that is only prose has no other heading to keep: the section
+    takes the body's place and nothing of the old text survives below it."""
+    assert replace_description("plain old text", "new desc") == "## Description\nnew desc\n"
+
+
+def test_replace_description_replaces_the_prose_above_the_first_heading():
+    """The prose a heading-less read calls the description is exactly what the
+    write replaces; the heading block below it is left byte-for-byte."""
+    body = "prose that predates the heading\n\n## Notes\n- n1\n"
+    assert description_body(body) == "prose that predates the heading"
+    assert replace_description(body, "new") == "## Description\nnew\n\n## Notes\n- n1\n"
+
+
+def test_replace_description_keeps_a_leading_heading_block_that_follows():
+    """A body that starts with another heading reads no description text; the
+    write inserts the section at the top and keeps the heading block below."""
+    assert replace_description("## Notes\n- n1\n", "new desc") == (
+        "## Description\nnew desc\n\n## Notes\n- n1\n"
     )
+    assert replace_description("## Notes\n- n1\n", "") == "## Description\n\n## Notes\n- n1\n"
+
+
+def test_replace_description_read_back_is_idempotent():
+    """What the read returns is what a write-back replaces, so reading the
+    description and setting it again cannot change a byte of the body."""
+    body = "## Description\nsteady\n\n## Notes\n- 2026-01-01 a.1: hi\n"
+    assert replace_description(body, description_body(body)) == body
 
 
 def test_replace_description_keeps_the_heading_when_the_text_is_empty():
@@ -225,3 +258,26 @@ def test_the_raw_title_placeholder_predicate_follows_the_format():
     assert not is_raw_title_placeholder(None)
     assert not is_raw_title_placeholder(BLANK_TITLE)
     assert is_placeholder(BLANK_TITLE)
+
+
+# --- the derived `request` key ---------------------------------------------
+
+
+def test_to_dict_derives_request_for_raw_tickets_only():
+    """`request` (tic-e5b9) is the one projection's derived key: a raw ticket
+    reports the text it was captured from, every other status reports null, and a
+    raw ticket whose body lost the 'Original request:' line reports null rather
+    than ''. The key is always present, so a caller reads its value instead of
+    probing for it."""
+    body = "## Description\nprose\n\nOriginal request: fix the door\n\n## Notes\n"
+    raw = make_ticket("tic-a1b2", status="raw", body=body)
+    assert raw.to_dict()["request"] == raw_captured_request(raw) == "fix the door"
+
+    opened = make_ticket("tic-a1b2", status="open", body=body)
+    assert opened.to_dict()["request"] is None
+
+    rewritten = make_ticket("tic-a1b2", status="raw", body="## Description\nby hand\n")
+    assert raw_captured_request(rewritten) == ""
+    assert rewritten.to_dict()["request"] is None
+    # Derived, so the stored form is untouched: no `request:` frontmatter line.
+    assert "\nrequest:" not in rewritten.to_markdown()
