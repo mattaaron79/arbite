@@ -40,6 +40,7 @@ from typing import Optional
 import yaml
 
 from .errors import SinkNotInitialised, TicketError
+from .schema import load_yaml
 from .sinks import DEFAULT_SINK_KIND, SINK_KINDS, SinkSpec, build_sink, default_location
 
 #: The one config file, and the only place a project's committed choices live:
@@ -123,7 +124,7 @@ def load_config(project_root: Path) -> dict:
     if path is None:
         return {}
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = load_yaml(path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as e:
         raise TicketError(f"{path}: config is not valid YAML: {e}")
     if not isinstance(data, dict):

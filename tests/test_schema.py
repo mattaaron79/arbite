@@ -8,6 +8,9 @@ this list, so pinning it here is what "the status vocabulary changed" means.
 from __future__ import annotations
 
 import pytest
+import yaml
+
+from arbite import schema
 
 from arbite.errors import TicketError
 from arbite.schema import (
@@ -281,3 +284,16 @@ def test_to_dict_derives_request_for_raw_tickets_only():
     assert rewritten.to_dict()["request"] is None
     # Derived, so the stored form is untouched: no `request:` frontmatter line.
     assert "\nrequest:" not in rewritten.to_markdown()
+
+
+@pytest.mark.parametrize("loader", [yaml.SafeLoader, getattr(yaml, "CSafeLoader", yaml.SafeLoader)])
+def test_parse_ticket_is_the_same_under_either_yaml_loader(monkeypatch, loader):
+    """The libyaml loader is an optimisation with a pure-Python fallback (tic-a583):
+    both parse a ticket to the same value and report bad YAML the same way."""
+    monkeypatch.setattr(schema, "SAFE_LOADER", loader)
+    ticket = make_ticket(
+        title="Größe: a 'quoted' title", tags=["a", "b"], depends_on=["tic-c3d4"], priority=2
+    )
+    assert schema.parse_ticket(ticket.to_markdown()) == ticket
+    with pytest.raises(TicketError, match="not valid YAML"):
+        schema.parse_ticket("---\ntitle: [unclosed\n---\n")

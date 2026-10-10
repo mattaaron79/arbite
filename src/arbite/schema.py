@@ -22,6 +22,16 @@ import yaml
 
 from .errors import TicketError
 
+# libyaml's parser when PyYAML was built with it, several times faster on the
+# frontmatter every listing parses; the pure-Python loader otherwise (tic-a583).
+# Dumping stays pure-Python so stored ticket text is byte-stable across installs.
+SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def load_yaml(text: str):
+    """`yaml.safe_load` through the fastest safe loader available."""
+    return yaml.load(text, Loader=SAFE_LOADER)
+
 # The canonical status vocabulary *and order*: this list is the single source
 # every other status ordering derives from -- the file sink's folder set, the
 # rendered docs, and the `--status` choices all come from here. "review" sits
@@ -379,7 +389,7 @@ def parse_ticket(text: str) -> Ticket:
     interchangeable: both must be able to reproduce the other's text."""
     front_yaml, body = _split_frontmatter(text)
     try:
-        data = yaml.safe_load(front_yaml) or {}
+        data = load_yaml(front_yaml) or {}
     except yaml.YAMLError as e:
         raise TicketError(f"ticket frontmatter is not valid YAML: {e}")
     if not isinstance(data, dict):
