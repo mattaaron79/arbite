@@ -41,11 +41,14 @@ def load_yaml(text: str):
 STATUSES = ["raw", "open", "in_progress", "review", "blocked", "shelved", "closed"]
 
 # The statuses that count as *live* in a progress view: work that is ready to be
-# claimed, being worked, or with a reviewer. Captured `raw` is deliberately not
-# live (it is not work yet) and neither are the parked or finished statuses.
-# Defined here, beside the vocabulary, so a status added later is classified
-# deliberately rather than silently defaulting into somebody's report.
-LIVE_STATUSES = ["open", "in_progress", "review"]
+# claimed, being worked, with a reviewer, or stalled. A `blocked` ticket is still
+# in flight -- the stall is precisely what a progress report exists to surface, so
+# an epic whose only active ticket is blocked must not vanish from it. Captured
+# `raw` is deliberately not live (it is not work yet) and neither are the parked
+# (`shelved`) or finished (`closed`) statuses. Defined here, beside the vocabulary,
+# so a status added later is classified deliberately rather than silently
+# defaulting into somebody's report.
+LIVE_STATUSES = ["open", "in_progress", "review", "blocked"]
 
 # Controlled vocabularies. `type` includes "memo" and "wish" because `arbite
 # raw memo` and `arbite raw wish` mint them; `create` deliberately does not

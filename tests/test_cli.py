@@ -3029,6 +3029,30 @@ def test_progress_shows_every_ticket_of_a_live_epic(cli, tmp_project, sink_kind)
     assert "1 closed" in output and "1 open" in output
 
 
+@pytest.mark.parametrize("sink_kind", ["file", "sqlite"])
+def test_progress_shows_an_epic_whose_only_live_ticket_is_blocked(cli, tmp_project, sink_kind):
+    """A stall is the progress a report exists to show: an epic whose only live ticket
+    is `blocked` is in scope, and that ticket counts as live, not as context."""
+    cli("init", sink=sink_kind)
+    stalled = create(cli, "the stalled one", epic="stalled-epic", sink=sink_kind)
+    done = create(cli, "finished sibling", epic="stalled-epic", sink=sink_kind)
+    cli("close", done, sink=sink_kind)
+    cli("block", stalled, "--reason", "waiting on an upstream API", sink=sink_kind)
+
+    output = cli("progress", sink=sink_kind).stdout
+
+    assert "stalled-epic" in output
+    assert stalled in output and done in output
+    assert "1 blocked" in output
+
+    payload = json.loads(cli("progress", "--json", sink=sink_kind).stdout)
+    assert [group["epic"] for group in payload] == ["stalled-epic"]
+    group = payload[0]
+    assert group["counts"]["blocked"] == 1
+    assert group["live"] == 1, "blocked is live, not merely shown as context"
+    assert group["total"] == 2
+
+
 def test_progress_orders_an_epic_topologically(cli, project):
     """Order inside an epic follows `depends_on` -- the same topological ordering
     `list next` uses, not the flat priority sort."""

@@ -1163,8 +1163,9 @@ def cmd_progress(args):
     "what is moving right now, and what surrounds it". The selection rule is the
     whole substance of the command:
 
-    1. the **live** tickets are every ticket whose status is open, in_progress or
-       review (`schema.LIVE_STATUSES`);
+    1. the **live** tickets are every ticket whose status is open, in_progress,
+       review or blocked (`schema.LIVE_STATUSES`) -- a blocked ticket is stalled,
+       and a stalled epic is exactly what this report exists to show;
     2. the epics in scope are every epic holding at least one live ticket;
     3. **every** ticket of those epics is shown, whatever its status -- including
        closed and shelved ones, which are the context that makes the live ticket
@@ -4441,7 +4442,9 @@ def build_parser():
         "progress",
         help="show live epics: what is in flight, plus the epic's other tickets",
         description="Report what is actually in flight, and the epics it sits in. The "
-        "live tickets are those whose status is open, in_progress or review; the epics in "
+        "live tickets are those whose status is open, in_progress, review or blocked -- a "
+        "stalled ticket is still in flight, and the epic that stalled is the one a "
+        "coordinator needs to see; the epics in "
         "scope are the ones holding at least one of them; and then every ticket of those "
         "epics is shown, whatever its status -- closed and shelved siblings included, "
         "because they are the context that makes the live ticket legible. An epic whose "
